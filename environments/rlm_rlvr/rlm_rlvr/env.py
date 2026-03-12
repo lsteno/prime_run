@@ -19,6 +19,8 @@ class RLMRLVREnv(vf.MultiTurnEnv):
 
     async def setup_state(self, state: vf.State) -> vf.State:
         client = state["client"]
+        if not isinstance(client, AsyncOpenAI):
+            client = client.client
         assert isinstance(client, AsyncOpenAI)
 
         base_url = str(client.base_url)
