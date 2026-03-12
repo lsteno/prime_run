@@ -1,0 +1,57 @@
+output_dir = "outputs/rlm-rlvr-smoke-gpu2"
+max_steps = 1
+seq_len = 2048
+
+[deployment]
+gpus_per_node = 2
+num_train_gpus = 1
+num_infer_gpus = 1
+
+[model]
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+
+[wandb]
+project = "rlm-rlvr"
+name = "rlm-rlvr-smoke-gpu2"
+offline = true
+
+[trainer.optim]
+lr = 2e-6
+weight_decay = 0.0
+
+[trainer.model.lora]
+rank = 16
+dropout = 0.0
+
+[trainer.loss]
+type = "custom"
+import_path = "prime_rl.trainer.rl.grpo_loss.clipped_grpo_loss"
+kwargs = { clip_eps = 0.2 }
+
+[orchestrator]
+batch_size = 4
+rollouts_per_example = 1
+use_token_client = true
+
+[orchestrator.sampling]
+max_tokens = 128
+
+[[orchestrator.env]]
+id = "rlm_rlvr"
+
+[orchestrator.env.args]
+data_paths = ["/home/coder/rl_training/data/train.parquet"]
+eval_fraction = 0.05
+max_examples = 16
+max_eval_examples = 8
+max_iterations = 2
+max_depth = 2
+turn_max_tokens = 128
+subcall_max_tokens = 64
+tokenizer_name = "Qwen/Qwen2.5-0.5B-Instruct"
+efficiency_penalty_coef = 0.02
+
+[inference]
+gpu_memory_utilization = 0.35
+
+[ckpt]
