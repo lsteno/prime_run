@@ -40,8 +40,8 @@ max_tokens = 128
 id = "rlm_rlvr"
 
 [orchestrator.env.args]
-data_paths = ["/home/coder/rl_training/data/train.parquet"]
-eval_fraction = 0.05
+data_paths = ["/home/coder/prime_run/data/train_with_context_tokens_split_20260313/train_curriculum.parquet"]
+eval_data_paths = ["/home/coder/prime_run/data/train_with_context_tokens_split_20260313/eval.parquet"]
 max_examples = 16
 max_eval_examples = 8
 max_iterations = 2

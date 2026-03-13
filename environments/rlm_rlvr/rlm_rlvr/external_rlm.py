@@ -8,11 +8,8 @@ from typing import Any
 
 
 def _ensure_rlm_importable() -> None:
-    if importlib.util.find_spec("rlm") is not None:
-        return
-
     source_dir = Path(os.environ.get("RLM_SOURCE_DIR", "/home/coder/rlm"))
-    if source_dir.exists():
+    if source_dir.exists() and str(source_dir) not in sys.path:
         sys.path.insert(0, str(source_dir))
 
     if importlib.util.find_spec("rlm") is None:

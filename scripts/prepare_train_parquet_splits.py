@@ -24,6 +24,7 @@ class SplitSummary:
     train_rows: int
     sft_fraction: float
     eval_fraction: float
+    curriculum_strength: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,6 +87,15 @@ def parse_args() -> argparse.Namespace:
         default=128,
         help="Parquet row group size used for writing output files.",
     )
+    parser.add_argument(
+        "--curriculum-strength",
+        type=float,
+        default=0.35,
+        help=(
+            "Soft curriculum intensity for train split ordering in [0, 1]. "
+            "0 keeps random order, 1 approaches context-length rank order."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -100,6 +110,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("batch sizes must be positive integers")
     if args.row_group_size <= 0:
         raise ValueError("row-group-size must be a positive integer")
+    if args.curriculum_strength < 0 or args.curriculum_strength > 1:
+        raise ValueError("curriculum-strength must be between 0 and 1")
 
 
 def _token_lengths_for_texts(
@@ -168,6 +180,7 @@ def build_splits(
     seed: int,
     sft_fraction: float,
     eval_fraction: float,
+    curriculum_strength: float,
 ) -> tuple[pa.Table, pa.Table, pa.Table, pa.Table]:
     total_rows = table.num_rows
     if total_rows == 0:
@@ -190,6 +203,20 @@ def build_splits(
     sft_table = shuffled.slice(0, sft_rows)
     eval_table = shuffled.slice(sft_end, eval_rows)
     train_table = shuffled.slice(eval_end, total_rows - eval_end)
+
+    if curriculum_strength > 0 and train_table.num_rows > 1:
+        if "context_token_count" not in train_table.column_names:
+            raise ValueError("Train table must include 'context_token_count' for curriculum ordering.")
+
+        context_lengths = train_table.column("context_token_count").to_numpy(zero_copy_only=False)
+        length_order = np.argsort(context_lengths, kind="stable")
+        length_ranks = np.empty(train_table.num_rows, dtype=np.float64)
+        length_ranks[length_order] = np.linspace(0.0, 1.0, train_table.num_rows, endpoint=False)
+        random_component = rng.random(train_table.num_rows)
+        blended_key = (curriculum_strength * length_ranks) + ((1.0 - curriculum_strength) * random_component)
+        curriculum_order = np.argsort(blended_key, kind="stable")
+        train_table = train_table.take(pa.array(curriculum_order, type=pa.int64()))
+
     return shuffled, sft_table, eval_table, train_table
 
 
@@ -214,6 +241,7 @@ def main() -> None:
         seed=args.seed,
         sft_fraction=args.sft_fraction,
         eval_fraction=args.eval_fraction,
+        curriculum_strength=args.curriculum_strength,
     )
 
     write_targets = [
@@ -240,6 +268,7 @@ def main() -> None:
         train_rows=train_table.num_rows,
         sft_fraction=args.sft_fraction,
         eval_fraction=args.eval_fraction,
+        curriculum_strength=args.curriculum_strength,
     )
     (output_dir / "split_summary.json").write_text(
         json.dumps(asdict(summary), indent=2),

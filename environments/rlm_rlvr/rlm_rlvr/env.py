@@ -140,8 +140,6 @@ def load_environment(
     data_paths: list[str] | None = None,
     eval_data_paths: list[str] | None = None,
     seed: int = 42,
-    eval_fraction: float = 0.05,
-    eval_size: int | None = None,
     max_examples: int = -1,
     max_eval_examples: int = -1,
     max_iterations: int = 4,
@@ -157,8 +155,6 @@ def load_environment(
         data_paths=data_paths,
         eval_data_paths=eval_data_paths,
         seed=seed,
-        eval_fraction=eval_fraction,
-        eval_size=eval_size,
         max_examples=max_examples,
         max_eval_examples=max_eval_examples,
     )

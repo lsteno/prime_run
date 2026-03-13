@@ -6,9 +6,9 @@
 - **Tags**: `rlvr`, `recursive`, `prime-rl`, `multi-turn`
 
 ### Datasets
-- **Primary dataset(s)**: Shared parquet schema used by `/home/coder/rl_training/data/train.parquet` and dataset-maker outputs.
+- **Primary dataset(s)**: Shared parquet schema used by explicit train/eval parquet files.
 - **Source links**: local parquet paths passed through `data_paths` / `eval_data_paths`.
-- **Split sizes**: train is shuffled first, then a deterministic held-out eval subset is carved out unless explicit eval parquet paths are supplied.
+- **Split sizes**: no in-environment splitting; pass explicit train and eval files.
 
 ### Task
 - **Type**: multi-turn
@@ -25,7 +25,7 @@ prime eval run rlm_rlvr
 Configure model and sampling:
 
 ```bash
-prime eval run rlm_rlvr -m gpt-4.1-mini -n 20 -r 3 -t 1024 -T 0.7 -a '{"data_paths": ["/home/coder/rl_training/data/train.parquet"], "eval_fraction": 0.05}'
+prime eval run rlm_rlvr -m gpt-4.1-mini -n 20 -r 3 -t 1024 -T 0.7 -a '{"data_paths": ["/home/coder/prime_run/data/train_with_context_tokens_split_20260313/train_curriculum.parquet"], "eval_data_paths": ["/home/coder/prime_run/data/train_with_context_tokens_split_20260313/eval.parquet"]}'
 ```
 
 Notes:
@@ -38,9 +38,7 @@ Notes:
 | Arg | Type | Default | Description |
 | --- | ---- | ------- | ----------- |
 | `data_paths` | `list[str]` | auto-detect | One or more training parquet paths with the shared RLM schema |
-| `eval_data_paths` | `list[str] \| null` | `null` | Optional dedicated eval parquet paths |
-| `eval_fraction` | `float` | `0.05` | Held-out eval fraction when `eval_data_paths` is omitted |
-| `eval_size` | `int \| null` | `null` | Explicit eval subset size after shuffle |
+| `eval_data_paths` | `list[str] \| null` | auto-detect | One or more eval parquet paths with the shared RLM schema |
 | `seed` | `int` | `42` | Dataset shuffle seed |
 | `max_examples` | `int` | `-1` | Limit training examples after splitting |
 | `max_eval_examples` | `int` | `-1` | Limit eval examples |
