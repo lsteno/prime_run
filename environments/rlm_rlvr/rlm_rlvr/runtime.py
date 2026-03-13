@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any
 
 from openai import OpenAI
 from openai.types.chat.chat_completion import ChatCompletion
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from .parsing import extract_code_blocks, extract_final_answer, render_execution_output
+from .external_rlm import CodeBlock, QueryMetadata, RLMIteration, build_system_prompt, build_user_prompt, find_code_blocks, find_final_answer, make_feedback_messages
 from .repl import RecursiveLocalRepl
 from .trace import append_step_trace, make_call_trace, make_segment
 
@@ -123,22 +124,6 @@ class RecursiveRuntime:
     def session(self) -> SyncInferenceSession:
         return self.state["_sync_session"]
 
-    def build_system_prompt(self, depth: int, max_depth: int) -> str:
-        remaining = max(0, max_depth - depth)
-        return (
-            "You are solving a task with a Python REPL. "
-            "Use ```repl``` blocks for computation. The variable `context` contains the task context. "
-            "Use llm_query(prompt) for a plain local model call. Use rlm_query(prompt) to recurse with the same local model. "
-            "Finish with FINAL(answer) or FINAL_VAR(variable_name). "
-            f"Current recursion depth: {depth}. Remaining recursion budget: {remaining}."
-        )
-
-    def build_continue_message(self) -> str:
-        return (
-            "Continue solving the original task. Use rlm_query(...) only when decomposition is necessary. "
-            "If you know the answer, emit FINAL(...)."
-        )
-
     def build_finalize_message(self) -> str:
         return "Provide the final answer now. Use FINAL(...) or FINAL_VAR(...)."
 
@@ -169,7 +154,7 @@ class RecursiveRuntime:
         self.state["max_depth_reached"] = max(int(self.state["max_depth_reached"]), depth)
 
     def _plain_query(self, prompt: str, model: str | None = None) -> dict[str, Any]:
-        del model
+        start_time = time.perf_counter()
         messages = [{"role": "user", "content": prompt}]
         text, payload = self.session.generate(
             messages=messages,
@@ -177,12 +162,20 @@ class RecursiveRuntime:
             temperature=self.config.temperature,
             top_p=self.config.top_p,
         )
-        self._append_segment(payload=payload, depth=int(self.state["current_call_depth"]), kind="plain_query", response_text=text)
+        self._append_segment(
+            payload=payload,
+            depth=int(self.state["current_call_depth"]),
+            kind="plain_query",
+            response_text=text,
+        )
         return {
+            "prompt": prompt,
+            "model": model or self.session.model_name,
             "response": text,
-            "final_answer": extract_final_answer(text) or text,
+            "final_answer": find_final_answer(text) or text,
             "depth": int(self.state["current_call_depth"]),
             "kind": "plain_query",
+            "execution_time": time.perf_counter() - start_time,
         }
 
     def _recursive_query(
@@ -191,22 +184,28 @@ class RecursiveRuntime:
         model: str | None = None,
         max_depth: int | None = None,
     ) -> dict[str, Any]:
-        del model
         child_depth = int(self.state["current_call_depth"]) + 1
-        effective_max_depth = self.config.max_depth if max_depth is None else min(self.config.max_depth, max_depth)
+        branch_max_depth = int(self.state.get("current_branch_max_depth", self.config.max_depth))
+        if max_depth is None:
+            effective_max_depth = branch_max_depth
+        else:
+            effective_max_depth = min(branch_max_depth, child_depth + max(0, int(max_depth)))
         self.state["used_recursion"] = True
         self.state["num_subcalls"] += 1
 
         if child_depth > effective_max_depth:
-            return self._plain_query(prompt)
+            return self._plain_query(prompt, model)
 
         result = self.run_call(prompt=prompt, depth=child_depth, max_depth=effective_max_depth, context_payload=None)
         return {
+            "prompt": prompt,
+            "model": model or self.session.model_name,
             "response": result["final_answer"] or result["response_text"],
             "final_answer": result["final_answer"],
             "depth": child_depth,
             "kind": "recursive_query",
             "trace": result["trace"],
+            "execution_time": float(result.get("execution_time", 0.0)),
         }
 
     def run_call(
@@ -217,57 +216,93 @@ class RecursiveRuntime:
         max_depth: int,
         context_payload: str | None,
     ) -> dict[str, Any]:
+        start_time = time.perf_counter()
         call_id = self._next_call_id()
         repl_context = prompt if context_payload is None else context_payload
+        context_metadata = QueryMetadata(repl_context)
         trace = make_call_trace(call_id=call_id, depth=depth, prompt=prompt)
         repl = RecursiveLocalRepl(
             context_payload=repl_context,
             llm_query_fn=self._plain_query,
             rlm_query_fn=self._recursive_query,
         )
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": self.build_system_prompt(depth, max_depth)},
-            {"role": "user", "content": prompt},
+        message_history: list[dict[str, str]] = [
+            {"role": "system", "content": build_system_prompt(depth=depth, max_depth=max_depth)},
+            {
+                "role": "user",
+                "content": (
+                    f"Your context is a {context_metadata.context_type} with "
+                    f"{context_metadata.context_total_length} total characters, and is broken up into chunks "
+                    f"of char lengths: {context_metadata.context_lengths}."
+                ),
+            },
         ]
         final_answer: str | None = None
         response_text = ""
 
         previous_depth = int(self.state["current_call_depth"])
+        previous_branch_max_depth = int(self.state.get("current_branch_max_depth", self.config.max_depth))
         self.state["current_call_depth"] = depth
+        self.state["current_branch_max_depth"] = max_depth
         try:
-            for _ in range(self.config.max_iterations):
+            for iteration_index in range(self.config.max_iterations):
+                current_prompt = message_history + [
+                    build_user_prompt(
+                        root_prompt=prompt,
+                        iteration=iteration_index,
+                        context_count=repl.get_context_count(),
+                        history_count=repl.get_history_count(),
+                    )
+                ]
                 response_text, payload = self.session.generate(
-                    messages=messages,
+                    messages=current_prompt,
                     max_tokens=self.config.turn_max_tokens,
                     temperature=self.config.temperature,
                     top_p=self.config.top_p,
                 )
-                self._append_segment(payload=payload, depth=depth, kind="recursive_turn", response_text=response_text)
+                self._append_segment(
+                    payload=payload,
+                    depth=depth,
+                    kind="recursive_turn",
+                    response_text=response_text,
+                )
 
-                code_blocks = extract_code_blocks(response_text)
-                feedback_messages: list[str] = []
-                if code_blocks:
+                code_block_strs = find_code_blocks(response_text)
+                code_blocks: list[CodeBlock] = []
+                if code_block_strs:
                     self.state["used_repl"] = True
 
-                for code in code_blocks:
-                    execution = repl.execute(code)
-                    for child_call in execution.child_calls:
-                        if child_call.get("kind") == "recursive_query":
+                for code in code_block_strs:
+                    execution = repl.execute_code(code)
+                    code_blocks.append(CodeBlock(code=code, result=execution))
+                    for child_call in execution.rlm_calls:
+                        metadata = child_call.metadata or {}
+                        if metadata.get("kind") == "recursive_query":
                             self.state["used_recursion"] = True
                     if final_answer is None and execution.final_answer is not None:
                         final_answer = execution.final_answer
-                    feedback = render_execution_output(execution.stdout, execution.stderr, execution.final_answer)
-                    if len(feedback) > self.config.execution_output_char_limit:
-                        feedback = feedback[: self.config.execution_output_char_limit] + "\n... [truncated]"
-                    feedback_messages.append(feedback)
 
                 if final_answer is None:
-                    final_answer = extract_final_answer(response_text)
+                    final_answer = find_final_answer(response_text, environment=repl)
+
+                iteration = RLMIteration(
+                    prompt=current_prompt,
+                    response=response_text,
+                    code_blocks=code_blocks,
+                    final_answer=final_answer,
+                )
+                feedback_messages = [
+                    message["content"]
+                    for message in make_feedback_messages(
+                        iteration,
+                        max_chars=self.config.execution_output_char_limit,
+                    )
+                ]
 
                 append_step_trace(
                     trace,
                     assistant=response_text,
-                    code_blocks=code_blocks,
+                    code_blocks=code_block_strs,
                     feedback=feedback_messages,
                     final_answer=final_answer,
                 )
@@ -275,27 +310,34 @@ class RecursiveRuntime:
                 if final_answer is not None:
                     break
 
-                messages.append({"role": "assistant", "content": response_text})
-                if feedback_messages:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": "\n\n".join(feedback_messages + [self.build_continue_message()]),
-                        }
+                message_history.append({"role": "assistant", "content": response_text})
+                message_history.extend(
+                    make_feedback_messages(
+                        iteration,
+                        max_chars=self.config.execution_output_char_limit,
                     )
-                else:
-                    messages.append({"role": "user", "content": self.build_continue_message()})
+                )
 
             if final_answer is None:
-                messages.append({"role": "user", "content": self.build_finalize_message()})
+                finalize_prompt = message_history + [
+                    {
+                        "role": "assistant",
+                        "content": "Please provide a final answer to the user's question based on the information provided.",
+                    }
+                ]
                 response_text, payload = self.session.generate(
-                    messages=messages,
+                    messages=finalize_prompt,
                     max_tokens=self.config.turn_max_tokens,
                     temperature=self.config.temperature,
                     top_p=self.config.top_p,
                 )
-                self._append_segment(payload=payload, depth=depth, kind="finalize_turn", response_text=response_text)
-                final_answer = extract_final_answer(response_text) or response_text.strip()
+                self._append_segment(
+                    payload=payload,
+                    depth=depth,
+                    kind="finalize_turn",
+                    response_text=response_text,
+                )
+                final_answer = find_final_answer(response_text, environment=repl) or response_text.strip()
                 append_step_trace(
                     trace,
                     assistant=response_text,
@@ -305,10 +347,12 @@ class RecursiveRuntime:
                 )
         finally:
             self.state["current_call_depth"] = previous_depth
+            self.state["current_branch_max_depth"] = previous_branch_max_depth
 
         self.state["rlm_trace"].append(trace)
         return {
             "response_text": response_text,
             "final_answer": final_answer,
             "trace": trace,
+            "execution_time": time.perf_counter() - start_time,
         }

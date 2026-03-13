@@ -1,126 +1,112 @@
 from __future__ import annotations
 
-import contextlib
-import io
-import traceback
-from dataclasses import dataclass
+import concurrent.futures
 from typing import Any, Callable
 
-
-_SAFE_BUILTINS = {
-    "abs": abs,
-    "all": all,
-    "any": any,
-    "bool": bool,
-    "dict": dict,
-    "enumerate": enumerate,
-    "filter": filter,
-    "float": float,
-    "format": format,
-    "int": int,
-    "isinstance": isinstance,
-    "len": len,
-    "list": list,
-    "map": map,
-    "max": max,
-    "min": min,
-    "open": open,
-    "pow": pow,
-    "print": print,
-    "range": range,
-    "repr": repr,
-    "reversed": reversed,
-    "round": round,
-    "set": set,
-    "sorted": sorted,
-    "str": str,
-    "sum": sum,
-    "tuple": tuple,
-    "type": type,
-    "zip": zip,
-    "__import__": __import__,
-    "Exception": Exception,
-    "ValueError": ValueError,
-    "TypeError": TypeError,
-    "KeyError": KeyError,
-    "IndexError": IndexError,
-    "RuntimeError": RuntimeError,
-}
+from .external_rlm import LocalREPL, RLMChatCompletion, empty_usage_summary
 
 
-@dataclass
-class ReplExecution:
-    stdout: str
-    stderr: str
-    final_answer: str | None
-    child_calls: list[dict[str, Any]]
-
-
-class RecursiveLocalRepl:
+class RecursiveLocalRepl(LocalREPL):
     def __init__(
         self,
         *,
         context_payload: str,
         llm_query_fn: Callable[[str, str | None], dict[str, Any]],
         rlm_query_fn: Callable[[str, str | None, int | None], dict[str, Any]],
+        enable_rlm_query_batched_async: bool = True,
     ):
         self._llm_query_fn = llm_query_fn
         self._rlm_query_fn = rlm_query_fn
-        self._child_calls: list[dict[str, Any]] = []
-        self._last_final_answer: str | None = None
+        super().__init__(
+            lm_handler_address=None,
+            context_payload=context_payload,
+            enable_rlm_query_batched_async=enable_rlm_query_batched_async,
+        )
 
-        self.globals: dict[str, Any] = {
-            "__builtins__": _SAFE_BUILTINS,
-            "FINAL": self._final,
-            "FINAL_VAR": self._final_var,
-            "SHOW_VARS": self._show_vars,
-            "llm_query": self._llm_query,
-            "rlm_query": self._rlm_query,
-        }
-        self.locals: dict[str, Any] = {"context": context_payload}
+    def _completion_from_payload(self, payload: dict[str, Any], prompt: str) -> RLMChatCompletion:
+        metadata: dict[str, Any] | None = None
+        if payload.get("trace") is not None or payload.get("kind") is not None:
+            metadata = {
+                "kind": payload.get("kind"),
+                "depth": payload.get("depth"),
+                "trace": payload.get("trace"),
+            }
+        return RLMChatCompletion(
+            root_model=str(payload.get("model") or "local-model"),
+            prompt=payload.get("prompt", prompt),
+            response=str(payload.get("response", "")),
+            usage_summary=empty_usage_summary(),
+            execution_time=float(payload.get("execution_time", 0.0)),
+            metadata=metadata,
+        )
 
-    def _final(self, value: Any) -> str:
-        answer = str(value)
-        self._last_final_answer = answer
-        return answer
+    def _run_llm_query(self, prompt: str, model: str | None = None) -> str:
+        payload = self._llm_query_fn(prompt, model)
+        self._pending_llm_calls.append(self._completion_from_payload(payload, prompt))
+        return str(payload.get("response", ""))
 
-    def _final_var(self, variable_name: str | Any) -> str:
-        if not isinstance(variable_name, str):
-            return self._final(variable_name)
-        key = variable_name.strip().strip("\"'")
-        if key not in self.locals:
-            available = sorted(name for name in self.locals if not name.startswith("_"))
-            return f"Variable '{key}' not found. Available variables: {available}"
-        return self._final(self.locals[key])
-
-    def _show_vars(self) -> dict[str, str]:
-        return {name: type(value).__name__ for name, value in self.locals.items() if not name.startswith("_")}
-
-    def _record_call(self, payload: dict[str, Any]) -> str:
-        self._child_calls.append(payload)
-        return payload["response"]
+    def _run_rlm_query(self, prompt: str, model: str | None = None, max_depth: int | None = None) -> str:
+        payload = self._rlm_query_fn(prompt, model, max_depth)
+        self._pending_llm_calls.append(self._completion_from_payload(payload, prompt))
+        return str(payload.get("response", ""))
 
     def _llm_query(self, prompt: str, model: str | None = None) -> str:
-        return self._record_call(self._llm_query_fn(prompt, model))
+        try:
+            return self._run_llm_query(prompt, model)
+        except Exception as exc:
+            return f"Error: LM query failed - {exc}"
+
+    def _llm_query_batched(self, prompts: list[str], model: str | None = None) -> list[str]:
+        return [self._llm_query(prompt, model) for prompt in prompts]
 
     def _rlm_query(self, prompt: str, model: str | None = None, max_depth: int | None = None) -> str:
-        return self._record_call(self._rlm_query_fn(prompt, model, max_depth))
+        try:
+            return self._run_rlm_query(prompt, model, max_depth)
+        except Exception as exc:
+            return f"Error: RLM query failed - {exc}"
 
-    def execute(self, code: str) -> ReplExecution:
-        stdout_buffer = io.StringIO()
-        stderr_buffer = io.StringIO()
-        self._child_calls = []
-        self._last_final_answer = None
+    def _rlm_query_batched(
+        self,
+        prompts: list[str],
+        model: str | None = None,
+        max_depth: int | None = None,
+    ) -> list[str]:
+        return [self._rlm_query(prompt, model, max_depth) for prompt in prompts]
 
-        with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+    def _rlm_query_batched_async(
+        self,
+        prompts: list[str],
+        model: str | None = None,
+        max_depth: int | None = None,
+        max_workers: int | None = None,
+    ) -> list[str]:
+        if not prompts:
+            return []
+
+        workers = max(1, max_workers if max_workers is not None else min(32, len(prompts)))
+
+        def run_one(prompt: str) -> tuple[bool, dict[str, Any] | str]:
             try:
-                exec(code, self.globals, self.locals)
-            except Exception:
-                traceback.print_exc(file=stderr_buffer)
+                return True, self._rlm_query_fn(prompt, model, max_depth)
+            except Exception as exc:
+                return False, f"Error: RLM query failed - {exc}"
 
-        return ReplExecution(
-            stdout=stdout_buffer.getvalue(),
-            stderr=stderr_buffer.getvalue(),
-            final_answer=self._last_final_answer,
-            child_calls=list(self._child_calls),
-        )
+        ordered_results: list[tuple[bool, dict[str, Any] | str] | None] = [None] * len(prompts)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_index = {executor.submit(run_one, prompt): index for index, prompt in enumerate(prompts)}
+            for future in concurrent.futures.as_completed(future_to_index):
+                ordered_results[future_to_index[future]] = future.result()
+
+        outputs: list[str] = []
+        for index, result in enumerate(ordered_results):
+            if result is None:
+                outputs.append("Error: RLM query failed - internal scheduling error")
+                continue
+            success, payload = result
+            if not success:
+                outputs.append(str(payload))
+                continue
+            assert isinstance(payload, dict)
+            self._pending_llm_calls.append(self._completion_from_payload(payload, prompts[index]))
+            outputs.append(str(payload.get("response", "")))
+        return outputs

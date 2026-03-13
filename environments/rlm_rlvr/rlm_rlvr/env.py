@@ -6,7 +6,8 @@ from openai import AsyncOpenAI
 import verifiers as vf
 
 from .dataset import build_datasets
-from .parsing import extract_code_blocks, extract_final_answer, render_execution_output
+from .external_rlm import CodeBlock, RLMIteration, build_system_prompt, build_user_prompt, find_code_blocks, find_final_answer, make_feedback_messages
+from .repl import RecursiveLocalRepl
 from .reward import build_rubric
 from .runtime import RecursiveRuntime, RuntimeConfig, SyncInferenceSession
 from .trace import make_segment
@@ -40,6 +41,7 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         state["rlm_segment_counter"] = 0
         state["rlm_call_counter"] = 0
         state["current_call_depth"] = 0
+        state["current_branch_max_depth"] = self.runtime_config.max_depth
         state["final_answer"] = None
         state["sampling_temperature"] = float((state.get("sampling_args") or {}).get("temperature", self.runtime_config.temperature))
 
@@ -52,6 +54,11 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         )
         state["_runtime"] = RecursiveRuntime(state, self.runtime_config)
         state["_root_context"] = (state.get("info") or {}).get("context", "")
+        state["_root_repl"] = RecursiveLocalRepl(
+            context_payload=state.get("_root_context", ""),
+            llm_query_fn=state["_runtime"]._plain_query,
+            rlm_query_fn=state["_runtime"]._recursive_query,
+        )
         return await super().setup_state(state)
 
     async def add_trajectory_step(self, state: vf.State, trajectory_step: vf.TrajectoryStep):
@@ -81,60 +88,52 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         del kwargs
         runtime: RecursiveRuntime = state["_runtime"]
         assistant_text = str(messages[-1].get("content", "")) if messages else ""
+        repl: RecursiveLocalRepl = state["_root_repl"]
 
-        final_answer = extract_final_answer(assistant_text)
-        if final_answer is not None:
-            state["final_answer"] = final_answer
-            state["final_env_response"] = []
-            return []
-
-        code_blocks = extract_code_blocks(assistant_text)
-        feedback: list[str] = []
-        if code_blocks:
+        code_block_strs = find_code_blocks(assistant_text)
+        code_blocks: list[CodeBlock] = []
+        if code_block_strs:
             state["used_repl"] = True
 
-        root_repl = runtime.run_call
-        if not hasattr(state, "_root_repl_initialized"):
-            state["_root_repl_initialized"] = True
-
-        # Reuse the same recursive runtime for root-side code execution by routing through a dedicated REPL call.
-        # The root call itself is already recorded as trajectory steps; here we only execute the emitted code.
-        from .repl import RecursiveLocalRepl
-
-        if "_root_repl" not in state:
-            state["_root_repl"] = RecursiveLocalRepl(
-                context_payload=state.get("_root_context", ""),
-                llm_query_fn=runtime._plain_query,
-                rlm_query_fn=runtime._recursive_query,
-            )
-
-        repl: RecursiveLocalRepl = state["_root_repl"]
-        for code in code_blocks:
-            execution = repl.execute(code)
-            for child_call in execution.child_calls:
-                if child_call.get("kind") == "recursive_query":
+        for code in code_block_strs:
+            execution = repl.execute_code(code)
+            code_blocks.append(CodeBlock(code=code, result=execution))
+            for child_call in execution.rlm_calls:
+                metadata = child_call.metadata or {}
+                if metadata.get("kind") == "recursive_query":
                     state["used_recursion"] = True
             if execution.final_answer is not None and state.get("final_answer") is None:
                 state["final_answer"] = execution.final_answer
-            rendered = render_execution_output(execution.stdout, execution.stderr, execution.final_answer)
-            if len(rendered) > self.runtime_config.execution_output_char_limit:
-                rendered = rendered[: self.runtime_config.execution_output_char_limit] + "\n... [truncated]"
-            feedback.append(rendered)
+
+        if state.get("final_answer") is None:
+            final_answer = find_final_answer(assistant_text, environment=repl)
+            if final_answer is not None:
+                state["final_answer"] = final_answer
 
         if state.get("final_answer") is not None:
             state["final_env_response"] = []
             return []
 
         session = state["_sync_session"]
-        if feedback:
-            feedback_text = "\n\n".join(feedback + [runtime.build_continue_message()])
-        elif len(state["trajectory"]) >= self.runtime_config.max_iterations:
-            feedback_text = runtime.build_finalize_message()
+        iteration = RLMIteration(prompt=messages, response=assistant_text, code_blocks=code_blocks)
+        feedback_messages = make_feedback_messages(
+            iteration,
+            max_chars=self.runtime_config.execution_output_char_limit,
+        )
+        next_iteration = len(state["trajectory"])
+        if next_iteration >= self.runtime_config.max_iterations:
+            next_message = {"role": "user", "content": runtime.build_finalize_message()}
         else:
-            feedback_text = runtime.build_continue_message()
+            next_message = build_user_prompt(
+                root_prompt=str((state.get("info") or {}).get("question", "")),
+                iteration=next_iteration,
+                context_count=repl.get_context_count(),
+                history_count=repl.get_history_count(),
+            )
 
-        state["total_env_tokens"] += float(session.count_text_tokens(feedback_text))
-        return [{"role": "user", "content": feedback_text}]
+        response_messages = [*feedback_messages, next_message]
+        state["total_env_tokens"] += float(sum(session.count_text_tokens(message["content"]) for message in response_messages))
+        return response_messages
 
 
 def load_environment(
@@ -172,11 +171,7 @@ def load_environment(
         top_p=top_p,
         tokenizer_name=tokenizer_name,
     )
-    system_prompt = (
-        "You are a recursive problem-solving model. Use ```repl``` blocks when computation helps. "
-        "The task context is available as `context`. Use rlm_query(prompt) to recurse with the same local model. "
-        "Finish with FINAL(answer) or FINAL_VAR(variable_name)."
-    )
+    system_prompt = build_system_prompt(depth=0, max_depth=max_depth)
     return RLMRLVREnv(
         dataset=train_builder,
         eval_dataset=eval_builder,

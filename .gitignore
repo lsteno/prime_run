@@ -3,3 +3,8 @@
 ./outputs
 ./environments/*/outputs
 *.pyc
+
+# local large artifacts / datasets
+/core
+/data/train_with_context_tokens_split_*/
+/data/**/*.parquet

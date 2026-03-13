@@ -4,8 +4,8 @@ import json
 import re
 from typing import Any
 
-CODE_BLOCK_RE = re.compile(r"```(?:repl|python)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
-FINAL_RE = re.compile(r"FINAL(?:_VAR)?\((.*?)\)", re.DOTALL)
+from .external_rlm import find_code_blocks, find_final_answer
+
 WHITESPACE_RE = re.compile(r"\s+")
 
 
@@ -39,16 +39,16 @@ def parse_answer_candidates(raw_answer: Any) -> list[str]:
 
 
 def extract_code_blocks(text: str) -> list[str]:
-    return [match.strip() for match in CODE_BLOCK_RE.findall(text or "") if match.strip()]
+    return [match.strip() for match in find_code_blocks(text or "") if match.strip()]
 
 
 def extract_final_answer(text: str) -> str | None:
     if not text:
         return None
-    match = FINAL_RE.search(text)
-    if match is None:
+    result = find_final_answer(text)
+    if result is None:
         return None
-    return match.group(1).strip().strip("\"'") or None
+    return str(result).strip().strip("\"'") or None
 
 
 def render_execution_output(stdout: str, stderr: str, final_answer: str | None) -> str:

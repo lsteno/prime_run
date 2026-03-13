@@ -30,6 +30,8 @@ prime eval run rlm_rlvr -m gpt-4.1-mini -n 20 -r 3 -t 1024 -T 0.7 -a '{"data_pat
 
 Notes:
 - Use `-a` / `--env-args` to pass environment-specific configuration as a JSON object.
+- This environment now reuses the canonical `rlm` package for prompt construction, parsing, and REPL execution.
+- If `rlm` is not importable from your environment, install `rlms` or set `RLM_SOURCE_DIR` to a local checkout such as `/home/coder/rlm` before running eval or training.
 
 ### Environment Arguments
 

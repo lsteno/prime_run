@@ -8,6 +8,7 @@ import pandas as pd
 import verifiers as vf
 from datasets import Dataset
 
+from .external_rlm import build_initial_messages
 from .parsing import parse_answer_candidates
 
 DEFAULT_DATASET_CANDIDATES = [
@@ -50,11 +51,16 @@ def _to_dataset(frame: pd.DataFrame) -> Dataset:
             "dataset_name": str(row["dataset"]),
             "source_task": str(row["task"]),
             "source_id": str(row["id"]) if "id" in row else "",
+            "question": str(row["prompt"]),
         }
         records.append(
             {
-                "question": str(row["prompt"]),
+                "prompt": build_initial_messages(
+                    context_payload=info["context"],
+                    root_prompt=str(row["prompt"]),
+                ),
                 "answer": answers[0],
+                "task": str(row["prompt"]),
                 "info": json.dumps(info, separators=(",", ":")),
             }
         )

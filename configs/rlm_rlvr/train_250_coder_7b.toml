@@ -1,6 +1,6 @@
 output_dir = "outputs/rlm-rlvr-train-250-coder-7b"
 max_steps = 63
-seq_len = 2048
+seq_len = 4096
 
 [deployment]
 gpus_per_node = 2
@@ -13,7 +13,10 @@ name = "Qwen/Qwen2.5-Coder-7B-Instruct"
 [wandb]
 project = "rlm-rlvr"
 name = "rlm-rlvr-train-250-coder-7b"
-offline = true
+offline = false
+
+[tensorboard]
+enabled = true
 
 [trainer.optim]
 lr = 2e-6
@@ -37,12 +40,17 @@ rollouts_per_example = 1
 use_token_client = true
 
 [orchestrator.sampling]
-max_tokens = 128
+max_tokens = 2048
 
 # Keep env-worker logs and sample logging enabled so recursive traces are inspectable.
 [orchestrator.log]
 env_worker_logs = true
 log_data = true
+
+[orchestrator.trace_export]
+enabled = true
+include_segments = true
+include_metrics = true
 
 [[orchestrator.env]]
 id = "rlm_rlvr"
@@ -52,19 +60,23 @@ data_paths = ["/home/coder/rl_training/data/train.parquet"]
 eval_fraction = 0.05
 max_examples = 250
 max_eval_examples = 16
-max_iterations = 2
+max_iterations = 10
 max_depth = 2
-turn_max_tokens = 128
-subcall_max_tokens = 64
+turn_max_tokens = 2048
+subcall_max_tokens = 2048
 tokenizer_name = "Qwen/Qwen2.5-Coder-7B-Instruct"
 efficiency_penalty_coef = 0.02
 
 [inference]
-gpu_memory_utilization = 0.85
+gpu_memory_utilization = 0.70
+
+[inference.server]
+host = "127.0.0.1"
+port = 8000
 
 [inference.model]
-max_model_len = 2048
-enforce_eager = true
+max_model_len = 32768
+enforce_eager = false
 
 # Save frequent checkpoints and preserve recent ones.
 # Rollouts, including rlm_trace and rlm_segments emitted by the env, are persisted
