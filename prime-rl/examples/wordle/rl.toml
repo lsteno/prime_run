@@ -1,0 +1,31 @@
+max_steps = 200
+seq_len = 8192
+
+[deployment]
+num_train_gpus = 2
+num_infer_gpus = 6
+
+[wandb]
+project = "wordle"
+name = "wordle"
+
+[ckpt] # Checkpoint at the end of training
+
+[model]
+name = "PrimeIntellect/Qwen3-1.7B-Wordle-SFT"
+
+[orchestrator]
+batch_size = 1024
+rollouts_per_example = 16
+
+[[orchestrator.env]]
+id = "primeintellect/wordle"
+name = "wordle"
+
+[orchestrator.sampling]
+max_tokens = 1024
+
+[trainer] # Default trainer config
+
+[inference.parallel]
+dp = 6

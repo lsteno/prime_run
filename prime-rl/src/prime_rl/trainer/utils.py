@@ -1,0 +1,390 @@
+import json
+import pickle
+import shutil
+import time
+from collections import defaultdict
+from collections.abc import Iterable
+from datetime import timedelta
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import torch
+import torch.distributed as dist
+from rich import print as rich_print
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+from torch import Tensor, nn
+from torch.distributed.tensor import DTensor
+from transformers.tokenization_utils import PreTrainedTokenizer
+
+from prime_rl.trainer.world import get_world
+from prime_rl.utils.logger import get_logger
+from prime_rl.utils.pathing import get_ckpt_dir
+from prime_rl.utils.utils import format_num, format_time, get_step_path
+
+DEFAULT_TIMEOUT = timedelta(seconds=600)
+
+
+def _to_local_tensor(tensor: Tensor | DTensor) -> Tensor:
+    if isinstance(tensor, DTensor):
+        return tensor.to_local()
+    return tensor
+
+
+def count_zero_gradient_elements(parameters: Iterable[nn.Parameter]) -> tuple[Tensor, Tensor]:
+    """Count zero-gradient parameter elements on the local distributed shards.
+
+    Parameters that require gradients but did not receive one in the current step
+    are counted as fully zero. This makes inactive MoE experts visible in the
+    metric instead of silently dropping them from the count.
+    """
+
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    num_zeros = torch.zeros((), dtype=torch.long, device=device)
+    num_tracked = torch.zeros((), dtype=torch.long, device=device)
+
+    for param in parameters:
+        if not param.requires_grad:
+            continue
+
+        local_param = _to_local_tensor(param.detach())
+        if local_param.numel() == 0:
+            continue
+
+        if local_param.device != num_zeros.device:
+            num_zeros = num_zeros.to(local_param.device)
+            num_tracked = num_tracked.to(local_param.device)
+
+        local_numel = torch.tensor(local_param.numel(), dtype=torch.long, device=local_param.device)
+        num_tracked += local_numel
+
+        if param.grad is None:
+            num_zeros += local_numel
+            continue
+
+        local_grad = _to_local_tensor(param.grad.detach())
+        if local_grad.numel() != local_param.numel():
+            raise ValueError("Local gradient shape does not match the local parameter shape")
+
+        num_zeros += local_numel - torch.count_nonzero(local_grad)
+
+    return num_zeros, num_tracked
+
+
+def get_zero_gradient_ratio(parameters: Iterable[nn.Parameter], dp_replicate: int = 1) -> float:
+    num_zero_grad, num_grad_elements = count_zero_gradient_elements(parameters)
+    dist.all_reduce(num_zero_grad, op=dist.ReduceOp.SUM)
+    dist.all_reduce(num_grad_elements, op=dist.ReduceOp.SUM)
+    if dp_replicate > 1:
+        num_zero_grad = torch.div(num_zero_grad, dp_replicate, rounding_mode="floor")
+        num_grad_elements = torch.div(num_grad_elements, dp_replicate, rounding_mode="floor")
+    return (num_zero_grad.float() / num_grad_elements.clamp_min(1).float()).item()
+
+
+def get_ckpt_disk_metrics(output_dir: Path) -> dict[str, float]:
+    """
+    Disk usage metrics for the checkpoint directory (<output_dir>/checkpoints).
+
+    Intended to be called by trainer(s) on rank 0 and included in an existing
+    monitor.log(...) call (once per step).
+    """
+    ckpt_dir = get_ckpt_dir(output_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(str(ckpt_dir))
+    total = float(usage.total) if usage.total else 0.0
+    return {
+        "system/ckpt_disk_free_gib": usage.free / 1024**3,
+        "system/ckpt_disk_used_gib": usage.used / 1024**3,
+        "system/ckpt_disk_total_gib": usage.total / 1024**3,
+        "system/ckpt_disk_free_ratio": (usage.free / total) if total else 0.0,
+    }
+
+
+def setup_torch_distributed(timeout: timedelta = DEFAULT_TIMEOUT, enable_gloo: bool = False):
+    device_id = get_world().local_rank
+    torch.cuda.set_device(device_id)
+    # Use Gloo backend for CPU and NCCL for GPU when CPU offloading is enabled
+    # Otherwise use NCCL for better GPU performance
+    backend = None  # by default nccl
+    if enable_gloo:
+        get_logger().info("Using Gloo backend for CPU and NCCL backend for GPU")
+        backend = "cpu:gloo,cuda:nccl"
+
+    dist.init_process_group(backend=backend, timeout=timeout, device_id=device_id)
+
+
+def get_response_lengths(position_ids: torch.Tensor) -> list[int]:
+    """
+    Compute lengths of concatenated sequences from position_ids.
+
+    Each sequence starts at 0 and increments. When position_ids resets to 0,
+    it indicates the start of a new sequence. Trailing zeros (padding) are
+    counted as part of the last sequence.
+
+    Args:
+        position_ids: Tensor of shape [total_seqlen]
+
+    Returns:
+        List of sequence lengths
+    """
+    position_ids = position_ids.flatten()
+
+    boundaries = [0]  # Start of first sequence
+
+    for i in range(1, len(position_ids)):
+        if position_ids[i] == 0 and position_ids[i - 1] != 0:
+            # This is a potential sequence boundary (0 after non-zero)
+            # But only if the next element is 1 (indicating a new incrementing sequence)
+            # Otherwise, this 0 is padding and belongs to current sequence
+            if i + 1 < len(position_ids) and position_ids[i + 1] == 1:
+                boundaries.append(i)
+
+    # Calculate lengths based on boundaries
+    lengths = []
+    for i in range(len(boundaries)):
+        start = boundaries[i]
+        end = boundaries[i + 1] if i + 1 < len(boundaries) else len(position_ids)
+        lengths.append(end - start)
+
+    return lengths
+
+
+def print_sample(input_ids: list[int], loss_mask: list[bool], tokenizer: PreTrainedTokenizer):
+    """
+    Visualize the loss mask of a tokenized sample using rich.
+    Reference: https://huggingface.co/Qwen/Qwen3-8B/discussions/14
+    """
+    text = Text()
+    for token, mask in zip(tokenizer.convert_ids_to_tokens(input_ids), loss_mask):
+        text.append(token.replace("Ġ", " ").replace("Ċ", "\n"), style="cyan" if mask else "white")
+    rich_print(text)
+
+
+def print_benchmark(history: dict[str, list[Any]]) -> None:
+    """
+    Print benchmark results as rich table. Shows formatted values for the
+    training throughput and overall step time. First first N rows show the
+    per-step values, and the last row shows the mean, std, min, and max values.
+    """
+    history.pop("step")
+    assert all(len(v) for v in history.values()), "All metrics must have logged the same number of steps"
+
+    # Turn metric history into pd.DataFrame
+    df = pd.DataFrame(dict(history.items()))
+    columns = {
+        "perf/mfu": "MFU",
+        "perf/throughput": "Throughput",
+        "time/step": "Step Time",
+        "perf/peak_memory": "Peak Memory",
+    }
+    df = df[columns.keys()].rename(columns=columns)
+    df = df.iloc[1:]  # Exclude first row
+
+    # Setup console
+    console = Console()
+    table = Table(title="Benchmark")
+
+    # Add columns
+    table.add_column("Step", justify="right")
+    for col in df.columns:
+        table.add_column(col, justify="center", style="magenta")
+
+    # Add formatted rows
+    formatted_df = pd.DataFrame(columns=df.columns)
+    formatted_df["MFU"] = df["MFU"].apply(lambda x: f"{format_num(x, precision=2)}%")
+    formatted_df["Throughput"] = df["Throughput"].apply(lambda x: format_num(x, precision=2))
+    formatted_df["Step Time"] = df["Step Time"].apply(format_time)
+    formatted_df["Peak Memory"] = df["Peak Memory"].apply(lambda x: f"{format_num(x, precision=1)} GiB")
+    for step, row in formatted_df.iterrows():
+        table.add_row(*([str(step)] + [str(x) for x in row]))
+
+    # Separator
+    table.add_row(*([""] * len(formatted_df.columns)))
+
+    # Add row for formatted, aggregated statistics
+    mean_df = df.describe().loc[["mean", "std", "min", "max"], :]
+    formatted_mean_df = pd.DataFrame()
+    formatted_mean_df["MFU"] = mean_df["MFU"].apply(lambda x: f"{format_num(x, precision=2)}%")
+    formatted_mean_df["Throughput"] = mean_df["Throughput"].apply(format_num, precision=2)
+    formatted_mean_df["Step Time"] = mean_df["Step Time"].apply(format_time)
+    mean_row = (
+        ["Overall"]
+        + formatted_mean_df.T.apply(
+            lambda row: f"{row['mean']} ± {row['std']} [{row['min']}, {row['max']}]", axis=1
+        ).tolist()
+        + [
+            f"{format_num(mean_df['Peak Memory']['mean'], precision=1)} GiB ({mean_df['Peak Memory']['mean'] / (torch.cuda.mem_get_info()[1] / 1024**3) * 100:.1f}%)"
+        ]
+    )
+    table.add_row(*mean_row)
+
+    # Display table
+    console.print(table)
+
+
+def export_benchmark_json(history: dict[str, list[Any]], output_path: Path) -> None:
+    """
+    Export benchmark results to a JSON file.
+
+    The JSON contains aggregated statistics (mean, std, min, max) for each metric.
+    """
+    history = history.copy()
+    history.pop("step", None)
+
+    # Turn metric history into pd.DataFrame
+    df = pd.DataFrame(dict(history.items()))
+    columns = {
+        "perf/mfu": "mfu",
+        "perf/throughput": "throughput",
+        "time/step": "step_time",
+        "perf/peak_memory": "peak_memory",
+    }
+    df = df[columns.keys()].rename(columns=columns)
+    df = df.iloc[1:]  # Exclude first warmup row
+
+    # Calculate statistics
+    stats = df.describe().loc[["mean", "std", "min", "max"], :]
+
+    # Get peak memory percentage
+    total_memory_gib = torch.cuda.mem_get_info()[1] / 1024**3
+    peak_memory_pct = stats["peak_memory"]["mean"] / total_memory_gib * 100
+
+    result = {
+        "mfu": {
+            "mean": float(stats["mfu"]["mean"]),
+            "std": float(stats["mfu"]["std"]),
+            "min": float(stats["mfu"]["min"]),
+            "max": float(stats["mfu"]["max"]),
+        },
+        "throughput": {
+            "mean": float(stats["throughput"]["mean"]),
+            "std": float(stats["throughput"]["std"]),
+            "min": float(stats["throughput"]["min"]),
+            "max": float(stats["throughput"]["max"]),
+        },
+        "step_time": {
+            "mean": float(stats["step_time"]["mean"]),
+            "std": float(stats["step_time"]["std"]),
+            "min": float(stats["step_time"]["min"]),
+            "max": float(stats["step_time"]["max"]),
+        },
+        "peak_memory": {
+            "gib": float(stats["peak_memory"]["mean"]),
+            "pct": float(peak_memory_pct),
+        },
+    }
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(result, f, indent=2)
+
+
+def flexible_all_gather(tensor: Tensor) -> Tensor:
+    """
+    All-gather a 1D tensor between all ranks, with potentially different numbr of element per rank.
+    Returns a tensor of shape (world_size * max_numel, dtype=tensor.dtype, device=tensor.device)
+    """
+
+    assert tensor.ndim == 1, "Can only flexibly all-gather 1D tensors"
+
+    if dist.get_world_size() == 1:
+        return tensor
+
+    # Find the tensor with the most elements
+    local_numel = tensor.numel()
+    local_numel_tensor = torch.tensor(local_numel, device=tensor.device)
+    all_numel_tensors = [torch.tensor(0, device=tensor.device) for _ in range(dist.get_world_size())]
+    dist.all_gather(all_numel_tensors, local_numel_tensor)
+    all_numels = [numel.item() for numel in all_numel_tensors]
+    max_numel = int(max(all_numels))
+
+    # Pad the tensor with zeros if it has less elements than the maximum
+    if local_numel < max_numel:
+        tensor = torch.cat([tensor, torch.zeros(max_numel - local_numel, dtype=tensor.dtype, device=tensor.device)])
+
+    # All-gather the tensors
+    all_tensors = [
+        torch.zeros(max_numel, dtype=tensor.dtype, device=tensor.device) for _ in range(dist.get_world_size())
+    ]
+    dist.all_gather(all_tensors, tensor)
+    all_tensors_unpadded = torch.cat([tensor[:numel] for tensor, numel in zip(all_tensors, all_numels)])
+
+    return all_tensors_unpadded
+
+
+class Tensors(defaultdict):
+    """A class to accumulate tensors and compute statistics (mean, median, std, min, max) across multiple steps and ranks."""
+
+    def __init__(self):
+        assert dist.is_initialized(), "Tensors requires a distributed environment"
+        super().__init__(list)
+
+    def compute_stats(self) -> dict[str, float | int]:
+        """Synchronize the tensor statistic across all ranks for each key and compute relevant statistics."""
+
+        metrics = {}
+        for key in list(self.keys()):
+            # All-gather tensors across steps and ranks (get global distribution)
+            tensors = torch.cat(self.pop(key), dim=0).to("cuda")
+            assert tensors.ndim == 1, "Can only aggregate 1D tensors"
+            tensors = flexible_all_gather(tensors)
+            assert tensors.ndim == 1, "Can only aggregate 1D tensors"
+
+            # Handle empty tensors (can happen when all rollouts in a batch fail)
+            if tensors.numel() == 0:
+                metrics[f"{key}/mean"] = float("nan")
+                metrics[f"{key}/median"] = float("nan")
+                metrics[f"{key}/std"] = float("nan")
+                metrics[f"{key}/min"] = float("nan")
+                metrics[f"{key}/max"] = float("nan")
+                continue
+
+            # Compute relevant tensor statistics
+            metrics[f"{key}/mean"] = tensors.mean().item()
+            metrics[f"{key}/median"] = torch.median(tensors).item()
+            metrics[f"{key}/std"] = tensors.std().item()
+            metrics[f"{key}/min"] = tensors.min().item()
+            metrics[f"{key}/max"] = tensors.max().item()
+
+            # Add back all-gathered tensors to self
+            self[key].append(tensors.tolist())
+
+        return metrics
+
+
+MEMORY_SNAPSHOT_MAX_ENTRIES = 100000
+
+
+class MemoryProfiler:
+    def __init__(self, step_num: int, snapshot_path: Path):
+        torch.cuda.memory._record_memory_history(max_entries=MEMORY_SNAPSHOT_MAX_ENTRIES)
+        self.logger = get_logger()
+        snapshot_path.mkdir(parents=True, exist_ok=True)
+        self.snapshot_path = snapshot_path
+        self.step_num = step_num
+
+    def step(self):
+        self.logger.info(f"Dumping memory snapshot at step {self.step_num} at {self.snapshot_path}")
+        begin = time.monotonic()
+        step_folder = self.snapshot_path / f"step_{self.step_num}"
+        step_folder.mkdir(parents=True, exist_ok=True)
+        file_path = step_folder / f"rank_{get_world().rank}.pickle"
+        with open(file_path, "wb") as output:
+            pickle.dump(torch.cuda.memory._snapshot(), output)
+        self.logger.info(
+            f"Finished dumping memory snapshot in {time.monotonic() - begin:.2f} seconds, load {file_path} at https://docs.pytorch.org/memory_viz to visualize the memory usage"
+        )
+        self.step_num += 1
+
+
+def maybe_clean(path: Path, step: int, async_level: int, interval_to_keep: int | None) -> None:
+    logger = get_logger()
+    step = max(step - (async_level + 1), 0)  # Consider deleting async_level + 1 steps ago
+    candidate_path_to_delete = get_step_path(path, step)
+    keep = bool(interval_to_keep and step % interval_to_keep == 0)
+    logger.debug(f"Considering deleting path {candidate_path_to_delete}")
+    if not keep:
+        logger.debug(f"Removing path {candidate_path_to_delete}")
+        shutil.rmtree(candidate_path_to_delete, ignore_errors=True)

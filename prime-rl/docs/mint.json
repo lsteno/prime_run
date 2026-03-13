@@ -1,0 +1,22 @@
+{
+    "$schema": "https://mintlify.com/docs.json",
+    "navigation": [
+        {
+            "group": "PRIME-RL",
+            "pages": [
+                "index",
+                "entrypoints",
+                "configs",
+                "environments",
+                "async",
+                "logging",
+                "multi_run_manager",
+                "checkpointing",
+                "benchmarking",
+                "deployment",
+                "kubernetes",
+                "troubleshooting"
+            ]
+        }
+    ]
+}
