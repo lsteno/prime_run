@@ -1,0 +1,17 @@
+name = "rlm-rlvr-hosted-tiny-probe-qwen35-9b"
+model = "Qwen/Qwen3.5-9B"
+max_steps = 1
+
+batch_size = 1
+rollouts_per_example = 1
+learning_rate = 8e-7
+lora_alpha = 32
+max_async_level = 1
+
+[sampling]
+max_tokens = 512
+temperature = 0.7
+
+[[env]]
+id = "lsteno/rlm-rlvr"
+args = { dataset_id = "lsteno/BEEG-agents", dataset_train_split = "train", dataset_eval_split = "eval", max_examples = 2, max_eval_examples = 1, max_iterations = 6, max_depth = 3, turn_max_tokens = 512, subcall_max_tokens = 512, tokenizer_name = "Qwen/Qwen3.5-9B", efficiency_penalty_coef = 0.02, inference_mode = "hosted", judge_model = "z-ai/glm-4.7-flash" }
