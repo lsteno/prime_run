@@ -9,12 +9,29 @@ import verifiers as vf
 from .dataset import build_datasets
 from .external_rlm import CodeBlock, RLMIteration, build_system_prompt, build_user_prompt, find_code_blocks, find_final_answer, make_feedback_messages
 from .repl import create_repl
-from .reward import build_rubric
+from .reward import add_metrics, build_rubric
 from .runtime import RecursiveRuntime, RuntimeConfig, SyncInferenceSession
 from .trace import make_segment
 
 
 class RLMRLVREnv(vf.MultiTurnEnv):
+    def _attach_debug_payload(self, state: vf.State) -> None:
+        trajectory = state.get("trajectory") or []
+        if not trajectory:
+            return
+
+        last_step = trajectory[-1]
+        extras = last_step.setdefault("extras", {})
+        extras["rlm_debug"] = {
+            "used_repl": bool(state.get("used_repl", False)),
+            "used_recursion": bool(state.get("used_recursion", False)),
+            "max_depth_reached": int(state.get("max_depth_reached", 0)),
+            "num_subcalls": int(state.get("num_subcalls", 0)),
+            "final_answer": state.get("final_answer"),
+            "trace": state.get("rlm_trace") or [],
+            "segments": state.get("rlm_segments") or [],
+        }
+
     def __init__(self, *, runtime_config: RuntimeConfig, **kwargs):
         super().__init__(max_turns=runtime_config.max_iterations + 1, interleaved_rollouts=True, **kwargs)
         self.runtime_config = runtime_config
@@ -114,6 +131,7 @@ class RLMRLVREnv(vf.MultiTurnEnv):
                 state["final_answer"] = final_answer
 
         if state.get("final_answer") is not None:
+            self._attach_debug_payload(state)
             state["final_env_response"] = []
             return []
 
@@ -136,6 +154,7 @@ class RLMRLVREnv(vf.MultiTurnEnv):
 
         response_messages = [*feedback_messages, next_message]
         state["total_env_tokens"] += float(sum(session.count_text_tokens(message["content"]) for message in response_messages))
+        self._attach_debug_payload(state)
         return response_messages
 
 
@@ -161,6 +180,11 @@ def load_environment(
     inference_mode: str = "hosted",
     inference_base_url: str | None = None,
     inference_api_key: str | None = None,
+    judge_model: str = "z-ai/glm-4.7-flash",
+    judge_base_url: str = "https://openrouter.ai/api/v1",
+    judge_api_key_var: str = "OPENROUTER_API_KEY",
+    judge_http_referer: str | None = None,
+    judge_app_title: str | None = None,
     repl_backend: str = "local",
     repl_backend_kwargs: dict[str, Any] | None = None,
 ) -> vf.Environment:
@@ -195,6 +219,16 @@ def load_environment(
         elif inference_mode == "hosted":
             inference_api_key = os.environ.get("RLM_HOSTED_INFERENCE_API_KEY")
 
+    vf.ensure_keys([judge_api_key_var])
+    judge_default_headers = {
+        key: value
+        for key, value in {
+            "HTTP-Referer": judge_http_referer,
+            "X-Title": judge_app_title,
+        }.items()
+        if value
+    }
+
     train_builder, eval_builder = build_datasets(
         data_paths=data_paths,
         eval_data_paths=eval_data_paths,
@@ -222,11 +256,18 @@ def load_environment(
         repl_backend_kwargs=repl_backend_kwargs,
     )
     system_prompt = build_system_prompt(depth=0, max_depth=max_depth)
+    reward_rubric = build_rubric(
+        judge_model=judge_model,
+        judge_base_url=judge_base_url,
+        judge_api_key=os.environ[judge_api_key_var],
+        judge_default_headers=judge_default_headers or None,
+    )
+    add_metrics(reward_rubric)
     return RLMRLVREnv(
         dataset=train_builder,
         eval_dataset=eval_builder,
         system_prompt=system_prompt,
-        rubric=build_rubric(),
+        rubric=reward_rubric,
         runtime_config=runtime_config,
         efficiency_penalty_coef=efficiency_penalty_coef,
         env_id="rlm_rlvr",

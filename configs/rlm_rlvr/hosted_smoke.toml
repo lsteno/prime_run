@@ -1,0 +1,17 @@
+name = "rlm-rlvr-hosted-smoke"
+model = "Qwen/Qwen3-4B-Thinking-2507"
+max_steps = 2
+
+batch_size = 4
+rollouts_per_example = 1
+learning_rate = 8e-7
+lora_alpha = 32
+max_async_level = 1
+
+[sampling]
+max_tokens = 256
+temperature = 0.7
+
+[[env]]
+id = "lsteno/rlm-rlvr"
+args = { dataset_id = "lsteno/BEEG-agents", dataset_train_split = "train", dataset_eval_split = "eval", max_examples = 8, max_eval_examples = 4, max_iterations = 25, max_depth = 1, turn_max_tokens = 256, subcall_max_tokens = 128, tokenizer_name = "Qwen/Qwen3-4B-Thinking-2507", efficiency_penalty_coef = 0.02, inference_mode = "hosted", judge_model = "minimax/minimax-m2.7" }

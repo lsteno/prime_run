@@ -8,8 +8,6 @@ import pandas as pd
 import verifiers as vf
 from datasets import Dataset, Features, Value, load_dataset
 
-from .parsing import parse_answer_candidates
-
 DEFAULT_HF_DATASET_ID = "lsteno/BEEG-agents"
 DEFAULT_HF_TRAIN_SPLIT = "train"
 DEFAULT_HF_EVAL_SPLIT = "eval"
@@ -53,19 +51,23 @@ def _pick_first(row: dict, keys: list[str]) -> object:
 
 
 def _parse_answers(value: object) -> list[str]:
-    answers = parse_answer_candidates(value)
-    if answers:
-        return answers
-
-    if isinstance(value, str):
-        text = value.strip()
-        if text:
-            return [text]
-        return []
-
     if isinstance(value, list):
         parsed = [_stringify(item).strip() for item in value]
         return [item for item in parsed if item]
+
+    if isinstance(value, dict):
+        text = _stringify(value).strip()
+        return [text] if text else []
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return [text]
+        return _parse_answers(parsed)
 
     text = _stringify(value).strip()
     return [text] if text else []

@@ -13,7 +13,7 @@
 ### Task
 - **Type**: multi-turn
 - **Output format expectations (optional)**: assistant text with optional ```repl``` blocks and a final `FINAL(...)` or `FINAL_VAR(...)` answer.
-- **Rubric overview**: terminal correctness minus a small efficiency penalty proportional to recursive subcalls, with monitor metrics for recursion usage and depth.
+- **Rubric overview**: binary semantic correctness from an LLM judge, with monitor metrics for recursion usage and depth.
 
 ### Quickstart
 Run an evaluation with default settings:
@@ -38,6 +38,7 @@ Notes:
 - Use `-a` / `--env-args` to pass environment-specific configuration as a JSON object.
 - This environment reuses the published `rlms` package for prompt construction, parsing, and REPL execution backends.
 - Install with Prime CLI (`prime env install rlm_rlvr -p /home/coder/prime_run/environments`) to ensure dependencies are available.
+- Set `OPENROUTER_API_KEY` so the semantic judge can score outputs. For hosted training, add it via `env_file`.
 - For `repl_backend = "prime"`, set `PRIME_API_KEY` in your environment.
 - Local parquet mode is opt-in: pass `data_paths` explicitly. If `eval_data_paths` is omitted, eval defaults to a deterministic 10% holdout from `data_paths`.
 
@@ -62,10 +63,15 @@ Notes:
 | `temperature` | `float` | `1.0` | Root and recursive sampling temperature |
 | `top_p` | `float` | `1.0` | Root and recursive nucleus sampling |
 | `tokenizer_name` | `str \| null` | `null` | Optional tokenizer override; defaults to the rollout model name |
-| `efficiency_penalty_coef` | `float` | `0.02` | Small penalty multiplied by `num_subcalls` |
+| `efficiency_penalty_coef` | `float` | `0.02` | Legacy arg kept for config compatibility; it no longer changes the binary reward |
 | `inference_mode` | `str` | `"hosted"` | Inference routing mode (`hosted` or `local`) |
 | `inference_base_url` | `str \| null` | `null` | Override OpenAI-compatible inference endpoint |
 | `inference_api_key` | `str \| null` | `null` | Override API key for inference endpoint |
+| `judge_model` | `str` | `"z-ai/glm-4.7-flash"` | OpenRouter model used for binary semantic judging |
+| `judge_base_url` | `str` | `"https://openrouter.ai/api/v1"` | Judge provider base URL |
+| `judge_api_key_var` | `str` | `"OPENROUTER_API_KEY"` | Environment variable that stores the judge API key |
+| `judge_http_referer` | `str \| null` | `null` | Optional OpenRouter `HTTP-Referer` header |
+| `judge_app_title` | `str \| null` | `null` | Optional OpenRouter `X-Title` header |
 | `repl_backend` | `str` | `"local"` | RLM REPL backend (`local`, `prime`, `docker`, `modal`, `daytona`, `e2b`) |
 | `repl_backend_kwargs` | `dict \| null` | `null` | Backend-specific kwargs passed to the selected REPL backend |
 
@@ -74,8 +80,9 @@ Summarize key metrics your rubric emits and how they’re interpreted.
 
 | Metric | Meaning |
 | ------ | ------- |
-| `reward` | Terminal correctness minus efficiency penalty |
-| `correctness` | Exact-match terminal correctness before penalty |
+| `reward` | Binary semantic correctness from the judge (`0` or `1`) |
+| `correctness` | Same binary judge score exposed as a metric |
+| `judge_score` | Binary judge score for observability |
 | `used_repl` | Fraction of rollouts that executed at least one REPL block |
 | `used_recursion` | Fraction of rollouts that invoked `rlm_query(...)` |
 | `num_subcalls` | Number of recursive subcalls executed in the rollout |
@@ -84,4 +91,3 @@ Summarize key metrics your rubric emits and how they’re interpreted.
 ### Prime-RL Notes
 - The environment emits flattened recursive segments in `rlm_segments` so Prime-RL can train both root turns and recursive subcalls.
 - Use the configs under `/home/coder/prime_run/configs/rlm_rlvr/` with `orchestrator.use_token_client = true` so recursive subcalls record exact token IDs and logprobs from the same local inference server.
-
