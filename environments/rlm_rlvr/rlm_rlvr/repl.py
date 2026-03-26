@@ -3,7 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 from typing import Any, Callable
 
-from .external_rlm import LocalREPL, RLMChatCompletion, empty_usage_summary
+from .external_rlm import BaseEnv, LocalREPL, RLMChatCompletion, empty_usage_summary, get_environment
 
 
 class RecursiveLocalRepl(LocalREPL):
@@ -110,3 +110,51 @@ class RecursiveLocalRepl(LocalREPL):
             self._pending_llm_calls.append(self._completion_from_payload(payload, prompts[index]))
             outputs.append(str(payload.get("response", "")))
         return outputs
+
+
+class ReplAdapter:
+    def __init__(self, env: BaseEnv, *, context_count: int = 0, history_count: int = 0):
+        self._env = env
+        self._context_count = context_count
+        self._history_count = history_count
+
+    def execute_code(self, code: str):
+        return self._env.execute_code(code)
+
+    def get_context_count(self) -> int:
+        get_count = getattr(self._env, "get_context_count", None)
+        if callable(get_count):
+            return int(get_count())
+        return self._context_count
+
+    def get_history_count(self) -> int:
+        get_count = getattr(self._env, "get_history_count", None)
+        if callable(get_count):
+            return int(get_count())
+        return self._history_count
+
+    def close(self) -> None:
+        cleanup = getattr(self._env, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+
+
+def create_repl(
+    *,
+    backend: str,
+    backend_kwargs: dict[str, Any] | None,
+    context_payload: str,
+    llm_query_fn: Callable[[str, str | None], dict[str, Any]],
+    rlm_query_fn: Callable[[str, str | None, int | None], dict[str, Any]],
+) -> RecursiveLocalRepl | ReplAdapter:
+    if backend == "local":
+        return RecursiveLocalRepl(
+            context_payload=context_payload,
+            llm_query_fn=llm_query_fn,
+            rlm_query_fn=rlm_query_fn,
+        )
+
+    kwargs = dict(backend_kwargs or {})
+    kwargs.setdefault("context_payload", context_payload)
+    env = get_environment(backend, kwargs)
+    return ReplAdapter(env, context_count=1 if context_payload else 0)

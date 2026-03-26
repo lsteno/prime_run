@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -7,7 +8,7 @@ import verifiers as vf
 
 from .dataset import build_datasets
 from .external_rlm import CodeBlock, RLMIteration, build_system_prompt, build_user_prompt, find_code_blocks, find_final_answer, make_feedback_messages
-from .repl import RecursiveLocalRepl
+from .repl import create_repl
 from .reward import build_rubric
 from .runtime import RecursiveRuntime, RuntimeConfig, SyncInferenceSession
 from .trace import make_segment
@@ -24,8 +25,8 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             client = client.client
         assert isinstance(client, AsyncOpenAI)
 
-        base_url = str(client.base_url)
-        api_key = getattr(client, "api_key", None) or "EMPTY"
+        base_url = self.runtime_config.inference_base_url or str(client.base_url)
+        api_key = self.runtime_config.inference_api_key or getattr(client, "api_key", None) or "EMPTY"
         default_headers = dict(getattr(client, "default_headers", {}) or {})
         model_name = str(state["model"])
 
@@ -54,7 +55,9 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         )
         state["_runtime"] = RecursiveRuntime(state, self.runtime_config)
         state["_root_context"] = (state.get("info") or {}).get("context", "")
-        state["_root_repl"] = RecursiveLocalRepl(
+        state["_root_repl"] = create_repl(
+            backend=self.runtime_config.repl_backend,
+            backend_kwargs=self.runtime_config.repl_backend_kwargs,
             context_payload=state.get("_root_context", ""),
             llm_query_fn=state["_runtime"]._plain_query,
             rlm_query_fn=state["_runtime"]._recursive_query,
@@ -88,7 +91,7 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         del kwargs
         runtime: RecursiveRuntime = state["_runtime"]
         assistant_text = str(messages[-1].get("content", "")) if messages else ""
-        repl: RecursiveLocalRepl = state["_root_repl"]
+        repl = state["_root_repl"]
 
         code_block_strs = find_code_blocks(assistant_text)
         code_blocks: list[CodeBlock] = []
@@ -127,8 +130,8 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             next_message = build_user_prompt(
                 root_prompt=str((state.get("info") or {}).get("question", "")),
                 iteration=next_iteration,
-                context_count=repl.get_context_count(),
-                history_count=repl.get_history_count(),
+                context_count=int(repl.get_context_count()),
+                history_count=int(repl.get_history_count()),
             )
 
         response_messages = [*feedback_messages, next_message]
@@ -139,6 +142,11 @@ class RLMRLVREnv(vf.MultiTurnEnv):
 def load_environment(
     data_paths: list[str] | None = None,
     eval_data_paths: list[str] | None = None,
+    dataset_id: str | None = "lsteno/BEEG-agents",
+    dataset_train_split: str = "train",
+    dataset_eval_split: str = "eval",
+    dataset_config: str | None = None,
+    dataset_revision: str | None = None,
     seed: int = 42,
     max_examples: int = -1,
     max_eval_examples: int = -1,
@@ -150,10 +158,51 @@ def load_environment(
     top_p: float = 1.0,
     tokenizer_name: str | None = None,
     efficiency_penalty_coef: float = 0.02,
+    inference_mode: str = "hosted",
+    inference_base_url: str | None = None,
+    inference_api_key: str | None = None,
+    repl_backend: str = "local",
+    repl_backend_kwargs: dict[str, Any] | None = None,
 ) -> vf.Environment:
+    if max_iterations < 1:
+        raise ValueError("max_iterations must be >= 1")
+    if max_depth < 0:
+        raise ValueError("max_depth must be >= 0")
+    if turn_max_tokens < 1 or subcall_max_tokens < 1:
+        raise ValueError("turn_max_tokens and subcall_max_tokens must be >= 1")
+    if not (0.0 <= top_p <= 1.0):
+        raise ValueError("top_p must be between 0.0 and 1.0")
+    if temperature < 0.0:
+        raise ValueError("temperature must be >= 0.0")
+
+    valid_inference_modes = {"hosted", "local"}
+    if inference_mode not in valid_inference_modes:
+        raise ValueError(f"inference_mode must be one of {sorted(valid_inference_modes)}")
+
+    valid_repl_backends = {"local", "prime", "docker", "modal", "daytona", "e2b"}
+    if repl_backend not in valid_repl_backends:
+        raise ValueError(f"repl_backend must be one of {sorted(valid_repl_backends)}")
+
+    if inference_base_url is None:
+        if inference_mode == "local":
+            inference_base_url = os.environ.get("RLM_LOCAL_INFERENCE_BASE_URL")
+        elif inference_mode == "hosted":
+            inference_base_url = os.environ.get("RLM_HOSTED_INFERENCE_BASE_URL")
+
+    if inference_api_key is None:
+        if inference_mode == "local":
+            inference_api_key = os.environ.get("RLM_LOCAL_INFERENCE_API_KEY")
+        elif inference_mode == "hosted":
+            inference_api_key = os.environ.get("RLM_HOSTED_INFERENCE_API_KEY")
+
     train_builder, eval_builder = build_datasets(
         data_paths=data_paths,
         eval_data_paths=eval_data_paths,
+        dataset_id=dataset_id,
+        dataset_train_split=dataset_train_split,
+        dataset_eval_split=dataset_eval_split,
+        dataset_config=dataset_config,
+        dataset_revision=dataset_revision,
         seed=seed,
         max_examples=max_examples,
         max_eval_examples=max_eval_examples,
@@ -166,6 +215,11 @@ def load_environment(
         temperature=temperature,
         top_p=top_p,
         tokenizer_name=tokenizer_name,
+        inference_mode=inference_mode,
+        inference_base_url=inference_base_url,
+        inference_api_key=inference_api_key,
+        repl_backend=repl_backend,
+        repl_backend_kwargs=repl_backend_kwargs,
     )
     system_prompt = build_system_prompt(depth=0, max_depth=max_depth)
     return RLMRLVREnv(

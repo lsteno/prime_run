@@ -9,7 +9,7 @@ from openai.types.chat.chat_completion import ChatCompletion
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from .external_rlm import CodeBlock, QueryMetadata, RLMIteration, build_system_prompt, build_user_prompt, find_code_blocks, find_final_answer, make_feedback_messages
-from .repl import RecursiveLocalRepl
+from .repl import create_repl
 from .trace import append_step_trace, make_call_trace, make_segment
 
 
@@ -23,6 +23,11 @@ class RuntimeConfig:
     top_p: float = 1.0
     execution_output_char_limit: int = 4000
     tokenizer_name: str | None = None
+    inference_mode: str = "hosted"
+    inference_base_url: str | None = None
+    inference_api_key: str | None = None
+    repl_backend: str = "local"
+    repl_backend_kwargs: dict[str, Any] | None = None
 
 
 @dataclass
@@ -221,7 +226,9 @@ class RecursiveRuntime:
         repl_context = prompt if context_payload is None else context_payload
         context_metadata = QueryMetadata(repl_context)
         trace = make_call_trace(call_id=call_id, depth=depth, prompt=prompt)
-        repl = RecursiveLocalRepl(
+        repl = create_repl(
+            backend=self.config.repl_backend,
+            backend_kwargs=self.config.repl_backend_kwargs,
             context_payload=repl_context,
             llm_query_fn=self._plain_query,
             rlm_query_fn=self._recursive_query,
@@ -250,8 +257,8 @@ class RecursiveRuntime:
                     build_user_prompt(
                         root_prompt=prompt,
                         iteration=iteration_index,
-                        context_count=repl.get_context_count(),
-                        history_count=repl.get_history_count(),
+                        context_count=int(repl.get_context_count()),
+                        history_count=int(repl.get_history_count()),
                     )
                 ]
                 response_text, payload = self.session.generate(
@@ -348,6 +355,9 @@ class RecursiveRuntime:
         finally:
             self.state["current_call_depth"] = previous_depth
             self.state["current_branch_max_depth"] = previous_branch_max_depth
+            close = getattr(repl, "close", None)
+            if callable(close):
+                close()
 
         self.state["rlm_trace"].append(trace)
         return {

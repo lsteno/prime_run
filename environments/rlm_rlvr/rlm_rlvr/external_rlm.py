@@ -1,40 +1,46 @@
 from __future__ import annotations
 
-import importlib.util
-import os
-import sys
-from pathlib import Path
 from typing import Any
 
-
-def _ensure_rlm_importable() -> None:
-    source_dir = Path(os.environ.get("RLM_SOURCE_DIR", "/home/coder/rlm"))
-    if source_dir.exists() and str(source_dir) not in sys.path:
-        sys.path.insert(0, str(source_dir))
-
-    if importlib.util.find_spec("rlm") is None:
-        raise ModuleNotFoundError(
-            "The 'rlm' package is required for rlm_rlvr. Install 'rlms' or set RLM_SOURCE_DIR to a local checkout."
-        )
-
-
-_ensure_rlm_importable()
-
 from rlm.core.types import CodeBlock, QueryMetadata, RLMChatCompletion, RLMIteration, UsageSummary
+from rlm.environments import get_environment
+from rlm.environments.base_env import BaseEnv
 from rlm.environments.local_repl import LocalREPL
 from rlm.utils.parsing import find_code_blocks, find_final_answer, format_iteration
 from rlm.utils.prompts import RLM_SYSTEM_PROMPT, build_rlm_system_prompt, build_user_prompt
 
 
 def build_system_prompt(*, depth: int, max_depth: int, enable_rlm_query_batched_async: bool = True) -> str:
-    messages = build_rlm_system_prompt(
-        system_prompt=RLM_SYSTEM_PROMPT,
-        query_metadata=QueryMetadata(""),
-        recursion_budget=max(0, max_depth - depth),
-        current_depth=depth,
-        max_depth=max_depth,
-        enable_rlm_query_batched_async=enable_rlm_query_batched_async,
-    )
+    del enable_rlm_query_batched_async
+    base_kwargs = {
+        "system_prompt": RLM_SYSTEM_PROMPT,
+        "query_metadata": QueryMetadata(""),
+    }
+    attempts = [
+        {
+            **base_kwargs,
+            "recursion_budget": max(0, max_depth - depth),
+            "current_depth": depth,
+            "max_depth": max_depth,
+        },
+        {
+            **base_kwargs,
+            "current_depth": depth,
+            "max_depth": max_depth,
+        },
+        base_kwargs,
+    ]
+
+    messages = None
+    for kwargs in attempts:
+        try:
+            messages = build_rlm_system_prompt(**kwargs)
+            break
+        except TypeError:
+            continue
+
+    if messages is None:
+        raise RuntimeError("Unable to call build_rlm_system_prompt with installed rlms version.")
     return str(messages[0]["content"])
 
 
@@ -44,11 +50,14 @@ def build_initial_messages(
     root_prompt: str,
     enable_rlm_query_batched_async: bool = True,
 ) -> list[dict[str, str]]:
-    system_and_metadata = build_rlm_system_prompt(
-        system_prompt=RLM_SYSTEM_PROMPT,
-        query_metadata=QueryMetadata(context_payload),
-        enable_rlm_query_batched_async=enable_rlm_query_batched_async,
-    )
+    del enable_rlm_query_batched_async
+    try:
+        system_and_metadata = build_rlm_system_prompt(
+            system_prompt=RLM_SYSTEM_PROMPT,
+            query_metadata=QueryMetadata(context_payload),
+        )
+    except TypeError:
+        system_and_metadata = build_rlm_system_prompt(system_prompt=RLM_SYSTEM_PROMPT)
     return [system_and_metadata[1], build_user_prompt(root_prompt=root_prompt, iteration=0)]
 
 
@@ -63,6 +72,7 @@ def empty_usage_summary() -> UsageSummary:
 
 __all__ = [
     "CodeBlock",
+    "BaseEnv",
     "LocalREPL",
     "QueryMetadata",
     "RLMChatCompletion",
@@ -75,5 +85,6 @@ __all__ = [
     "empty_usage_summary",
     "find_code_blocks",
     "find_final_answer",
+    "get_environment",
     "make_feedback_messages",
 ]

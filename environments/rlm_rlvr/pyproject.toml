@@ -3,12 +3,12 @@ name = "rlm-rlvr"
 description = "Recursive RLVR environment for training RLM-style policies with Prime RL"
 tags = ["rlvr", "recursive", "prime-rl", "train", "eval"]
 version = "0.1.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "datasets>=4.1.0",
     "openai>=2.14.0",
     "pandas>=2.2.0",
-    "rlms>=0.1.1",
+    "rlms[prime]>=0.1.1",
     "transformers>=4.55.0",
     "verifiers>=0.1.10",
 ]
