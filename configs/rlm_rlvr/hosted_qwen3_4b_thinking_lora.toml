@@ -15,7 +15,7 @@ temperature = 0.7
 
 [[env]]
 id = "lsteno/rlm-rlvr"
-args = { dataset_id = "lsteno/BEEG-agents", dataset_train_split = "train", dataset_eval_split = "eval", max_examples = 2000, max_eval_examples = 128, max_iterations = 4, max_depth = 2, turn_max_tokens = 512, subcall_max_tokens = 256, tokenizer_name = "Qwen/Qwen3-4B-Thinking-2507", efficiency_penalty_coef = 0.02, inference_mode = "hosted" }
+args = { dataset_id = "lsteno/BEEG-agents", dataset_train_split = "train", dataset_eval_split = "eval", max_examples = 2000, max_eval_examples = 128, max_iterations = 4, max_depth = 2, turn_max_tokens = 512, subcall_max_tokens = 256 }
 
 [eval]
 interval = 25
@@ -25,7 +25,7 @@ eval_base_model = true
 
 [[eval.env]]
 id = "lsteno/rlm-rlvr"
-args = { dataset_id = "lsteno/BEEG-agents", dataset_train_split = "train", dataset_eval_split = "eval", max_examples = 2000, max_eval_examples = 128, max_iterations = 4, max_depth = 2, turn_max_tokens = 512, subcall_max_tokens = 256, tokenizer_name = "Qwen/Qwen3-4B-Thinking-2507", efficiency_penalty_coef = 0.02, inference_mode = "hosted" }
+args = { dataset_id = "lsteno/BEEG-agents", dataset_train_split = "train", dataset_eval_split = "eval", max_examples = 2000, max_eval_examples = 128, max_iterations = 4, max_depth = 2, turn_max_tokens = 512, subcall_max_tokens = 256 }
 
 [buffer]
 easy_threshold = 0.8

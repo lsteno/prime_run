@@ -65,8 +65,6 @@ max_iterations = 10
 max_depth = 2
 turn_max_tokens = 2048
 subcall_max_tokens = 2048
-tokenizer_name = "Qwen/Qwen2.5-Coder-7B-Instruct"
-efficiency_penalty_coef = 0.02
 
 [inference]
 gpu_memory_utilization = 0.70

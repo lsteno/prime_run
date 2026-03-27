@@ -48,8 +48,6 @@ max_iterations = 4
 max_depth = 2
 turn_max_tokens = 256
 subcall_max_tokens = 128
-tokenizer_name = "Qwen/Qwen2.5-7B-Instruct"
-efficiency_penalty_coef = 0.02
 
 [ckpt]
 

@@ -47,7 +47,7 @@ If you want checkpoints on the attached disk, clone the repo onto that mounted d
 
 ## 5. Export only the secrets needed on the pod
 
-For the standard on-demand path with `inference_mode = "local"`, the `prime-rl` launcher starts the local inference server for you. You do not need to set `RLM_LOCAL_INFERENCE_BASE_URL` or `RLM_LOCAL_INFERENCE_API_KEY`.
+The refactored environment uses the canonical `RLMEnv` path and no longer accepts `inference_mode` or local inference endpoint env args. In the standard on-demand path, `prime-rl` handles model serving for rollout generation and recursive subcalls automatically.
 
 Export only the secrets required by your run:
 
@@ -57,7 +57,7 @@ export HF_TOKEN=...
 export WANDB_API_KEY=...
 ```
 
-`PRIME_API_KEY` is only needed if you switch to `repl_backend = "prime"` or use other Prime-hosted endpoints directly from the environment.
+You do not need `PRIME_API_KEY` for the default `rlm_rlvr` path unless you add extra Prime-hosted integrations outside the canonical environment wrapper.
 
 ## 6. Smoke the run before scaling up
 

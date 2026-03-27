@@ -75,9 +75,6 @@ max_iterations = 12
 max_depth = 3
 turn_max_tokens = 1024
 subcall_max_tokens = 512
-tokenizer_name = "Qwen/Qwen3.5-4B"
-efficiency_penalty_coef = 0.02
-inference_mode = "local"
 judge_model = "z-ai/glm-4.7-flash"
 
 [inference]
