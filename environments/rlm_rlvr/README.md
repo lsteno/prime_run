@@ -38,9 +38,11 @@ Notes:
 - Use `-a` / `--env-args` to pass environment-specific configuration as a JSON object.
 - This environment reuses the published `rlms` package for prompt construction, parsing, and REPL execution backends.
 - Install with Prime CLI (`prime env install rlm_rlvr -p /home/coder/prime_run/environments`) to ensure dependencies are available.
-- Set `OPENROUTER_API_KEY` so the semantic judge can score outputs. For hosted training, add it via `env_file`.
+- Set `OPENROUTER_API_KEY` so the semantic judge can score outputs. For managed hosted training, add it via `env_file`. For self-managed `prime-rl` runs on Prime Intellect on-demand GPUs, export it directly in the pod shell.
 - For `repl_backend = "prime"`, set `PRIME_API_KEY` in your environment.
 - Local parquet mode is opt-in: pass `data_paths` explicitly. If `eval_data_paths` is omitted, eval defaults to a deterministic 10% holdout from `data_paths`.
+- `inference_mode = "hosted"` is for managed hosted training. `inference_mode = "local"` is the standard setting for self-managed `prime-rl` runs on on-demand GPUs.
+- In the standard self-managed `prime-rl` path, the launcher handles the local inference base URL and API wiring. You do not need to set `RLM_LOCAL_INFERENCE_BASE_URL` or `RLM_LOCAL_INFERENCE_API_KEY` unless you are overriding the default local server.
 
 ### Environment Arguments
 
@@ -64,9 +66,9 @@ Notes:
 | `top_p` | `float` | `1.0` | Root and recursive nucleus sampling |
 | `tokenizer_name` | `str \| null` | `null` | Optional tokenizer override; defaults to the rollout model name |
 | `efficiency_penalty_coef` | `float` | `0.02` | Legacy arg kept for config compatibility; it no longer changes the binary reward |
-| `inference_mode` | `str` | `"hosted"` | Inference routing mode (`hosted` or `local`) |
-| `inference_base_url` | `str \| null` | `null` | Override OpenAI-compatible inference endpoint |
-| `inference_api_key` | `str \| null` | `null` | Override API key for inference endpoint |
+| `inference_mode` | `str` | `"hosted"` | Inference routing mode. Use `hosted` for managed hosted training and `local` for self-managed `prime-rl` on local or on-demand GPUs |
+| `inference_base_url` | `str \| null` | `null` | Override the OpenAI-compatible inference endpoint. Usually unset for self-managed `prime-rl`, which wires the local inference server automatically |
+| `inference_api_key` | `str \| null` | `null` | Override API key for the inference endpoint. Usually unset for self-managed `prime-rl` local inference |
 | `judge_model` | `str` | `"z-ai/glm-4.7-flash"` | OpenRouter model used for binary semantic judging |
 | `judge_base_url` | `str` | `"https://openrouter.ai/api/v1"` | Judge provider base URL |
 | `judge_api_key_var` | `str` | `"OPENROUTER_API_KEY"` | Environment variable that stores the judge API key |
@@ -90,4 +92,6 @@ Summarize key metrics your rubric emits and how they’re interpreted.
 
 ### Prime-RL Notes
 - The environment emits flattened recursive segments in `rlm_segments` so Prime-RL can train both root turns and recursive subcalls.
-- Use the configs under `/home/coder/prime_run/configs/rlm_rlvr/` with `orchestrator.use_token_client = true` so recursive subcalls record exact token IDs and logprobs from the same local inference server.
+- For Prime Intellect on-demand pods, start with `/home/coder/prime_run/configs/rlm_rlvr/ondemand_smoke_qwen3_4b.toml`, which keeps `orchestrator.use_token_client = false` and `inference_mode = "local"` for a lower-risk bring-up path.
+- After the pod path is stable, use `/home/coder/prime_run/configs/rlm_rlvr/ondemand_long_deep_qwen35_9b.toml` for the longer Qwen 3.5 9B run.
+- If you need exact token IDs and logprobs from the same local inference server for recursive subcalls, enable `orchestrator.use_token_client = true` in a follow-up config after the on-demand smoke path is stable.
