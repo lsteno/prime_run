@@ -4,9 +4,12 @@
 ./environments/*/outputs
 *.pyc
 .env
+*.log
 
 # local large artifacts / datasets
 /core
 /data/train_with_context_tokens_split_*/
 *.parquet
 *.json
+outputs/rlm-rlvr-ondemand-full-h100x8-qwen35-9b-whole-dataset/checkpoints/step_10/trainer/.__0_0.distcp.D4TIEB0ufQ
+outputs/rlm-rlvr-ondemand-full-h100x8-qwen35-9b-whole-dataset/*

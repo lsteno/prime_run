@@ -1,0 +1,111 @@
+output_dir = "outputs/rlm-rlvr-ondemand-full-h100x8-qwen35-9b-whole-dataset-highthroughput"
+max_steps = 200
+seq_len = 15360
+
+[deployment]
+gpus_per_node = 8
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[model]
+name = "Qwen/Qwen3.5-9B"
+
+[wandb]
+project = "rlm-rlvr"
+name = "rlm-rlvr-ondemand-full-h100x8-qwen35-9b-whole-dataset-highthroughput"
+offline = false
+
+[trainer.optim]
+lr = 8e-7
+weight_decay = 0.0
+
+[trainer.model]
+optimization_dtype = "bfloat16"
+attn = "flash_attention_3"
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.model.lora]
+rank = 32
+alpha = 64
+dropout = 0.0
+target_modules = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+[trainer.tokenizer]
+name = "Qwen/Qwen3.5-9B"
+
+[trainer.loss]
+type = "custom"
+import_path = "prime_rl.trainer.rl.grpo_loss.clipped_grpo_loss"
+kwargs = { clip_eps = 0.2 }
+
+[orchestrator]
+batch_size = 8
+rollouts_per_example = 2
+max_inflight_rollouts = 8
+max_concurrent = 8
+max_async_level = 1
+use_token_client = false
+
+[orchestrator.wandb.log_extras]
+samples = true
+distributions = true
+interval = 10
+
+[orchestrator.sampling]
+max_tokens = 1024
+temperature = 0.7
+
+[orchestrator.log]
+env_worker_logs = true
+log_data = true
+
+[orchestrator.trace_export]
+enabled = true
+include_segments = true
+include_metrics = true
+
+[[orchestrator.env]]
+id = "rlm_rlvr"
+max_retries = 3
+
+[orchestrator.env.args]
+dataset_id = "lsteno/BEEG-agents"
+dataset_train_split = "train"
+dataset_eval_split = "eval"
+max_examples = -1
+max_eval_examples = -1
+max_iterations = 19
+max_depth = 2
+turn_max_tokens = 512
+subcall_max_tokens = 384
+max_prompt_tokens = 14336
+tokenizer_name = "Qwen/Qwen3.5-9B"
+efficiency_penalty_coef = 0.02
+inference_mode = "local"
+judge_model = "z-ai/glm-4.7-flash"
+
+[inference]
+enable_prefix_caching = true
+gpu_memory_utilization = 0.92
+
+[inference.parallel]
+tp = 2
+dp = 2
+
+[inference.model]
+max_model_len = 16384
+enforce_eager = false
+
+[ckpt]
+interval = 25
+keep_last = 4

@@ -69,6 +69,7 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             default_headers=default_headers,
             model_name=model_name,
             tokenizer_name=self.runtime_config.tokenizer_name,
+            max_prompt_tokens=self.runtime_config.max_prompt_tokens,
         )
         state["_runtime"] = RecursiveRuntime(state, self.runtime_config)
         state["_root_context"] = (state.get("info") or {}).get("context", "")
@@ -173,6 +174,7 @@ def load_environment(
     max_depth: int = 2,
     turn_max_tokens: int = 192,
     subcall_max_tokens: int = 128,
+    max_prompt_tokens: int | None = None,
     temperature: float = 1.0,
     top_p: float = 1.0,
     tokenizer_name: str | None = None,
@@ -194,6 +196,8 @@ def load_environment(
         raise ValueError("max_depth must be >= 0")
     if turn_max_tokens < 1 or subcall_max_tokens < 1:
         raise ValueError("turn_max_tokens and subcall_max_tokens must be >= 1")
+    if max_prompt_tokens is not None and max_prompt_tokens < 1:
+        raise ValueError("max_prompt_tokens must be >= 1")
     if not (0.0 <= top_p <= 1.0):
         raise ValueError("top_p must be between 0.0 and 1.0")
     if temperature < 0.0:
@@ -246,6 +250,7 @@ def load_environment(
         max_iterations=max_iterations,
         turn_max_tokens=turn_max_tokens,
         subcall_max_tokens=subcall_max_tokens,
+        max_prompt_tokens=max_prompt_tokens,
         temperature=temperature,
         top_p=top_p,
         tokenizer_name=tokenizer_name,

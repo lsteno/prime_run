@@ -19,6 +19,7 @@ class RuntimeConfig:
     max_iterations: int = 4
     turn_max_tokens: int = 192
     subcall_max_tokens: int = 128
+    max_prompt_tokens: int | None = None
     temperature: float = 1.0
     top_p: float = 1.0
     execution_output_char_limit: int = 4000
@@ -49,8 +50,10 @@ class SyncInferenceSession:
         default_headers: dict[str, str] | None,
         model_name: str,
         tokenizer_name: str | None,
+        max_prompt_tokens: int | None,
     ):
         self.model_name = model_name
+        self.max_prompt_tokens = max_prompt_tokens
         self.client = OpenAI(
             base_url=base_url,
             api_key=api_key or "EMPTY",
@@ -72,6 +75,70 @@ class SyncInferenceSession:
 
     def count_text_tokens(self, text: str) -> int:
         return len(self.tokenizer.encode(text, add_special_tokens=False))
+
+    def _clone_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        return [{"role": str(message["role"]), "content": str(message["content"])} for message in messages]
+
+    def _drop_oldest_history_message(self, messages: list[dict[str, str]]) -> bool:
+        if not messages:
+            return False
+        drop_index = 1 if messages[0].get("role") == "system" else 0
+        if drop_index >= len(messages) - 1:
+            return False
+        messages.pop(drop_index)
+        return True
+
+    def _decode_tail_tokens(self, token_ids: list[int], *, fallback_text: str) -> str:
+        decode = getattr(self.tokenizer, "decode", None)
+        if callable(decode):
+            text = str(decode(token_ids, skip_special_tokens=False)).strip()
+            if text:
+                return text
+        approx_chars = max(1, int(len(fallback_text) * len(token_ids) / max(len(self.tokenizer.encode(fallback_text, add_special_tokens=False)), 1)))
+        return fallback_text[-approx_chars:].strip() or fallback_text[-approx_chars:]
+
+    def _truncate_last_message(self, messages: list[dict[str, str]], *, overflow_tokens: int) -> bool:
+        if not messages:
+            return False
+        last_index = len(messages) - 1
+        content = str(messages[last_index].get("content", ""))
+        token_ids = self.tokenizer.encode(content, add_special_tokens=False)
+        if len(token_ids) <= 1:
+            return False
+        trim_tokens = min(len(token_ids) - 1, max(overflow_tokens + 16, len(token_ids) // 8, 1))
+        keep_tokens = max(1, len(token_ids) - trim_tokens)
+        new_content = self._decode_tail_tokens(token_ids[-keep_tokens:], fallback_text=content)
+        if new_content == content:
+            return False
+        messages[last_index] = {**messages[last_index], "content": new_content}
+        return True
+
+    def _fit_messages_to_prompt_budget(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_prompt_tokens: int | None = None,
+    ) -> tuple[list[dict[str, str]], list[int]]:
+        budget = self.max_prompt_tokens if max_prompt_tokens is None else max_prompt_tokens
+        trimmed_messages = self._clone_messages(messages)
+        prompt_ids = self.render_prompt_ids(trimmed_messages, add_generation_prompt=True)
+        if budget is None:
+            return trimmed_messages, prompt_ids
+
+        while len(prompt_ids) > budget:
+            overflow_tokens = len(prompt_ids) - budget
+            if self._drop_oldest_history_message(trimmed_messages):
+                prompt_ids = self.render_prompt_ids(trimmed_messages, add_generation_prompt=True)
+                continue
+            if not self._truncate_last_message(trimmed_messages, overflow_tokens=overflow_tokens):
+                break
+            prompt_ids = self.render_prompt_ids(trimmed_messages, add_generation_prompt=True)
+        return trimmed_messages, prompt_ids
+
+    @staticmethod
+    def _is_prompt_too_long_error(exc: Exception) -> bool:
+        message = str(exc)
+        return "maximum context length" in message and "prompt" in message
 
     @staticmethod
     def _coerce_token_ids(token_ids: Any, *, fallback: list[int]) -> list[int]:
@@ -100,25 +167,42 @@ class SyncInferenceSession:
         temperature: float,
         top_p: float,
     ) -> tuple[str, TokenPayload]:
-        prompt_ids = self.render_prompt_ids(messages, add_generation_prompt=True)
-        response = self.client.post(
-            "/chat/completions/tokens",
-            body={
-                "model": self.model_name,
-                "messages": messages,
-                "tokens": prompt_ids,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-                "logprobs": True,
-                "extra_body": {
-                    "return_token_ids": True,
-                    "top_k": -1,
-                    "min_p": 0.0,
-                },
+        request_messages, prompt_ids = self._fit_messages_to_prompt_budget(messages)
+        request_body = {
+            "model": self.model_name,
+            "messages": request_messages,
+            "tokens": prompt_ids,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "logprobs": True,
+            "extra_body": {
+                "return_token_ids": True,
+                "top_k": -1,
+                "min_p": 0.0,
             },
-            cast_to=ChatCompletion,
-        )
+        }
+        try:
+            response = self.client.post(
+                "/chat/completions/tokens",
+                body=request_body,
+                cast_to=ChatCompletion,
+            )
+        except Exception as exc:
+            if not self._is_prompt_too_long_error(exc):
+                raise
+            retry_budget = max((self.max_prompt_tokens or len(prompt_ids)) - 32, 1)
+            request_messages, prompt_ids = self._fit_messages_to_prompt_budget(
+                request_messages,
+                max_prompt_tokens=retry_budget,
+            )
+            request_body["messages"] = request_messages
+            request_body["tokens"] = prompt_ids
+            response = self.client.post(
+                "/chat/completions/tokens",
+                body=request_body,
+                cast_to=ChatCompletion,
+            )
         assert response.choices is not None and len(response.choices) == 1
         choice = response.choices[0]
         assert choice.message is not None

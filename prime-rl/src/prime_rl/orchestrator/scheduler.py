@@ -89,6 +89,7 @@ class Scheduler:
         self.sampling_args = get_sampling_args(config.sampling, temperature=initial_temp)
         self.model_name = self.config.model.name
         self.json_logging = config.log.json_logging
+        self.max_retries_by_task = {env_config.resolved_name: env_config.max_retries for env_config in config.env}
 
         # Inference pool - used for admin operations (adapter sync) and metrics
         self.inference_pool = inference_pool
@@ -201,7 +202,7 @@ class Scheduler:
                 example=group.example,
                 model_name=self.model_name,
                 sampling_args=self.sampling_args,
-                max_retries=0,  # TODO: make configurable
+                max_retries=self.max_retries_by_task.get(group.example["task"], 0),
             )
         )
         self.inflight_requests[run_rollout_task] = InflightRolloutInfo(

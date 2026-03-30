@@ -17,10 +17,39 @@ class _FakeTokenizer:
         del add_special_tokens
         return [len(text), len(text) + 1] if text else []
 
+    def decode(self, token_ids: list[int], skip_special_tokens: bool = False) -> str:
+        del skip_special_tokens
+        return " ".join(f"tok{token_id}" for token_id in token_ids)
+
+
+class _BudgetTokenizer:
+    def apply_chat_template(self, messages, *, tokenize: bool, add_generation_prompt: bool, return_dict: bool):
+        assert tokenize is True
+        assert return_dict is True
+        input_ids: list[int] = []
+        for index, message in enumerate(messages):
+            input_ids.append(1000 + index)
+            input_ids.extend(self.encode(message["content"]))
+        if add_generation_prompt:
+            input_ids.append(2000)
+        return {"input_ids": input_ids}
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return [len(part) for part in text.split() if part]
+
+    def decode(self, token_ids: list[int], skip_special_tokens: bool = False) -> str:
+        del skip_special_tokens
+        return " ".join("x" * max(token_id, 1) for token_id in token_ids)
+
 
 class _FakeClient:
+    def __init__(self) -> None:
+        self.bodies: list[dict] = []
+
     def post(self, path: str, *, body, cast_to):
-        del body, cast_to
+        del cast_to
+        self.bodies.append(body)
         assert path == "/chat/completions/tokens"
         choice = SimpleNamespace(
             message=SimpleNamespace(content="ok"),
@@ -35,6 +64,7 @@ def test_generate_falls_back_when_token_metadata_is_missing() -> None:
     session.model_name = "fake-model"
     session.client = _FakeClient()
     session.tokenizer = _FakeTokenizer()
+    session.max_prompt_tokens = None
 
     text, payload = SyncInferenceSession.generate(
         session,
@@ -49,6 +79,34 @@ def test_generate_falls_back_when_token_metadata_is_missing() -> None:
     assert payload.completion_ids == [2, 3]
     assert payload.completion_logprobs == [0.0, 0.0]
     assert payload.completion_mask == [True, True]
+
+
+def test_generate_trims_prompt_history_to_fit_budget() -> None:
+    client = _FakeClient()
+    session = object.__new__(SyncInferenceSession)
+    session.model_name = "fake-model"
+    session.client = client
+    session.tokenizer = _BudgetTokenizer()
+    session.max_prompt_tokens = 10
+
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "assistant", "content": "drop these tokens first please"},
+        {"role": "user", "content": "keep this question available"},
+    ]
+
+    SyncInferenceSession.generate(
+        session,
+        messages=messages,
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    assert client.bodies, "expected a completion request"
+    request_body = client.bodies[0]
+    assert len(request_body["tokens"]) <= 10
+    assert len(request_body["messages"]) < len(messages)
 
 
 def test_recursive_local_repl_routes_llm_and_rlm_queries() -> None:

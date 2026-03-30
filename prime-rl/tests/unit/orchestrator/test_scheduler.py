@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import prime_rl.orchestrator.scheduler as scheduler_module
 from prime_rl.orchestrator.scheduler import InflightRolloutInfo, Scheduler
 
 
@@ -57,5 +58,50 @@ def test_update_off_policy_does_not_increment_interleaved_on_policy_tasks():
             if task is not None and not task.done():
                 task.cancel()
         await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+def test_schedule_rollout_uses_task_retry_config():
+    async def run() -> None:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.rate_limiter = None
+        scheduler.groups = {
+            1: SimpleNamespace(
+                example={"task": "rlm_rlvr"},
+                rollouts_to_schedule=1,
+                pinned_client=None,
+            )
+        }
+        scheduler.inflight_requests = {}
+        scheduler.env = object()
+        scheduler.model_name = "test-model"
+        scheduler.sampling_args = {"temperature": 0.7}
+        scheduler.max_retries_by_task = {"rlm_rlvr": 3}
+
+        client = SimpleNamespace(api_base_url="http://test", extra_headers={})
+
+        async def select_client():
+            return client
+
+        scheduler._select_least_loaded_client = select_client
+
+        captured: dict[str, int] = {}
+        original_run_rollout = scheduler_module.run_rollout
+
+        async def fake_run_rollout(**kwargs):
+            captured["max_retries"] = kwargs["max_retries"]
+            return {"trajectory": [], "error": None}
+
+        scheduler_module.run_rollout = fake_run_rollout
+        try:
+            await scheduler.schedule_rollout(group_id=1)
+            assert scheduler.inflight_requests
+            task = next(iter(scheduler.inflight_requests))
+            await task
+        finally:
+            scheduler_module.run_rollout = original_run_rollout
+
+        assert captured["max_retries"] == 3
 
     asyncio.run(run())
