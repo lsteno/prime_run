@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -47,6 +49,62 @@ def _get_expected_answers(answer: str, info: dict[str, Any] | None) -> list[str]
     return [answer]
 
 
+def _normalize_text(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value)).strip()
+    text = re.sub(r"\s+", " ", text)
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'", "`"}:
+        text = text[1:-1].strip()
+    return text
+
+
+def _canonicalize_json(value: str) -> str | None:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _canonicalize_number(value: str) -> str | None:
+    candidate = value.replace(",", "").strip()
+    if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", candidate):
+        return None
+
+    try:
+        normalized = format(Decimal(candidate).normalize(), "f")
+    except InvalidOperation:
+        return None
+
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    return normalized or "0"
+
+
+def _equivalent_forms(value: Any) -> set[str]:
+    normalized = _normalize_text(value)
+    if not normalized:
+        return {""}
+
+    forms = {normalized, normalized.casefold()}
+    json_form = _canonicalize_json(normalized)
+    if json_form is not None:
+        forms.add(json_form)
+
+    number_form = _canonicalize_number(normalized)
+    if number_form is not None:
+        forms.add(number_form)
+
+    return forms
+
+
+def _is_exact_match(predicted_answer: str, expected_answers: list[str]) -> bool:
+    predicted_forms = _equivalent_forms(predicted_answer)
+    for expected_answer in expected_answers:
+        if predicted_forms & _equivalent_forms(expected_answer):
+            return True
+    return False
+
+
 def _parse_binary_judge_score(raw_text: str) -> float:
     text = raw_text.strip()
     if text in {"0", "1"}:
@@ -72,6 +130,32 @@ def _parse_binary_judge_score(raw_text: str) -> float:
 
 def _format_expected_answers(answers: list[str]) -> str:
     return "\n".join(f"- {answer}" for answer in answers)
+
+
+def _extract_message_text(message: Any) -> str:
+    content = getattr(message, "content", None)
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            text = getattr(part, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+                continue
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        joined = "".join(parts).strip()
+        if joined:
+            return joined
+
+    reasoning = getattr(message, "reasoning", None)
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning.strip()
+    return ""
 
 
 def _record_judge_payload(
@@ -111,7 +195,7 @@ async def _call_binary_judge(
     *,
     judge_model: str,
     judge_prompt: str,
-) -> tuple[float, str]:
+) -> tuple[float, str, str | None]:
     messages = [
         {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
         {"role": "user", "content": judge_prompt},
@@ -123,12 +207,13 @@ async def _call_binary_judge(
             model=judge_model,
             messages=messages,
             temperature=0,
-            max_tokens=4,
+            max_tokens=8,
+            extra_body={"reasoning": {"enabled": False}},
         )
-        raw_response = (judge_response.choices[0].message.content or "").strip()
+        raw_response = _extract_message_text(judge_response.choices[0].message)
         last_raw_response = raw_response
         try:
-            return _parse_binary_judge_score(raw_response), raw_response
+            return _parse_binary_judge_score(raw_response), raw_response, None
         except ValueError:
             if attempt == 1:
                 break
@@ -144,7 +229,7 @@ async def _call_binary_judge(
                 },
             ]
 
-    return 0.0, last_raw_response
+    return 0.0, last_raw_response, "invalid_binary_score"
 
 
 def build_rubric(
@@ -177,19 +262,30 @@ def build_rubric(
             )
             return 0.0
 
+        if _is_exact_match(predicted_answer, expected_answers):
+            state["reward_correctness"] = 1.0
+            _record_judge_payload(
+                state,
+                predicted_answer=predicted_answer,
+                expected_answers=expected_answers,
+                score=1.0,
+                raw_response="[exact_match]",
+                parse_error=None,
+            )
+            return 1.0
+
         judge_prompt = JUDGE_PROMPT.format(
             question=question or "(not provided)",
             expected_answers=_format_expected_answers(expected_answers),
             predicted_answer=predicted_answer,
         )
-        score, raw_response = await _call_binary_judge(
+        score, raw_response, parse_error = await _call_binary_judge(
             judge_client,
             judge_model=judge_model,
             judge_prompt=judge_prompt,
         )
 
         state["reward_correctness"] = score
-        parse_error = None if raw_response.strip() in {"0", "1"} else ("invalid_binary_score" if score == 0.0 else None)
         _record_judge_payload(
             state,
             predicted_answer=predicted_answer,
