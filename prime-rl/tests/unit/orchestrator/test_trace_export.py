@@ -106,3 +106,62 @@ def test_export_rollout_traces_includes_judge_debug_payload(tmp_path: Path) -> N
     assert payload["rollouts"][0]["judge_score"] == 1.0
     assert payload["rollouts"][0]["judge_raw_response"] == "1"
     assert payload["rollouts"][0]["judge_parse_error"] is None
+
+
+def test_export_rollout_traces_falls_back_to_debug_trace_and_segments(tmp_path: Path) -> None:
+    trace_path = export_rollout_traces(
+        rollouts=[
+            {
+                "example_id": 10,
+                "task": "rlm_rlvr",
+                "answer": "ground truth answer",
+                "reward": 1.0,
+                "error": None,
+                "final_answer": "model answer",
+                "trajectory": [
+                    {
+                        "extras": {
+                            "rlm_debug": {
+                                "trace": [{"call_id": 7, "steps": [{"assistant": "child"}]}],
+                                "segments": [
+                                    {
+                                        "order": 3,
+                                        "depth": 1,
+                                        "kind": "plain_query",
+                                        "temperature": 0.0,
+                                        "response_text": "child answer",
+                                        "prompt_ids": [1, 2],
+                                        "completion_ids": [3],
+                                        "completion_logprobs": [-0.1],
+                                        "completion_mask": [True],
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                ],
+                "is_truncated": False,
+                "stop_condition": "completed",
+                "sampling_args": {},
+                "timing": {},
+            }
+        ],
+        step=5,
+        output_dir=tmp_path,
+    )
+
+    payload = json.loads(trace_path.read_text())
+
+    assert payload["rollouts"][0]["trace"] == [{"call_id": 7, "steps": [{"assistant": "child"}]}]
+    assert payload["rollouts"][0]["segments"] == [
+        {
+            "order": 3,
+            "depth": 1,
+            "kind": "plain_query",
+            "temperature": 0.0,
+            "response_text": "child answer",
+            "prompt_token_count": 2,
+            "completion_token_count": 1,
+            "trainable_token_count": 1,
+        }
+    ]

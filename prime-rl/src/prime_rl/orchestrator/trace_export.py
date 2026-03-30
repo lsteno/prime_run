@@ -65,6 +65,14 @@ def _rollout_debug(rollout: vf.RolloutOutput) -> dict[str, Any]:
 
 def _rollout_record(rollout: vf.RolloutOutput, include_segments: bool, include_metrics: bool) -> dict[str, Any]:
     debug = _rollout_debug(rollout)
+    trace = rollout.get("rlm_trace")
+    if not trace:
+        trace = debug.get("trace") or []
+
+    segments = rollout.get("rlm_segments")
+    if not segments:
+        segments = debug.get("segments") or []
+
     record = {
         "example_id": rollout.get("example_id"),
         "task": rollout.get("task"),
@@ -81,12 +89,12 @@ def _rollout_record(rollout: vf.RolloutOutput, include_segments: bool, include_m
         "stop_condition": rollout.get("stop_condition"),
         "sampling_args": _json_safe(rollout.get("sampling_args") or {}),
         "timing": _json_safe(rollout.get("timing") or {}),
-        "trace": _json_safe(rollout.get("rlm_trace") or []),
+        "trace": _json_safe(trace),
     }
     if include_metrics:
         record["metrics"] = _json_safe(rollout.get("metrics") or {})
     if include_segments:
-        record["segments"] = [_segment_summary(segment) for segment in rollout.get("rlm_segments") or []]
+        record["segments"] = [_segment_summary(segment) for segment in segments]
     return record
 
 

@@ -73,6 +73,25 @@ class SyncInferenceSession:
     def count_text_tokens(self, text: str) -> int:
         return len(self.tokenizer.encode(text, add_special_tokens=False))
 
+    @staticmethod
+    def _coerce_token_ids(token_ids: Any, *, fallback: list[int]) -> list[int]:
+        if token_ids is None:
+            return list(fallback)
+        return [int(token_id) for token_id in token_ids]
+
+    @staticmethod
+    def _coerce_logprobs(logprobs: Any, *, completion_len: int) -> list[float]:
+        if hasattr(logprobs, "content") and logprobs.content is not None:
+            values = [float(item.logprob) for item in logprobs.content]
+        elif isinstance(logprobs, dict) and logprobs.get("content") is not None:
+            values = [float(item["logprob"]) for item in logprobs["content"]]
+        else:
+            values = []
+
+        if len(values) < completion_len:
+            values.extend([0.0] * (completion_len - len(values)))
+        return values[:completion_len]
+
     def generate(
         self,
         *,
@@ -104,13 +123,12 @@ class SyncInferenceSession:
         choice = response.choices[0]
         assert choice.message is not None
         text = (choice.message.content or "").strip()
-        completion_ids = list(getattr(choice, "token_ids"))
-        prompt_token_ids = list(getattr(response, "prompt_token_ids"))
-        logprobs = choice.logprobs
-        if hasattr(logprobs, "content") and logprobs.content is not None:
-            completion_logprobs = [float(item.logprob) for item in logprobs.content]
-        else:
-            completion_logprobs = [float(item["logprob"]) for item in logprobs["content"]]
+        completion_ids = self._coerce_token_ids(
+            getattr(choice, "token_ids", None),
+            fallback=self.tokenizer.encode(text, add_special_tokens=False),
+        )
+        prompt_token_ids = self._coerce_token_ids(getattr(response, "prompt_token_ids", None), fallback=prompt_ids)
+        completion_logprobs = self._coerce_logprobs(getattr(choice, "logprobs", None), completion_len=len(completion_ids))
         payload = TokenPayload(
             prompt_ids=prompt_token_ids,
             completion_ids=completion_ids,
