@@ -62,13 +62,50 @@ class WandbMonitor(Monitor):
         if config is not None and isinstance(config, WandbWithExtrasConfig) and config.log_extras:
             if config.log_extras.samples:
                 self.last_log_samples_step = -1
-                self.samples_cols = ["step", "task", "example_id", "messages", "input_ids", "reward"]
+                self.samples_cols = [
+                    "step",
+                    "task",
+                    "example_id",
+                    "messages",
+                    "input_ids",
+                    "answer",
+                    "expected_answers",
+                    "rlm_answer",
+                    "judge_score",
+                    "judge_raw_response",
+                    "reward",
+                ]
                 self.samples_table = wandb.Table(
                     columns=self.samples_cols,
                     log_mode="INCREMENTAL",
                 )
                 self.tokenizer = tokenizer
                 self.samples = []
+
+    @staticmethod
+    def _rollout_answer(rollout: vf.RolloutOutput) -> str:
+        final_answer = rollout.get("final_answer")
+        if final_answer not in (None, ""):
+            return str(final_answer)
+
+        completion = rollout.get("completion") or []
+        if completion:
+            last_message = completion[-1]
+            if isinstance(last_message, dict):
+                content = last_message.get("content")
+                if content not in (None, ""):
+                    return str(content)
+
+        return ""
+
+    @staticmethod
+    def _rollout_debug(rollout: vf.RolloutOutput) -> dict[str, Any]:
+        trajectory = rollout.get("trajectory") or []
+        if not trajectory:
+            return {}
+        last_step = trajectory[-1]
+        extras = last_step.get("extras") or {}
+        return extras.get("rlm_debug") or {}
 
     def _maybe_overwrite_wandb_command(self) -> None:
         """Overwrites sys.argv with the start command if it is set in the environment variables."""
@@ -114,12 +151,18 @@ class WandbMonitor(Monitor):
             tokens = last_step["tokens"]
             full_ids = tokens["prompt_ids"] + tokens["completion_ids"]
             messages_text = self.tokenizer.decode(full_ids)
+            debug = self._rollout_debug(rollout)
             sample = {
                 "step": step,
                 "task": rollout.get("task"),
                 "example_id": rollout["example_id"],
                 "messages": messages_text,
                 "input_ids": str(full_ids),
+                "answer": rollout.get("answer"),
+                "expected_answers": json.dumps(debug.get("expected_answers", [])),
+                "rlm_answer": self._rollout_answer(rollout),
+                "judge_score": debug.get("judge_score"),
+                "judge_raw_response": debug.get("judge_raw_response"),
                 "reward": rollout["reward"],
             }
             assert list(sample.keys()) == self.samples_cols, (

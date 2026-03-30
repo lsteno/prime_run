@@ -1,0 +1,81 @@
+output_dir = "outputs/rlm-rlvr-ondemand-smoke-a100x4-qwen25-7b"
+max_steps = 2
+seq_len = 8192
+
+[deployment]
+gpus_per_node = 4
+num_train_gpus = 2
+num_infer_gpus = 2
+
+[model]
+name = "Qwen/Qwen2.5-7B-Instruct"
+
+[wandb]
+project = "rlm-rlvr"
+name = "rlm-rlvr-ondemand-smoke-a100x4-qwen25-7b"
+offline = true
+
+[trainer.optim]
+lr = 1e-6
+weight_decay = 0.0
+
+[trainer.model.lora]
+rank = 16
+dropout = 0.0
+
+[trainer.loss]
+type = "custom"
+import_path = "prime_rl.trainer.rl.grpo_loss.clipped_grpo_loss"
+kwargs = { clip_eps = 0.2 }
+
+[orchestrator]
+batch_size = 4
+rollouts_per_example = 1
+max_inflight_rollouts = 4
+max_concurrent = 4
+max_async_level = 1
+use_token_client = false
+
+[orchestrator.sampling]
+max_tokens = 192
+
+[orchestrator.log]
+env_worker_logs = true
+log_data = true
+
+[orchestrator.trace_export]
+enabled = true
+include_segments = true
+include_metrics = true
+
+[[orchestrator.env]]
+id = "rlm_rlvr"
+
+[orchestrator.env.args]
+dataset_id = "lsteno/BEEG-agents"
+dataset_train_split = "train"
+dataset_eval_split = "eval"
+max_examples = 16
+max_eval_examples = 8
+max_iterations = 2
+max_depth = 1
+turn_max_tokens = 192
+subcall_max_tokens = 96
+tokenizer_name = "Qwen/Qwen2.5-7B-Instruct"
+efficiency_penalty_coef = 0.02
+inference_mode = "local"
+judge_model = "z-ai/glm-4.7-flash"
+
+[inference]
+gpu_memory_utilization = 0.65
+
+[inference.parallel]
+tp = 1
+
+[inference.model]
+max_model_len = 8192
+enforce_eager = false
+
+[ckpt]
+interval = 1
+keep_last = 2

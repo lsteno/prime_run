@@ -54,12 +54,26 @@ def _rollout_answer(rollout: vf.RolloutOutput) -> str | None:
     return None
 
 
+def _rollout_debug(rollout: vf.RolloutOutput) -> dict[str, Any]:
+    trajectory = rollout.get("trajectory") or []
+    if not trajectory:
+        return {}
+    last_step = trajectory[-1]
+    extras = last_step.get("extras") or {}
+    return extras.get("rlm_debug") or {}
+
+
 def _rollout_record(rollout: vf.RolloutOutput, include_segments: bool, include_metrics: bool) -> dict[str, Any]:
+    debug = _rollout_debug(rollout)
     record = {
         "example_id": rollout.get("example_id"),
         "task": rollout.get("task"),
         "answer": _json_safe(rollout.get("answer")),
+        "expected_answers": _json_safe(debug.get("expected_answers")),
         "rlm_answer": _json_safe(_rollout_answer(rollout)),
+        "judge_score": _json_safe(debug.get("judge_score")),
+        "judge_raw_response": _json_safe(debug.get("judge_raw_response")),
+        "judge_parse_error": _json_safe(debug.get("judge_parse_error")),
         "reward": rollout.get("reward"),
         "error": _json_safe(rollout.get("error")),
         "final_answer": rollout.get("final_answer"),

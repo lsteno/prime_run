@@ -74,6 +74,38 @@ def _format_expected_answers(answers: list[str]) -> str:
     return "\n".join(f"- {answer}" for answer in answers)
 
 
+def _record_judge_payload(
+    state: vf.State,
+    *,
+    predicted_answer: str,
+    expected_answers: list[str],
+    score: float,
+    raw_response: str,
+    parse_error: str | None,
+) -> None:
+    state["judge_predicted_answer"] = predicted_answer
+    state["judge_expected_answers"] = list(expected_answers)
+    state["judge_score"] = score
+    state["judge_raw_response"] = raw_response
+    state["judge_parse_error"] = parse_error
+
+    trajectory = state.get("trajectory") or []
+    if not trajectory:
+        return
+
+    extras = trajectory[-1].setdefault("extras", {})
+    rlm_debug = extras.setdefault("rlm_debug", {})
+    rlm_debug.update(
+        {
+            "predicted_answer": predicted_answer,
+            "expected_answers": list(expected_answers),
+            "judge_score": score,
+            "judge_raw_response": raw_response,
+            "judge_parse_error": parse_error,
+        }
+    )
+
+
 async def _call_binary_judge(
     judge_client: AsyncOpenAI,
     *,
@@ -135,8 +167,14 @@ def build_rubric(
 
         if not predicted_answer:
             state["reward_correctness"] = 0.0
-            state["judge_score"] = 0.0
-            state["judge_raw_response"] = "0"
+            _record_judge_payload(
+                state,
+                predicted_answer="",
+                expected_answers=expected_answers,
+                score=0.0,
+                raw_response="0",
+                parse_error=None,
+            )
             return 0.0
 
         judge_prompt = JUDGE_PROMPT.format(
@@ -151,10 +189,14 @@ def build_rubric(
         )
 
         state["reward_correctness"] = score
-        state["judge_score"] = score
-        state["judge_raw_response"] = raw_response
-        state["judge_parse_error"] = (
-            None if raw_response.strip() in {"0", "1"} else ("invalid_binary_score" if score == 0.0 else None)
+        parse_error = None if raw_response.strip() in {"0", "1"} else ("invalid_binary_score" if score == 0.0 else None)
+        _record_judge_payload(
+            state,
+            predicted_answer=predicted_answer,
+            expected_answers=expected_answers,
+            score=score,
+            raw_response=raw_response,
+            parse_error=parse_error,
         )
         return score
 
