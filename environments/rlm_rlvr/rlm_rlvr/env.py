@@ -8,6 +8,7 @@ import verifiers as vf
 
 from .dataset import build_datasets
 from .external_rlm import CodeBlock, RLMIteration, build_system_prompt, build_user_prompt, find_code_blocks, find_final_answer, make_feedback_messages
+from .prompt_variants import DEFAULT_PROMPT_VARIANT, PROMPT_VARIANTS
 from .repl import create_repl
 from .reward import add_metrics, build_rubric
 from .runtime import RecursiveRuntime, RuntimeConfig, SyncInferenceSession
@@ -178,6 +179,7 @@ def load_environment(
     temperature: float = 1.0,
     top_p: float = 1.0,
     tokenizer_name: str | None = None,
+    prompt_variant: str = DEFAULT_PROMPT_VARIANT,
     efficiency_penalty_coef: float = 0.02,
     inference_mode: str = "hosted",
     inference_base_url: str | None = None,
@@ -202,6 +204,8 @@ def load_environment(
         raise ValueError("top_p must be between 0.0 and 1.0")
     if temperature < 0.0:
         raise ValueError("temperature must be >= 0.0")
+    if prompt_variant not in PROMPT_VARIANTS:
+        raise ValueError(f"prompt_variant must be one of {sorted(PROMPT_VARIANTS)}")
 
     valid_inference_modes = {"hosted", "local"}
     if inference_mode not in valid_inference_modes:
@@ -259,8 +263,13 @@ def load_environment(
         inference_api_key=inference_api_key,
         repl_backend=repl_backend,
         repl_backend_kwargs=repl_backend_kwargs,
+        prompt_variant=prompt_variant,
     )
-    system_prompt = build_system_prompt(depth=0, max_depth=max_depth)
+    system_prompt = build_system_prompt(
+        depth=0,
+        max_depth=max_depth,
+        prompt_variant=prompt_variant,
+    )
     reward_rubric = build_rubric(
         judge_model=judge_model,
         judge_base_url=judge_base_url,

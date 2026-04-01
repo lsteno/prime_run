@@ -9,6 +9,7 @@ from openai.types.chat.chat_completion import ChatCompletion
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from .external_rlm import CodeBlock, QueryMetadata, RLMIteration, build_system_prompt, build_user_prompt, find_code_blocks, find_final_answer, make_feedback_messages
+from .prompt_variants import DEFAULT_PROMPT_VARIANT
 from .repl import create_repl
 from .trace import append_step_trace, make_call_trace, make_segment
 
@@ -29,6 +30,7 @@ class RuntimeConfig:
     inference_api_key: str | None = None
     repl_backend: str = "local"
     repl_backend_kwargs: dict[str, Any] | None = None
+    prompt_variant: str = DEFAULT_PROMPT_VARIANT
 
 
 @dataclass
@@ -336,7 +338,14 @@ class RecursiveRuntime:
             rlm_query_fn=self._recursive_query,
         )
         message_history: list[dict[str, str]] = [
-            {"role": "system", "content": build_system_prompt(depth=depth, max_depth=max_depth)},
+            {
+                "role": "system",
+                "content": build_system_prompt(
+                    depth=depth,
+                    max_depth=max_depth,
+                    prompt_variant=self.config.prompt_variant,
+                ),
+            },
             {
                 "role": "user",
                 "content": (

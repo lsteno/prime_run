@@ -7,13 +7,22 @@ from rlm.environments import get_environment
 from rlm.environments.base_env import BaseEnv
 from rlm.environments.local_repl import LocalREPL
 from rlm.utils.parsing import find_code_blocks, find_final_answer, format_iteration
-from rlm.utils.prompts import RLM_SYSTEM_PROMPT, build_rlm_system_prompt, build_user_prompt
+from rlm.utils.prompts import build_rlm_system_prompt, build_user_prompt
+
+from .prompt_variants import DEFAULT_PROMPT_VARIANT, get_system_prompt_template
 
 
-def build_system_prompt(*, depth: int, max_depth: int, enable_rlm_query_batched_async: bool = True) -> str:
+def build_system_prompt(
+    *,
+    depth: int,
+    max_depth: int,
+    prompt_variant: str = DEFAULT_PROMPT_VARIANT,
+    enable_rlm_query_batched_async: bool = True,
+) -> str:
     del enable_rlm_query_batched_async
+    system_prompt_template = get_system_prompt_template(prompt_variant)
     base_kwargs = {
-        "system_prompt": RLM_SYSTEM_PROMPT,
+        "system_prompt": system_prompt_template,
         "query_metadata": QueryMetadata(""),
     }
     attempts = [
@@ -48,16 +57,18 @@ def build_initial_messages(
     *,
     context_payload: str | dict[str, Any] | list[Any],
     root_prompt: str,
+    prompt_variant: str = DEFAULT_PROMPT_VARIANT,
     enable_rlm_query_batched_async: bool = True,
 ) -> list[dict[str, str]]:
     del enable_rlm_query_batched_async
+    system_prompt_template = get_system_prompt_template(prompt_variant)
     try:
         system_and_metadata = build_rlm_system_prompt(
-            system_prompt=RLM_SYSTEM_PROMPT,
+            system_prompt=system_prompt_template,
             query_metadata=QueryMetadata(context_payload),
         )
     except TypeError:
-        system_and_metadata = build_rlm_system_prompt(system_prompt=RLM_SYSTEM_PROMPT)
+        system_and_metadata = build_rlm_system_prompt(system_prompt=system_prompt_template)
     return [system_and_metadata[1], build_user_prompt(root_prompt=root_prompt, iteration=0)]
 
 
@@ -77,7 +88,6 @@ __all__ = [
     "QueryMetadata",
     "RLMChatCompletion",
     "RLMIteration",
-    "RLM_SYSTEM_PROMPT",
     "UsageSummary",
     "build_initial_messages",
     "build_system_prompt",

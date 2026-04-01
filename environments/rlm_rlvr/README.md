@@ -40,6 +40,7 @@ Notes:
 - Install with Prime CLI (`prime env install rlm_rlvr -p /home/coder/prime_run/environments`) to ensure dependencies are available.
 - Set `OPENROUTER_API_KEY` so the semantic judge can score outputs. For managed hosted training, add it via `env_file`. For self-managed `prime-rl` runs on Prime Intellect on-demand GPUs, export it directly in the pod shell.
 - For `repl_backend = "prime"`, set `PRIME_API_KEY` in your environment.
+- Use `prompt_variant` to switch between the default upstream prompt and the local balanced prompt variants for inference bakeoffs.
 - Local parquet mode is opt-in: pass `data_paths` explicitly. If `eval_data_paths` is omitted, eval defaults to a deterministic 10% holdout from `data_paths`.
 - `inference_mode = "hosted"` is for managed hosted training. `inference_mode = "local"` is the standard setting for self-managed `prime-rl` runs on on-demand GPUs.
 - In the standard self-managed `prime-rl` path, the launcher handles the local inference base URL and API wiring. You do not need to set `RLM_LOCAL_INFERENCE_BASE_URL` or `RLM_LOCAL_INFERENCE_API_KEY` unless you are overriding the default local server.
@@ -65,6 +66,7 @@ Notes:
 | `temperature` | `float` | `1.0` | Root and recursive sampling temperature |
 | `top_p` | `float` | `1.0` | Root and recursive nucleus sampling |
 | `tokenizer_name` | `str \| null` | `null` | Optional tokenizer override; defaults to the rollout model name |
+| `prompt_variant` | `str` | `"default"` | System prompt variant. Supported values: `default`, `balanced_v1`, `balanced_v2` |
 | `efficiency_penalty_coef` | `float` | `0.02` | Legacy arg kept for config compatibility; it no longer changes the binary reward |
 | `inference_mode` | `str` | `"hosted"` | Inference routing mode. Use `hosted` for managed hosted training and `local` for self-managed `prime-rl` on local or on-demand GPUs |
 | `inference_base_url` | `str \| null` | `null` | Override the OpenAI-compatible inference endpoint. Usually unset for self-managed `prime-rl`, which wires the local inference server automatically |
@@ -95,3 +97,4 @@ Summarize key metrics your rubric emits and how they’re interpreted.
 - For Prime Intellect on-demand pods, start with `/home/coder/prime_run/configs/rlm_rlvr/ondemand_smoke_qwen3_4b.toml`, which keeps `orchestrator.use_token_client = false` and `inference_mode = "local"` for a lower-risk bring-up path.
 - After the pod path is stable, use `/home/coder/prime_run/configs/rlm_rlvr/ondemand_long_deep_qwen35_9b.toml` for the longer Qwen 3.5 9B run.
 - If you need exact token IDs and logprobs from the same local inference server for recursive subcalls, enable `orchestrator.use_token_client = true` in a follow-up config after the on-demand smoke path is stable.
+- For local SFT warmup on an 8xH100 node, see `/home/coder/prime_run/configs/rlm_sft/README.md` and `/home/coder/prime_run/configs/rlm_sft/local_h100x8_qwen3_4b.toml`.

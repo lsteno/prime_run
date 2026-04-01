@@ -1,0 +1,30 @@
+run_name = "compare-prompts-qwen3-4b"
+output_dir = "outputs/rlm_traces"
+endpoints_path = "configs/endpoints.toml"
+
+[model]
+model = "Qwen/Qwen3-4B-Thinking-2507"
+url = "http://localhost:8000/v1"
+api_key_env = "VLLM_API_KEY"
+
+[dataset]
+dataset_id = "lsteno/BEEG-agents"
+split = "eval"
+max_examples = 20
+seed = 42
+
+[rollout]
+prompt_variants = ["default", "balanced_v1", "balanced_v2"]
+max_iterations = 19
+max_depth = 2
+turn_max_tokens = 512
+subcall_max_tokens = 384
+max_prompt_tokens = 16384
+temperature = 0.7
+top_p = 1.0
+tokenizer_name = "Qwen/Qwen3-4B-Thinking-2507"
+repl_backend = "local"
+
+[judge]
+enabled = true
+endpoint_id = "glm-4.7"
