@@ -13,3 +13,4 @@
 *.json
 outputs/rlm-rlvr-ondemand-full-h100x8-qwen35-9b-whole-dataset/checkpoints/step_10/trainer/.__0_0.distcp.D4TIEB0ufQ
 outputs/rlm-rlvr-ondemand-full-h100x8-qwen35-9b-whole-dataset/*
+pipelines/rlm_traces/examples/outputs/
