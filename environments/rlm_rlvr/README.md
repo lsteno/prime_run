@@ -71,7 +71,7 @@ Notes:
 | `inference_mode` | `str` | `"hosted"` | Inference routing mode. Use `hosted` for managed hosted training and `local` for self-managed `prime-rl` on local or on-demand GPUs |
 | `inference_base_url` | `str \| null` | `null` | Override the OpenAI-compatible inference endpoint. Usually unset for self-managed `prime-rl`, which wires the local inference server automatically |
 | `inference_api_key` | `str \| null` | `null` | Override API key for the inference endpoint. Usually unset for self-managed `prime-rl` local inference |
-| `judge_model` | `str` | `"z-ai/glm-4.7-flash"` | OpenRouter model used for binary semantic judging |
+| `judge_model` | `str` | `"z-ai/glm-5"` | OpenRouter model used for binary semantic judging |
 | `judge_base_url` | `str` | `"https://openrouter.ai/api/v1"` | Judge provider base URL |
 | `judge_api_key_var` | `str` | `"OPENROUTER_API_KEY"` | Environment variable that stores the judge API key |
 | `judge_http_referer` | `str \| null` | `null` | Optional OpenRouter `HTTP-Referer` header |

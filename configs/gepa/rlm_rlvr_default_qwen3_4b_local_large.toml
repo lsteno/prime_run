@@ -10,9 +10,9 @@ env_args = { dataset_id = "lsteno/BEEG-agents", dataset_train_split = "train", d
 extra_env_kwargs = {}
 
 [gepa]
-max_calls = 300
-num_train = 60
-num_val = 30
+max_calls = 1000
+num_train = 200
+num_val = 100
 minibatch_size = 3
 perfect_score = 1.0
 

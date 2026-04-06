@@ -184,7 +184,7 @@ def load_environment(
     inference_mode: str = "hosted",
     inference_base_url: str | None = None,
     inference_api_key: str | None = None,
-    judge_model: str = "z-ai/glm-4.7-flash",
+    judge_model: str = "z-ai/glm-5",
     judge_base_url: str = "https://openrouter.ai/api/v1",
     judge_api_key_var: str = "OPENROUTER_API_KEY",
     judge_http_referer: str | None = None,

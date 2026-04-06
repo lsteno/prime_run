@@ -9,29 +9,39 @@ from typing import Any
 from openai import AsyncOpenAI
 import verifiers as vf
 
-JUDGE_PROMPT = """You are grading whether a model answer is semantically correct.
+JUDGE_PROMPT = """You are a binary grader.
 
-Question:
+You will be given three things:
+1. The dataset task.
+2. One or more gold reference answers for that task.
+3. The candidate answer produced by the model being evaluated.
+
+Your job is to judge whether the candidate answer is semantically correct with respect to the dataset task and the gold reference answer(s).
+
+Dataset task:
 {question}
 
-Reference answer(s):
+Gold reference answer(s):
 {expected_answers}
 
-Model answer:
+Candidate model answer:
 {predicted_answer}
 
-Scoring rules:
-- Return 1 if the model answer is mostly correct in meaning.
-- Semantic correctness matters more than exact wording or format.
-- Return 1 if the answer contains the correct fact, entity, or number even if formatting is imperfect.
-- Return 1 if the answer adds extra harmless text but still clearly gives the correct answer.
-- Return 0 only if the answer is completely incorrect, missing the core correct information, contradictory on the final answer, or gives no answer.
+How to score:
+- Return 1 if the candidate answer clearly conveys the same final answer as any gold reference answer.
+- Semantic correctness matters more than exact wording, formatting, quoting style, or JSON formatting.
+- Return 1 if the candidate answer contains the correct fact, entity, string, or number, even if extra harmless text is present.
+- Return 0 if the candidate answer is missing the core answer, gives the wrong answer, contradicts the correct answer, is only scratchpad/reasoning/code without a clear final answer, or is empty.
+- If the candidate answer is truncated, malformed, or noisy, still return 1 only if the correct final answer is clearly present.
 - The only valid outputs are 0 or 1.
 
 Return exactly one character: 0 or 1.
 """
 
-JUDGE_SYSTEM_PROMPT = "Return exactly one character: 0 or 1. Never return JSON, tool calls, or explanations."
+JUDGE_SYSTEM_PROMPT = (
+    "You are a strict binary grader. Return exactly one character: 0 or 1. "
+    "Do not return JSON, explanations, tool calls, or any other text."
+)
 
 
 def _get_predicted_answer(state: vf.State, completion) -> str:
