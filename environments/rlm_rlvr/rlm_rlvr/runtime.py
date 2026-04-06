@@ -173,7 +173,6 @@ class SyncInferenceSession:
         request_body = {
             "model": self.model_name,
             "messages": request_messages,
-            "tokens": prompt_ids,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
@@ -186,7 +185,7 @@ class SyncInferenceSession:
         }
         try:
             response = self.client.post(
-                "/chat/completions/tokens",
+                "chat/completions",
                 body=request_body,
                 cast_to=ChatCompletion,
             )
@@ -199,9 +198,8 @@ class SyncInferenceSession:
                 max_prompt_tokens=retry_budget,
             )
             request_body["messages"] = request_messages
-            request_body["tokens"] = prompt_ids
             response = self.client.post(
-                "/chat/completions/tokens",
+                "chat/completions",
                 body=request_body,
                 cast_to=ChatCompletion,
             )
@@ -234,7 +232,7 @@ class RecursiveRuntime:
         return self.state["_sync_session"]
 
     def build_finalize_message(self) -> str:
-        return "Provide the final answer now. Use FINAL(...) or FINAL_VAR(...)."
+        return "Provide only the final answer now. No explanation. Use FINAL(...) or FINAL_VAR(...)."
 
     def _next_segment_order(self) -> int:
         order = int(self.state["rlm_segment_counter"])
@@ -439,8 +437,8 @@ class RecursiveRuntime:
             if final_answer is None:
                 finalize_prompt = message_history + [
                     {
-                        "role": "assistant",
-                        "content": "Please provide a final answer to the user's question based on the information provided.",
+                        "role": "user",
+                        "content": self.build_finalize_message(),
                     }
                 ]
                 response_text, payload = self.session.generate(

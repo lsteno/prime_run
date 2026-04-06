@@ -1,0 +1,20 @@
+model = "qwen3-4b-rlm-local"
+reflection_model = "qwen3-30b-t"
+endpoints_path = "../endpoints.toml"
+
+[env]
+env_id = "rlm_rlvr"
+env_args = { dataset_id = "lsteno/BEEG-agents", dataset_train_split = "train", dataset_eval_split = "eval", seed = 42, prompt_variant = "default", max_iterations = 19, max_depth = 2, turn_max_tokens = 1024, subcall_max_tokens = 768, max_prompt_tokens = 15360, tokenizer_name = "Qwen/Qwen3-4B-Thinking-2507", inference_mode = "local", repl_backend = "local", judge_model = "z-ai/glm-4.7-flash" }
+extra_env_kwargs = {}
+
+[gepa]
+max_calls = 300
+num_train = 60
+num_val = 30
+minibatch_size = 3
+perfect_score = 1.0
+
+[execution]
+max_concurrent = 8
+seed = 42
+sampling_args = { max_tokens = 1024, temperature = 0.7, top_p = 1.0 }

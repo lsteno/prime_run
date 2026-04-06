@@ -582,6 +582,12 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def render_comparison_markdown(results: dict[str, dict[str, Any]]) -> str:
     lines = [
         "# Prompt Comparison",
@@ -660,23 +666,34 @@ def main() -> None:
     for prompt_variant in prompt_variants:
         variant_runtime = RuntimeConfig(**asdict(runtime_config))
         variant_runtime.prompt_variant = prompt_variant
-        records = [
-            run_rollout(
+        variant_dir = run_dir / prompt_variant
+        records_path = variant_dir / "records.jsonl"
+        successful_path = variant_dir / "successful_records.jsonl"
+        records: list[dict[str, Any]] = []
+        successful: list[dict[str, Any]] = []
+        write_jsonl(records_path, [])
+        write_jsonl(successful_path, [])
+
+        for example in examples:
+            record = run_rollout(
                 example=example,
                 endpoint=model_endpoint,
                 runtime_config=variant_runtime,
                 prompt_variant=prompt_variant,
                 judge_endpoint=judge_endpoint,
             )
-            for example in examples
-        ]
-        variant_dir = run_dir / prompt_variant
-        write_jsonl(variant_dir / "records.jsonl", records)
-        successful = [record for record in records if not record["error"]]
-        write_jsonl(variant_dir / "successful_records.jsonl", successful)
-        summary = summarize(records)
-        comparison[prompt_variant] = summary
-        write_json(variant_dir / "summary.json", summary)
+            records.append(record)
+            append_jsonl(records_path, record)
+            if not record["error"]:
+                successful.append(record)
+                append_jsonl(successful_path, record)
+
+            summary = summarize(records)
+            comparison[prompt_variant] = summary
+            write_json(variant_dir / "summary.json", summary)
+            write_json(run_dir / "comparison.json", comparison)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "comparison.md").write_text(render_comparison_markdown(comparison))
 
     write_json(run_dir / "comparison.json", comparison)
     run_dir.mkdir(parents=True, exist_ok=True)
