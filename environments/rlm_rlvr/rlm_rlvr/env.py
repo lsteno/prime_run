@@ -7,7 +7,7 @@ from openai import AsyncOpenAI
 import verifiers as vf
 
 from .dataset import build_datasets
-from .external_rlm import CodeBlock, RLMIteration, build_system_prompt, build_user_prompt, find_code_blocks, find_final_answer, make_feedback_messages
+from .external_rlm import CodeBlock, RLMIteration, build_initial_messages, build_system_prompt, build_user_prompt, find_code_blocks, find_final_answer, make_feedback_messages
 from .prompt_variants import DEFAULT_PROMPT_VARIANT, PROMPT_VARIANTS
 from .repl import create_repl
 from .reward import add_metrics, build_rubric
@@ -73,7 +73,13 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             max_prompt_tokens=self.runtime_config.max_prompt_tokens,
         )
         state["_runtime"] = RecursiveRuntime(state, self.runtime_config)
-        state["_root_context"] = (state.get("info") or {}).get("context", "")
+        info = state.get("info") or {}
+        state["_root_context"] = info.get("context", "")
+        state["prompt"] = build_initial_messages(
+            context_payload=state.get("_root_context", ""),
+            root_prompt=str(info.get("question", "")),
+            prompt_variant=self.runtime_config.prompt_variant,
+        )
         state["_root_repl"] = create_repl(
             backend=self.runtime_config.repl_backend,
             backend_kwargs=self.runtime_config.repl_backend_kwargs,
@@ -211,9 +217,9 @@ def load_environment(
     if inference_mode not in valid_inference_modes:
         raise ValueError(f"inference_mode must be one of {sorted(valid_inference_modes)}")
 
-    valid_repl_backends = {"local", "prime", "docker", "modal", "daytona", "e2b"}
+    valid_repl_backends = {"local"}
     if repl_backend not in valid_repl_backends:
-        raise ValueError(f"repl_backend must be one of {sorted(valid_repl_backends)}")
+        raise ValueError("rlm_rlvr currently supports only local REPL execution.")
 
     if inference_base_url is None:
         if inference_mode == "local":

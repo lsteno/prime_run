@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
+import pytest
+from openai import AsyncOpenAI
+
+from rlm_rlvr.env import RLMRLVREnv, load_environment
 from rlm_rlvr.repl import RecursiveLocalRepl
 from rlm_rlvr.runtime import RecursiveRuntime, RuntimeConfig, SyncInferenceSession, TokenPayload
 
@@ -50,13 +55,23 @@ class _FakeClient:
     def post(self, path: str, *, body, cast_to):
         del cast_to
         self.bodies.append(body)
-        assert path == "/chat/completions/tokens"
+        assert path == "chat/completions"
+        assert body["logprobs"] is True
+        assert body["extra_body"]["return_token_ids"] is True
         choice = SimpleNamespace(
             message=SimpleNamespace(content="ok"),
             token_ids=None,
             logprobs=None,
         )
         return SimpleNamespace(choices=[choice], prompt_token_ids=None)
+
+
+class _FakeSyncInferenceSession:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+
+    def count_text_tokens(self, text: str) -> int:
+        return len(text.split())
 
 
 def test_generate_falls_back_when_token_metadata_is_missing() -> None:
@@ -79,6 +94,30 @@ def test_generate_falls_back_when_token_metadata_is_missing() -> None:
     assert payload.completion_ids == [2, 3]
     assert payload.completion_logprobs == [0.0, 0.0]
     assert payload.completion_mask == [True, True]
+
+
+def test_setup_state_rebuilds_root_prompt_with_real_context_metadata(monkeypatch) -> None:
+    import rlm_rlvr.env as env_module
+
+    monkeypatch.setattr(env_module, "SyncInferenceSession", _FakeSyncInferenceSession)
+    environment = object.__new__(RLMRLVREnv)
+    environment.runtime_config = RuntimeConfig(prompt_variant="balanced_v1")
+    environment.efficiency_penalty_coef = 0.02
+    state = {
+        "client": AsyncOpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY"),
+        "model": "fake-model",
+        "info": {
+            "context": "alpha beta gamma",
+            "question": "What is in the context?",
+        },
+        "sampling_args": {},
+    }
+
+    updated = asyncio.run(environment.setup_state(state))
+
+    assert [message["role"] for message in updated["prompt"]] == ["system", "user", "user"]
+    assert "16 total characters" in updated["prompt"][1]["content"]
+    assert "What is in the context?" in updated["prompt"][2]["content"]
 
 
 def test_generate_trims_prompt_history_to_fit_budget() -> None:
@@ -105,7 +144,8 @@ def test_generate_trims_prompt_history_to_fit_budget() -> None:
 
     assert client.bodies, "expected a completion request"
     request_body = client.bodies[0]
-    assert len(request_body["tokens"]) <= 10
+    prompt_ids = session.render_prompt_ids(request_body["messages"], add_generation_prompt=True)
+    assert len(prompt_ids) <= 10
     assert len(request_body["messages"]) < len(messages)
 
 
@@ -140,6 +180,53 @@ def test_recursive_local_repl_routes_llm_and_rlm_queries() -> None:
     assert "recursive-response:3" in result.stdout
     assert result.stderr == ""
     assert [call.metadata["kind"] for call in result.rlm_calls] == ["plain_query", "recursive_query"]
+
+
+def test_recursive_local_repl_async_batch_runs_serially_in_order() -> None:
+    calls: list[str] = []
+
+    def rlm_query_fn(prompt: str, model: str | None, max_depth: int | None):
+        del model, max_depth
+        calls.append(prompt)
+        return {
+            "prompt": prompt,
+            "model": "test-model",
+            "response": f"response:{prompt}",
+            "kind": "recursive_query",
+            "depth": 1,
+            "trace": [{"call_id": len(calls), "steps": []}],
+            "execution_time": 0.02,
+        }
+
+    repl = RecursiveLocalRepl(
+        context_payload="context",
+        llm_query_fn=lambda prompt, model: {"prompt": prompt, "model": model or "test-model", "response": prompt},
+        rlm_query_fn=rlm_query_fn,
+    )
+
+    responses = repl._rlm_query_batched_async(["alpha", "beta", "gamma"], max_workers=4)
+
+    assert responses == ["response:alpha", "response:beta", "response:gamma"]
+    assert calls == ["alpha", "beta", "gamma"]
+    assert [call.prompt for call in repl._pending_llm_calls] == ["alpha", "beta", "gamma"]
+
+
+def test_create_repl_rejects_non_local_backend() -> None:
+    from rlm_rlvr.repl import create_repl
+
+    with pytest.raises(ValueError, match="only local REPL"):
+        create_repl(
+            backend="prime",
+            backend_kwargs=None,
+            context_payload="context",
+            llm_query_fn=lambda prompt, model: {"response": prompt},
+            rlm_query_fn=lambda prompt, model, max_depth: {"response": prompt},
+        )
+
+
+def test_load_environment_rejects_non_local_backend_before_key_checks() -> None:
+    with pytest.raises(ValueError, match="only local REPL"):
+        load_environment(repl_backend="docker")
 
 
 def test_recursive_query_updates_depth_and_trace() -> None:

@@ -3,7 +3,7 @@ name = "rlm-rlvr"
 description = "Recursive RLVR environment for training RLM-style policies with Prime RL"
 tags = ["rlvr", "recursive", "prime-rl", "train", "eval"]
 version = "0.1.3"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "datasets>=4.1.0",
     "openai==2.26.0",
@@ -14,6 +14,11 @@ dependencies = [
     "rlms[prime]==0.1.1",
     "transformers>=4.55.0",
     "verifiers==0.1.11",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.0",
 ]
 
 [build-system]

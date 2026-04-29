@@ -3,8 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 from rlm.core.types import CodeBlock, QueryMetadata, RLMChatCompletion, RLMIteration, UsageSummary
-from rlm.environments import get_environment
-from rlm.environments.base_env import BaseEnv
 from rlm.environments.local_repl import LocalREPL
 from rlm.utils.parsing import find_code_blocks, find_final_answer, format_iteration
 from rlm.utils.prompts import build_rlm_system_prompt, build_user_prompt
@@ -69,7 +67,7 @@ def build_initial_messages(
         )
     except TypeError:
         system_and_metadata = build_rlm_system_prompt(system_prompt=system_prompt_template)
-    return [system_and_metadata[1], build_user_prompt(root_prompt=root_prompt, iteration=0)]
+    return [*system_and_metadata, build_user_prompt(root_prompt=root_prompt, iteration=0)]
 
 
 def make_feedback_messages(iteration: RLMIteration, *, max_chars: int) -> list[dict[str, str]]:
@@ -83,7 +81,6 @@ def empty_usage_summary() -> UsageSummary:
 
 __all__ = [
     "CodeBlock",
-    "BaseEnv",
     "LocalREPL",
     "QueryMetadata",
     "RLMChatCompletion",
@@ -95,6 +92,5 @@ __all__ = [
     "empty_usage_summary",
     "find_code_blocks",
     "find_final_answer",
-    "get_environment",
     "make_feedback_messages",
 ]
