@@ -14,7 +14,7 @@ JUDGE_PROMPT = """You are a binary grader.
 You will be given three things:
 1. The dataset task.
 2. One or more gold reference answers for that task.
-3. The candidate answer produced by the model being evaluated.
+3. The candidate answer produced by the model you are evaluating.
 
 Your job is to judge whether the candidate answer is semantically correct with respect to the dataset task and the gold reference answer(s).
 
@@ -32,7 +32,7 @@ How to score:
 - Semantic correctness matters more than exact wording, formatting, quoting style, or JSON formatting.
 - Return 1 if the candidate answer contains the correct fact, entity, string, or number, even if extra harmless text is present.
 - Return 0 if the candidate answer is missing the core answer, gives the wrong answer, contradicts the correct answer, is only scratchpad/reasoning/code without a clear final answer, or is empty.
-- If the candidate answer is truncated, malformed, or noisy, still return 1 only if the correct final answer is clearly present.
+- If the candidate answer is truncated, malformed, or noisy, you should return 1 only if the correct final answer is clearly present.
 - The only valid outputs are 0 or 1.
 
 Return exactly one character: 0 or 1.

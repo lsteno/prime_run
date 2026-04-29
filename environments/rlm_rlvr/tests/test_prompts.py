@@ -11,10 +11,10 @@ def test_prompt_variants_validate_names() -> None:
         get_system_prompt_template("missing")
 
 
-@pytest.mark.parametrize("prompt_variant", ["balanced_v1", "balanced_v2"])
+@pytest.mark.parametrize("prompt_variant", ["balanced_v1", "balanced_v2", "sanjaya_text_v1"])
 def test_balanced_prompt_variants_keep_required_contracts(prompt_variant: str) -> None:
     prompt = get_system_prompt_template(prompt_variant)
-    assert "sub-calls" in prompt
+    assert "sub-call" in prompt or "subcall" in prompt
     assert "`context`" in prompt
     assert "```repl" in prompt
     assert "Plain text or unfenced code will not run." in prompt
@@ -25,7 +25,7 @@ def test_balanced_prompt_variants_keep_required_contracts(prompt_variant: str) -
 def test_build_system_prompt_uses_requested_variant() -> None:
     prompt = build_system_prompt(depth=0, max_depth=2, prompt_variant="balanced_v1")
     assert "Each turn should do useful work immediately" in prompt
-    assert sorted(PROMPT_VARIANTS) == ["balanced_v1", "balanced_v2", "default"]
+    assert sorted(PROMPT_VARIANTS) == ["balanced_v1", "balanced_v2", "default", "sanjaya_text_v1"]
 
 
 def test_initial_messages_include_system_context_metadata_and_question() -> None:
