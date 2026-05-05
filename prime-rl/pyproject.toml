@@ -72,9 +72,7 @@ envs = [
 ]
 
 [dependency-groups]
-fp8-inference = [
-    "deep-gemm @ https://github.com/hallerite/DeepGEMM/releases/download/v2.3.0-torch2.9/deep_gemm-2.3.0+35c4bc8-cp312-cp312-linux_x86_64.whl ; platform_machine == 'x86_64'",
-]
+fp8-inference = []
 dev = [
     "ipykernel>=6.29.5",
     "ipywidgets>=8.1.7",

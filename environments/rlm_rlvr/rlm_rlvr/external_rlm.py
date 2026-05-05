@@ -10,15 +10,40 @@ from rlm.utils.prompts import build_rlm_system_prompt, build_user_prompt
 from .prompt_variants import DEFAULT_PROMPT_VARIANT, get_system_prompt_template
 
 
+def append_budget_reminder(
+    system_prompt_template: str,
+    *,
+    max_prompt_tokens: int | None = None,
+    turn_max_tokens: int | None = None,
+    subcall_max_tokens: int | None = None,
+) -> str:
+    context_window = f"{max_prompt_tokens} prompt tokens" if max_prompt_tokens is not None else "the configured model context window"
+    turn_budget = f"{turn_max_tokens} output tokens" if turn_max_tokens is not None else "the configured turn output budget"
+    subcall_budget = f"{subcall_max_tokens} output tokens" if subcall_max_tokens is not None else "the configured subcall output budget"
+    reminder = (
+        "Budget reminder: your prompt context window is "
+        f"{context_window}; root and recursive RLM turns may output up to {turn_budget}; "
+        f"one-shot LLM subcalls may output up to {subcall_budget}; make every subcall context-aware "
+        "with only the relevant excerpts to avoid context rot."
+    )
+    return f"{system_prompt_template.rstrip()}\n\n{reminder}\n"
+
+
 def build_system_prompt(
     *,
     depth: int,
     max_depth: int,
     prompt_variant: str = DEFAULT_PROMPT_VARIANT,
-    enable_rlm_query_batched_async: bool = True,
+    max_prompt_tokens: int | None = None,
+    turn_max_tokens: int | None = None,
+    subcall_max_tokens: int | None = None,
 ) -> str:
-    del enable_rlm_query_batched_async
-    system_prompt_template = get_system_prompt_template(prompt_variant)
+    system_prompt_template = append_budget_reminder(
+        get_system_prompt_template(prompt_variant),
+        max_prompt_tokens=max_prompt_tokens,
+        turn_max_tokens=turn_max_tokens,
+        subcall_max_tokens=subcall_max_tokens,
+    )
     base_kwargs = {
         "system_prompt": system_prompt_template,
         "query_metadata": QueryMetadata(""),
@@ -56,10 +81,16 @@ def build_initial_messages(
     context_payload: str | dict[str, Any] | list[Any],
     root_prompt: str,
     prompt_variant: str = DEFAULT_PROMPT_VARIANT,
-    enable_rlm_query_batched_async: bool = True,
+    max_prompt_tokens: int | None = None,
+    turn_max_tokens: int | None = None,
+    subcall_max_tokens: int | None = None,
 ) -> list[dict[str, str]]:
-    del enable_rlm_query_batched_async
-    system_prompt_template = get_system_prompt_template(prompt_variant)
+    system_prompt_template = append_budget_reminder(
+        get_system_prompt_template(prompt_variant),
+        max_prompt_tokens=max_prompt_tokens,
+        turn_max_tokens=turn_max_tokens,
+        subcall_max_tokens=subcall_max_tokens,
+    )
     try:
         system_and_metadata = build_rlm_system_prompt(
             system_prompt=system_prompt_template,
@@ -86,6 +117,7 @@ __all__ = [
     "RLMChatCompletion",
     "RLMIteration",
     "UsageSummary",
+    "append_budget_reminder",
     "build_initial_messages",
     "build_system_prompt",
     "build_user_prompt",

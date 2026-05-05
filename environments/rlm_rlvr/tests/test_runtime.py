@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from types import SimpleNamespace
 
 import pytest
 from openai import AsyncOpenAI
 
 from rlm_rlvr.env import RLMRLVREnv, load_environment
+from rlm_rlvr.prompt_variants import DEFAULT_PROMPT_VARIANT
 from rlm_rlvr.repl import RecursiveLocalRepl
-from rlm_rlvr.runtime import RecursiveRuntime, RuntimeConfig, SyncInferenceSession, TokenPayload
+from rlm_rlvr.runtime import RecursiveRuntime, RuntimeConfig, SubcallPromptTooLargeError, SyncInferenceSession, TokenPayload
+from rlm_rlvr.trace import make_call_trace
 
 
 class _FakeTokenizer:
@@ -21,10 +25,6 @@ class _FakeTokenizer:
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
         del add_special_tokens
         return [len(text), len(text) + 1] if text else []
-
-    def decode(self, token_ids: list[int], skip_special_tokens: bool = False) -> str:
-        del skip_special_tokens
-        return " ".join(f"tok{token_id}" for token_id in token_ids)
 
 
 class _BudgetTokenizer:
@@ -43,10 +43,6 @@ class _BudgetTokenizer:
         del add_special_tokens
         return [len(part) for part in text.split() if part]
 
-    def decode(self, token_ids: list[int], skip_special_tokens: bool = False) -> str:
-        del skip_special_tokens
-        return " ".join("x" * max(token_id, 1) for token_id in token_ids)
-
 
 class _FakeClient:
     def __init__(self) -> None:
@@ -57,7 +53,6 @@ class _FakeClient:
         self.bodies.append(body)
         assert path == "chat/completions"
         assert body["logprobs"] is True
-        assert body["extra_body"]["return_token_ids"] is True
         choice = SimpleNamespace(
             message=SimpleNamespace(content="ok"),
             token_ids=None,
@@ -74,12 +69,36 @@ class _FakeSyncInferenceSession:
         return len(text.split())
 
 
+def _runtime_state(**overrides):
+    state = {
+        "current_call_depth": 0,
+        "current_branch_max_depth": 2,
+        "rlm_segment_counter": 0,
+        "rlm_call_counter": 0,
+        "rlm_segments": [],
+        "rlm_trace": [],
+        "total_model_tokens": 0.0,
+        "max_depth_reached": 0,
+        "used_repl": False,
+        "used_recursion": False,
+        "used_llm_subcalls": False,
+        "used_rlm_subcalls": False,
+        "num_subcalls": 0,
+        "num_llm_subcalls": 0,
+        "num_rlm_subcalls": 0,
+        "sampling_temperature": 0.0,
+    }
+    state.update(overrides)
+    return state
+
+
 def test_generate_falls_back_when_token_metadata_is_missing() -> None:
     session = object.__new__(SyncInferenceSession)
     session.model_name = "fake-model"
     session.client = _FakeClient()
     session.tokenizer = _FakeTokenizer()
     session.max_prompt_tokens = None
+    session.enable_vllm_extra_body = True
 
     text, payload = SyncInferenceSession.generate(
         session,
@@ -94,6 +113,32 @@ def test_generate_falls_back_when_token_metadata_is_missing() -> None:
     assert payload.completion_ids == [2, 3]
     assert payload.completion_logprobs == [0.0, 0.0]
     assert payload.completion_mask == [True, True]
+    assert session.client.bodies[0]["return_token_ids"] is True
+    assert session.client.bodies[0]["top_k"] == -1
+    assert session.client.bodies[0]["min_p"] == 0.0
+    assert "extra_body" not in session.client.bodies[0]
+
+
+def test_generate_does_not_send_vllm_extras_for_hosted_mode() -> None:
+    session = object.__new__(SyncInferenceSession)
+    session.model_name = "fake-model"
+    session.client = _FakeClient()
+    session.tokenizer = _FakeTokenizer()
+    session.max_prompt_tokens = None
+    session.enable_vllm_extra_body = False
+
+    SyncInferenceSession.generate(
+        session,
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    assert "return_token_ids" not in session.client.bodies[0]
+    assert "top_k" not in session.client.bodies[0]
+    assert "min_p" not in session.client.bodies[0]
+    assert "extra_body" not in session.client.bodies[0]
 
 
 def test_setup_state_rebuilds_root_prompt_with_real_context_metadata(monkeypatch) -> None:
@@ -101,7 +146,7 @@ def test_setup_state_rebuilds_root_prompt_with_real_context_metadata(monkeypatch
 
     monkeypatch.setattr(env_module, "SyncInferenceSession", _FakeSyncInferenceSession)
     environment = object.__new__(RLMRLVREnv)
-    environment.runtime_config = RuntimeConfig(prompt_variant="balanced_v1")
+    environment.runtime_config = RuntimeConfig(prompt_variant=DEFAULT_PROMPT_VARIANT)
     environment.efficiency_penalty_coef = 0.02
     state = {
         "client": AsyncOpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY"),
@@ -118,15 +163,80 @@ def test_setup_state_rebuilds_root_prompt_with_real_context_metadata(monkeypatch
     assert [message["role"] for message in updated["prompt"]] == ["system", "user", "user"]
     assert "16 total characters" in updated["prompt"][1]["content"]
     assert "What is in the context?" in updated["prompt"][2]["content"]
+    assert updated["rlm_call_counter"] == 1
+    assert updated["rlm_trace"][0]["call_id"] == 0
+    assert updated["rlm_trace"][0]["depth"] == 0
+    assert updated["rlm_trace"][0]["prompt"] == "What is in the context?"
+    assert updated["used_llm_subcalls"] is False
+    assert updated["used_rlm_subcalls"] is False
 
 
-def test_generate_trims_prompt_history_to_fit_budget() -> None:
+def test_env_response_records_root_repl_feedback(tmp_path) -> None:
+    environment = object.__new__(RLMRLVREnv)
+    environment.runtime_config = RuntimeConfig(
+        max_iterations=4,
+        execution_output_char_limit=4000,
+        live_trace_dir=str(tmp_path),
+    )
+
+    root_trace = make_call_trace(call_id=0, depth=0, prompt="What happened?")
+    state = {
+        "_runtime": SimpleNamespace(build_finalize_message=lambda: "finalize"),
+        "_root_repl": RecursiveLocalRepl(
+            context_payload="root context",
+            llm_query_fn=lambda prompt, model: {"prompt": prompt, "model": model or "test-model", "response": prompt},
+            rlm_query_fn=lambda prompt, model, max_depth: {"prompt": prompt, "model": model or "test-model", "response": prompt},
+        ),
+        "_sync_session": _FakeSyncInferenceSession(),
+        "_root_trace": root_trace,
+        "rlm_trace": [root_trace],
+        "trajectory": [],
+        "info": {"question": "What happened?", "source_id": "sample-1"},
+        "prompt_variant": "default",
+        "live_trace_dir": str(tmp_path),
+        "used_repl": False,
+        "used_recursion": False,
+        "used_llm_subcalls": False,
+        "used_rlm_subcalls": False,
+        "final_answer": None,
+        "total_env_tokens": 0.0,
+        "max_depth_reached": 0,
+        "num_subcalls": 0,
+        "num_llm_subcalls": 0,
+        "num_rlm_subcalls": 0,
+        "rlm_segments": [],
+    }
+
+    response = asyncio.run(
+        environment.env_response(
+            [{"role": "assistant", "content": "```repl\nprint('hello from root')\n```"}],
+            state,
+        )
+    )
+
+    assert response
+    assert len(root_trace["steps"]) == 1
+    step = root_trace["steps"][0]
+    assert step["code_blocks"] == ["print('hello from root')"]
+    assert any("hello from root" in feedback for feedback in step["feedback"])
+    assert step["final_answer"] is None
+
+    live_trace_path = tmp_path / "default" / "sample-1.json"
+    assert live_trace_path.exists()
+    live_trace = json.loads(live_trace_path.read_text())
+    assert live_trace["event"] == "root_feedback"
+    assert live_trace["traces"][0]["steps"][0]["code_blocks"] == ["print('hello from root')"]
+    assert any("hello from root" in feedback for feedback in live_trace["traces"][0]["steps"][0]["feedback"])
+
+
+def test_generate_preserves_messages_without_prompt_fitting() -> None:
     client = _FakeClient()
     session = object.__new__(SyncInferenceSession)
     session.model_name = "fake-model"
     session.client = client
     session.tokenizer = _BudgetTokenizer()
     session.max_prompt_tokens = 10
+    session.enable_vllm_extra_body = True
 
     messages = [
         {"role": "system", "content": "sys"},
@@ -143,10 +253,7 @@ def test_generate_trims_prompt_history_to_fit_budget() -> None:
     )
 
     assert client.bodies, "expected a completion request"
-    request_body = client.bodies[0]
-    prompt_ids = session.render_prompt_ids(request_body["messages"], add_generation_prompt=True)
-    assert len(prompt_ids) <= 10
-    assert len(request_body["messages"]) < len(messages)
+    assert client.bodies[0]["messages"] == messages
 
 
 def test_recursive_local_repl_routes_llm_and_rlm_queries() -> None:
@@ -157,7 +264,7 @@ def test_recursive_local_repl_routes_llm_and_rlm_queries() -> None:
             "model": model or "test-model",
             "response": "plain-response",
             "kind": "plain_query",
-            "depth": 0,
+            "depth": 1,
             "execution_time": 0.01,
         },
         rlm_query_fn=lambda prompt, model, max_depth: {
@@ -182,33 +289,199 @@ def test_recursive_local_repl_routes_llm_and_rlm_queries() -> None:
     assert [call.metadata["kind"] for call in result.rlm_calls] == ["plain_query", "recursive_query"]
 
 
-def test_recursive_local_repl_async_batch_runs_serially_in_order() -> None:
-    calls: list[str] = []
+def test_plain_query_batch_runs_in_parallel() -> None:
+    runtime = RecursiveRuntime(
+        _runtime_state(_sync_session=SimpleNamespace(model_name="fake-model")),
+        RuntimeConfig(max_prompt_tokens=4096, live_trace_dir=None),
+    )
 
-    def rlm_query_fn(prompt: str, model: str | None, max_depth: int | None):
-        del model, max_depth
-        calls.append(prompt)
+    def fake_plain_query(prompt: str, model: str | None = None) -> dict[str, object]:
+        del model
+        time.sleep(0.05)
         return {
             "prompt": prompt,
-            "model": "test-model",
+            "model": "fake-model",
             "response": f"response:{prompt}",
+            "kind": "plain_query",
+            "depth": 1,
+            "execution_time": 0.01,
+        }
+
+    runtime._plain_query = fake_plain_query  # type: ignore[method-assign]
+
+    start = time.perf_counter()
+    payloads = runtime.run_plain_query_batch(["alpha", "beta", "gamma"], max_workers=3)
+    elapsed = time.perf_counter() - start
+
+    assert [payload["response"] for payload in payloads] == [
+        "response:alpha",
+        "response:beta",
+        "response:gamma",
+    ]
+    assert elapsed < 0.13
+
+
+def test_recursive_query_batch_runs_in_parallel() -> None:
+    runtime = RecursiveRuntime(
+        _runtime_state(_sync_session=SimpleNamespace(model_name="fake-model")),
+        RuntimeConfig(max_prompt_tokens=4096, live_trace_dir=None),
+    )
+
+    def fake_recursive_query(
+        prompt: str,
+        model: str | None = None,
+        max_depth: int | None = None,
+    ) -> dict[str, object]:
+        del model, max_depth
+        time.sleep(0.05)
+        return {
+            "prompt": prompt,
+            "model": "fake-model",
+            "response": f"response:{prompt}",
+            "final_answer": f"answer:{prompt}",
             "kind": "recursive_query",
             "depth": 1,
-            "trace": [{"call_id": len(calls), "steps": []}],
+            "trace": [{"call_id": 1, "steps": []}],
             "execution_time": 0.02,
         }
+
+    runtime._recursive_query = fake_recursive_query  # type: ignore[method-assign]
+
+    start = time.perf_counter()
+    payloads = runtime.run_recursive_query_batch(["alpha", "beta", "gamma"], max_workers=3)
+    elapsed = time.perf_counter() - start
+
+    assert [payload["response"] for payload in payloads] == [
+        "response:alpha",
+        "response:beta",
+        "response:gamma",
+    ]
+    assert elapsed < 0.13
+
+
+def test_recursive_local_repl_batched_calls_preserve_pending_call_order() -> None:
+    def llm_query_batch_fn(
+        prompts: list[str],
+        model: str | None,
+        max_workers: int | None,
+    ) -> list[dict[str, object]]:
+        del model, max_workers
+        return [
+            {
+                "prompt": prompt,
+                "model": "test-model",
+                "response": f"plain:{prompt}",
+                "kind": "plain_query",
+                "depth": 1,
+                "execution_time": 0.01,
+            }
+            for prompt in prompts
+        ]
+
+    def rlm_query_batch_fn(
+        prompts: list[str],
+        model: str | None,
+        max_depth: int | None,
+        max_workers: int | None,
+    ) -> list[dict[str, object]]:
+        del model, max_depth, max_workers
+        return [
+            {
+                "prompt": prompt,
+                "model": "test-model",
+                "response": f"recursive:{prompt}",
+                "kind": "recursive_query",
+                "depth": 1,
+                "trace": [{"call_id": index + 1, "steps": []}],
+                "execution_time": 0.02,
+            }
+            for index, prompt in enumerate(prompts)
+        ]
 
     repl = RecursiveLocalRepl(
         context_payload="context",
         llm_query_fn=lambda prompt, model: {"prompt": prompt, "model": model or "test-model", "response": prompt},
-        rlm_query_fn=rlm_query_fn,
+        rlm_query_fn=lambda prompt, model, max_depth: {"prompt": prompt, "model": model or "test-model", "response": prompt},
+        llm_query_batch_fn=llm_query_batch_fn,
+        rlm_query_batch_fn=rlm_query_batch_fn,
     )
 
-    responses = repl._rlm_query_batched_async(["alpha", "beta", "gamma"], max_workers=4)
+    llm_responses = repl._llm_query_batched(["alpha", "beta"])
+    rlm_responses = repl._rlm_query_batched_async(["gamma", "delta"], max_workers=4)
 
-    assert responses == ["response:alpha", "response:beta", "response:gamma"]
-    assert calls == ["alpha", "beta", "gamma"]
-    assert [call.prompt for call in repl._pending_llm_calls] == ["alpha", "beta", "gamma"]
+    assert llm_responses == ["plain:alpha", "plain:beta"]
+    assert rlm_responses == ["recursive:gamma", "recursive:delta"]
+    assert [call.prompt for call in repl._pending_llm_calls] == ["alpha", "beta", "gamma", "delta"]
+
+
+def test_oversized_llm_subcall_is_blocked_and_visible_in_repl() -> None:
+    class _BudgetSession:
+        model_name = "fake-model"
+
+        def generate(self, **kwargs):
+            del kwargs
+            raise AssertionError("oversized subcall should be blocked before model generation")
+
+    state = _runtime_state(_sync_session=_BudgetSession())
+    runtime = RecursiveRuntime(
+        state,
+        RuntimeConfig(
+            max_prompt_tokens=100,
+            subcall_prompt_limit_ratio=0.85,
+            live_trace_dir=None,
+        ),
+    )
+    repl = RecursiveLocalRepl(
+        context_payload="context",
+        llm_query_fn=runtime._plain_query,
+        rlm_query_fn=lambda prompt, model, max_depth: {"response": prompt},
+    )
+
+    result = repl.execute_code("answer = llm_query('word ' * 90)")
+
+    assert "Error: LM query failed" in result.stdout
+    assert "llm_query prompt is too large" in result.stdout
+    assert "approximate 85% subcall prompt budget" in result.stdout
+    assert "answer" in result.locals
+    assert "llm_query prompt is too large" in result.locals["answer"]
+    assert repl._pending_llm_calls == []
+
+
+def test_oversized_batched_llm_subcalls_raise_one_error() -> None:
+    runtime = RecursiveRuntime(
+        _runtime_state(_sync_session=SimpleNamespace(model_name="fake-model")),
+        RuntimeConfig(
+            max_prompt_tokens=100,
+            subcall_prompt_limit_ratio=0.85,
+            live_trace_dir=None,
+        ),
+    )
+
+    with pytest.raises(SubcallPromptTooLargeError, match=r"indices 0 .* 2"):
+        runtime.run_plain_query_batch(["word " * 90, "small prompt", "word " * 95])
+
+
+def test_oversized_recursive_subcall_is_blocked_before_child_state_changes() -> None:
+    runtime = RecursiveRuntime(
+        _runtime_state(
+            _sync_session=SimpleNamespace(model_name="fake-model"),
+            rlm_call_counter=1,
+        ),
+        RuntimeConfig(
+            max_depth=2,
+            max_prompt_tokens=1000,
+            subcall_prompt_limit_ratio=0.85,
+            live_trace_dir=None,
+        ),
+    )
+
+    with pytest.raises(SubcallPromptTooLargeError, match="rlm_query prompt is too large"):
+        runtime._recursive_query("word " * 900)
+
+    assert runtime.state["used_recursion"] is False
+    assert runtime.state["num_subcalls"] == 0
+    assert runtime.state["num_rlm_subcalls"] == 0
+    assert runtime.state["rlm_trace"] == []
 
 
 def test_create_repl_rejects_non_local_backend() -> None:
@@ -245,20 +518,7 @@ def test_recursive_query_updates_depth_and_trace() -> None:
                 ),
             )
 
-    state = {
-        "_sync_session": _StubSession(),
-        "rlm_segment_counter": 0,
-        "rlm_call_counter": 0,
-        "rlm_segments": [],
-        "rlm_trace": [],
-        "total_model_tokens": 0.0,
-        "max_depth_reached": 0,
-        "current_call_depth": 0,
-        "current_branch_max_depth": 2,
-        "used_recursion": False,
-        "num_subcalls": 0,
-        "sampling_temperature": 0.0,
-    }
+    state = _runtime_state(_sync_session=_StubSession())
     runtime = RecursiveRuntime(
         state,
         RuntimeConfig(
@@ -269,6 +529,7 @@ def test_recursive_query_updates_depth_and_trace() -> None:
             temperature=0.0,
             top_p=1.0,
             repl_backend="local",
+            live_trace_dir=None,
         ),
     )
 
@@ -278,6 +539,100 @@ def test_recursive_query_updates_depth_and_trace() -> None:
     assert result["response"] == "42"
     assert result["depth"] == 1
     assert state["used_recursion"] is True
+    assert state["used_llm_subcalls"] is False
+    assert state["used_rlm_subcalls"] is True
     assert state["num_subcalls"] == 1
+    assert state["num_llm_subcalls"] == 0
+    assert state["num_rlm_subcalls"] == 1
     assert state["max_depth_reached"] == 1
     assert len(state["rlm_trace"]) == 1
+
+
+def test_plain_query_counts_as_depth_one_llm_subcall() -> None:
+    class _StubSession:
+        model_name = "fake-model"
+
+        def generate(self, *, messages, max_tokens: int, temperature: float, top_p: float):
+            del messages, max_tokens, temperature, top_p
+            return (
+                "plain answer",
+                TokenPayload(
+                    prompt_ids=[11, 12],
+                    completion_ids=[21, 22],
+                    completion_logprobs=[0.0, 0.0],
+                    completion_mask=[True, True],
+                ),
+            )
+
+    state = _runtime_state(_sync_session=_StubSession())
+    runtime = RecursiveRuntime(
+        state,
+        RuntimeConfig(
+            subcall_max_tokens=4,
+            temperature=0.0,
+            top_p=1.0,
+            live_trace_dir=None,
+        ),
+    )
+
+    result = runtime._plain_query("solve directly")
+
+    assert result["response"] == "plain answer"
+    assert result["kind"] == "plain_query"
+    assert state["used_recursion"] is True
+    assert state["used_llm_subcalls"] is True
+    assert state["used_rlm_subcalls"] is False
+    assert state["num_subcalls"] == 1
+    assert state["num_llm_subcalls"] == 1
+    assert state["num_rlm_subcalls"] == 0
+    assert state["max_depth_reached"] == 1
+    assert len(state["rlm_segments"]) == 1
+
+
+def test_live_trace_compacts_segments_without_token_arrays(tmp_path) -> None:
+    from rlm_rlvr.live_trace import write_live_trace
+
+    root_trace = make_call_trace(call_id=0, depth=0, prompt="Question?")
+    state = {
+        "prompt_variant": DEFAULT_PROMPT_VARIANT,
+        "live_trace_dir": str(tmp_path),
+        "info": {"source_id": "source/with spaces", "question": "Question?"},
+        "rlm_trace": [root_trace],
+        "rlm_segments": [
+            {
+                "order": 0,
+                "depth": 0,
+                "kind": "root_turn",
+                "prompt_ids": [1, 2, 3],
+                "completion_ids": [4, 5],
+                "completion_logprobs": [-0.1, -0.2],
+                "completion_mask": [True, True],
+                "temperature": 0.7,
+                "response_text": "```repl\nprint(1)\n```",
+            }
+        ],
+        "used_repl": True,
+        "used_recursion": True,
+        "used_llm_subcalls": True,
+        "used_rlm_subcalls": False,
+        "max_depth_reached": 1,
+        "num_subcalls": 1,
+        "num_llm_subcalls": 1,
+        "num_rlm_subcalls": 0,
+        "total_model_tokens": 2.0,
+        "total_env_tokens": 0.0,
+        "final_answer": None,
+    }
+
+    write_live_trace(state, event="test")
+
+    path = tmp_path / DEFAULT_PROMPT_VARIANT / "source_with_spaces.json"
+    live_trace = json.loads(path.read_text())
+    segment = live_trace["segments"][0]
+    assert live_trace["status"]["used_llm_subcalls"] is True
+    assert live_trace["status"]["num_llm_subcalls"] == 1
+    assert segment["prompt_tokens"] == 3
+    assert segment["completion_tokens"] == 2
+    assert segment["response_text"] == "```repl\nprint(1)\n```"
+    assert "prompt_ids" not in segment
+    assert "completion_ids" not in segment

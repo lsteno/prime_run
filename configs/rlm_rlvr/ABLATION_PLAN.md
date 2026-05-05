@@ -6,8 +6,18 @@
 - Target self-managed local training on rented 4-8 GPU A100/H100 pods.
 - Keep the study focused on recursive RLVR, cost-aware reward shaping, recursion depth, and LoRA rank/LR behavior.
 - Drop async futures, `D_seq`, and rsLoRA from the study goals.
-- Drop GEPA prompt optimization for this phase; use a small set of manually tuned prompt variants instead.
+- Drop GEPA prompt optimization for this phase; standardize on the Sanjaya text RLM prompt.
 - End with an eval-only benchmark pass on the original RLM paper benchmark family: CodeQA, BrowseComp-Plus 1K, OOLONG, OOLONG-Pairs, and optionally S-NIAH for length-scaling diagnostics.
+
+# TODO
+- ✅ Parallelize llm query batched
+- ✅ _raise_if_subcall_prompt_too_large(...) is stupid and slow and _fit_messages_to_prompt_budget(...) cuts away context! Bad! Simplify the guard by using character count estimates and remove _fit_messages_to_prompt_budget(...) to avoid loss of context (just raise error if prompt too big) also raise single error for multiple too long calls (e.g. batched call)
+- ✅ Update tracking of recursion to distinguish between llm subcalls and rlm subcalls
+- Potentially only train on root turns?
+- Strengthen how we track which subcall generated what so model is rewarded/trained exactly on the context it had at a certain time, this should fix the error we get where it says output is more than seq_len
+- Make sure responses from tools are masked so we don't train on tool/REPL outputs
+- Diagnose why we don't get su-rlm calls, is it broken or do the models just not use it?
+- Still need to add cost awerness in the reward!!!
 
 ## Scope Decisions
 
@@ -21,9 +31,8 @@
   - set `trainer.model.lora.alpha = 2 * rank` unless a smoke run shows instability
   - interpret rank as a capacity/optimization ablation, not as a scaling-law ablation
 - No GEPA prompt optimization:
-  - keep 2-3 manually written prompt variants
-  - choose one before RL with fixed eval samples
-  - select by correctness first, then generated-token cost, then recursion/subcall behavior
+  - use `sanjaya_text_v1` as the default training prompt
+  - keep prompt changes out of the main ablation matrix unless diagnostics show the prompt is the blocker
 - Cost awareness remains central:
   - implement active shaped reward before long training
   - use generated tokens across root turns and recursive subcalls as the single cost source
@@ -32,7 +41,7 @@
 ## Environment And Config Changes Needed
 
 - Add env arg `cost_reward_alpha`.
-- Keep `prompt_variant` as the manual prompt selector.
+- Keep `prompt_variant` as a compatibility selector, with `sanjaya_text_v1` as the default and `default` as an alias.
 - Make the reward formula explicit:
   - `cost_k = total_model_tokens / 1024`
   - `reward_shaped = reward_correctness / (1 + cost_reward_alpha * cost_k)`
@@ -83,24 +92,15 @@ Estimated resources:
 - 8 GPUs: 1-3 wall-hours.
 - Use measured step time from this stage to update all later estimates.
 
-### Stage 1: Manual Prompt Tuning
+### Stage 1: Sanjaya Prompt Calibration
 
 - Eval only, no RL updates.
-- Prompt variants:
-  - current/default
-  - concise manual variant
-  - cost-aware manual variant
+- Fixed prompt: `sanjaya_text_v1`.
 - Depth caps:
   - `max_depth = 1`
   - `max_depth = 2`
-- Run 30-50 eval samples per prompt/depth pair.
-- Select one default prompt for training unless a depth-specific prompt clearly dominates.
-
-Selection rule:
-
-- Highest correctness wins.
-- If tied, choose lower `total_model_tokens`.
-- If still tied, choose healthier recursion behavior: fewer wasteful subcalls without eliminating useful recursion.
+- Run 30-50 eval samples per depth setting.
+- Select the depth setting for training by correctness first, then generated-token cost, then recursion/subcall behavior.
 
 Estimated resources:
 
@@ -204,7 +204,7 @@ Estimated resources:
 Compare:
 
 - base Qwen3 4B
-- prompt-only RLM with the winning manual prompt
+- prompt-only RLM with the Sanjaya prompt
 - best RL-trained RLM
 
 Report:
@@ -219,7 +219,7 @@ Report:
 ## Test And Validation Gates
 
 - Prompt tests:
-  - manual prompt variants preserve REPL code-block parsing
+  - Sanjaya prompt and `default` alias preserve REPL code-block parsing
   - recursion calls remain documented
   - `FINAL(...)` and `FINAL_VAR(...)` termination remains clear
 - Reward tests:

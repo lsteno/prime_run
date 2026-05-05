@@ -325,8 +325,24 @@ async def used_recursion_metric(state: vf.State) -> float:
     return 1.0 if state.get("used_recursion") else 0.0
 
 
+async def used_llm_subcalls_metric(state: vf.State) -> float:
+    return 1.0 if state.get("used_llm_subcalls") else 0.0
+
+
+async def used_rlm_subcalls_metric(state: vf.State) -> float:
+    return 1.0 if state.get("used_rlm_subcalls") else 0.0
+
+
 async def num_subcalls_metric(state: vf.State) -> float:
     return float(state.get("num_subcalls", 0))
+
+
+async def num_llm_subcalls_metric(state: vf.State) -> float:
+    return float(state.get("num_llm_subcalls", 0))
+
+
+async def num_rlm_subcalls_metric(state: vf.State) -> float:
+    return float(state.get("num_rlm_subcalls", 0))
 
 
 async def max_depth_metric(state: vf.State) -> float:
@@ -338,6 +354,10 @@ def add_metrics(rubric: vf.Rubric) -> vf.Rubric:
     rubric.add_metric(judge_score_metric)
     rubric.add_metric(used_repl_metric)
     rubric.add_metric(used_recursion_metric)
+    rubric.add_metric(used_llm_subcalls_metric)
+    rubric.add_metric(used_rlm_subcalls_metric)
     rubric.add_metric(num_subcalls_metric)
+    rubric.add_metric(num_llm_subcalls_metric)
+    rubric.add_metric(num_rlm_subcalls_metric)
     rubric.add_metric(max_depth_metric)
     return rubric

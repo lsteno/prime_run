@@ -65,6 +65,7 @@ def _rollout_debug(rollout: vf.RolloutOutput) -> dict[str, Any]:
 
 def _rollout_record(rollout: vf.RolloutOutput, include_segments: bool, include_metrics: bool) -> dict[str, Any]:
     debug = _rollout_debug(rollout)
+    sample_metadata = debug.get("sample_metadata") or {}
     trace = rollout.get("rlm_trace")
     if not trace:
         trace = debug.get("trace") or []
@@ -78,6 +79,12 @@ def _rollout_record(rollout: vf.RolloutOutput, include_segments: bool, include_m
         "task": rollout.get("task"),
         "answer": _json_safe(rollout.get("answer")),
         "expected_answers": _json_safe(debug.get("expected_answers")),
+        "source_id": _json_safe(sample_metadata.get("source_id")),
+        "dataset_name": _json_safe(sample_metadata.get("dataset_name")),
+        "source_task": _json_safe(sample_metadata.get("source_task")),
+        "answer_type": _json_safe(sample_metadata.get("answer_type")),
+        "context_token_count": _json_safe(sample_metadata.get("context_token_count")),
+        "sample_metadata": _json_safe(sample_metadata.get("metadata") or {}),
         "rlm_answer": _json_safe(_rollout_answer(rollout)),
         "judge_score": _json_safe(debug.get("judge_score")),
         "judge_raw_response": _json_safe(debug.get("judge_raw_response")),

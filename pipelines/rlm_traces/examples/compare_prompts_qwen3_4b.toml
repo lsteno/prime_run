@@ -1,4 +1,4 @@
-run_name = "compare-prompts-qwen3-4b"
+run_name = "sanjaya-traces-qwen3-4b"
 output_dir = "outputs/rlm_traces"
 endpoints_path = "configs/endpoints.toml"
 
@@ -14,7 +14,7 @@ max_examples = 20
 seed = 42
 
 [rollout]
-prompt_variants = ["default", "balanced_v1", "balanced_v2"]
+prompt_variants = ["sanjaya_text_v1"]
 max_iterations = 19
 max_depth = 2
 turn_max_tokens = 512

@@ -8,14 +8,42 @@ import verifiers as vf
 
 from .dataset import build_datasets
 from .external_rlm import CodeBlock, RLMIteration, build_initial_messages, build_system_prompt, build_user_prompt, find_code_blocks, find_final_answer, make_feedback_messages
+from .live_trace import write_live_trace
 from .prompt_variants import DEFAULT_PROMPT_VARIANT, PROMPT_VARIANTS
 from .repl import create_repl
 from .reward import add_metrics, build_rubric
 from .runtime import RecursiveRuntime, RuntimeConfig, SyncInferenceSession
-from .trace import make_segment
+from .trace import append_step_trace, make_call_trace, make_segment
 
 
 class RLMRLVREnv(vf.MultiTurnEnv):
+    @staticmethod
+    def _sample_metadata(info: dict[str, Any]) -> dict[str, Any]:
+        metadata = info.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        selected_metadata = {
+            key: metadata.get(key)
+            for key in (
+                "source_dataset",
+                "task_group",
+                "reasoning_types",
+                "repo",
+                "language",
+                "n_docs",
+                "n_wiki",
+            )
+            if key in metadata
+        }
+        return {
+            "source_id": info.get("source_id"),
+            "dataset_name": info.get("dataset_name"),
+            "source_task": info.get("source_task"),
+            "answer_type": info.get("answer_type"),
+            "context_token_count": info.get("context_token_count"),
+            "metadata": selected_metadata,
+        }
+
     def _attach_debug_payload(self, state: vf.State) -> None:
         trajectory = state.get("trajectory") or []
         if not trajectory:
@@ -26,9 +54,14 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         extras["rlm_debug"] = {
             "used_repl": bool(state.get("used_repl", False)),
             "used_recursion": bool(state.get("used_recursion", False)),
+            "used_llm_subcalls": bool(state.get("used_llm_subcalls", False)),
+            "used_rlm_subcalls": bool(state.get("used_rlm_subcalls", False)),
             "max_depth_reached": int(state.get("max_depth_reached", 0)),
             "num_subcalls": int(state.get("num_subcalls", 0)),
+            "num_llm_subcalls": int(state.get("num_llm_subcalls", 0)),
+            "num_rlm_subcalls": int(state.get("num_rlm_subcalls", 0)),
             "final_answer": state.get("final_answer"),
+            "sample_metadata": self._sample_metadata(state.get("info") or {}),
             "trace": state.get("rlm_trace") or [],
             "segments": state.get("rlm_segments") or [],
         }
@@ -51,17 +84,23 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         state["efficiency_penalty_coef"] = getattr(self, "efficiency_penalty_coef", 0.02)
         state["used_repl"] = False
         state["used_recursion"] = False
+        state["used_llm_subcalls"] = False
+        state["used_rlm_subcalls"] = False
         state["max_depth_reached"] = 0
         state["num_subcalls"] = 0
+        state["num_llm_subcalls"] = 0
+        state["num_rlm_subcalls"] = 0
         state["total_model_tokens"] = 0.0
         state["total_env_tokens"] = 0.0
         state["rlm_segments"] = []
         state["rlm_trace"] = []
         state["rlm_segment_counter"] = 0
-        state["rlm_call_counter"] = 0
+        state["rlm_call_counter"] = 1
         state["current_call_depth"] = 0
         state["current_branch_max_depth"] = self.runtime_config.max_depth
         state["final_answer"] = None
+        state["prompt_variant"] = self.runtime_config.prompt_variant
+        state["live_trace_dir"] = self.runtime_config.live_trace_dir
         state["sampling_temperature"] = float((state.get("sampling_args") or {}).get("temperature", self.runtime_config.temperature))
 
         state["_sync_session"] = SyncInferenceSession(
@@ -71,21 +110,43 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             model_name=model_name,
             tokenizer_name=self.runtime_config.tokenizer_name,
             max_prompt_tokens=self.runtime_config.max_prompt_tokens,
+            enable_vllm_extra_body=self.runtime_config.inference_mode == "local",
         )
         state["_runtime"] = RecursiveRuntime(state, self.runtime_config)
         info = state.get("info") or {}
         state["_root_context"] = info.get("context", "")
+        state["_root_trace"] = make_call_trace(
+            call_id=0,
+            depth=0,
+            prompt=str(info.get("question", "")),
+        )
+        state["rlm_trace"].append(state["_root_trace"])
         state["prompt"] = build_initial_messages(
             context_payload=state.get("_root_context", ""),
             root_prompt=str(info.get("question", "")),
             prompt_variant=self.runtime_config.prompt_variant,
+            max_prompt_tokens=self.runtime_config.max_prompt_tokens,
+            turn_max_tokens=self.runtime_config.turn_max_tokens,
+            subcall_max_tokens=self.runtime_config.subcall_max_tokens,
         )
+        write_live_trace(state, event="setup_state")
         state["_root_repl"] = create_repl(
             backend=self.runtime_config.repl_backend,
             backend_kwargs=self.runtime_config.repl_backend_kwargs,
             context_payload=state.get("_root_context", ""),
             llm_query_fn=state["_runtime"]._plain_query,
             rlm_query_fn=state["_runtime"]._recursive_query,
+            llm_query_batch_fn=lambda prompts, model, max_workers: state["_runtime"].run_plain_query_batch(
+                prompts,
+                model=model,
+                max_workers=max_workers,
+            ),
+            rlm_query_batch_fn=lambda prompts, model, max_depth, max_workers: state["_runtime"].run_recursive_query_batch(
+                prompts,
+                model=model,
+                max_depth=max_depth,
+                max_workers=max_workers,
+            ),
         )
         return await super().setup_state(state)
 
@@ -111,6 +172,7 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         state["rlm_segment_counter"] += 1
         state["rlm_segments"].append(segment)
         state["total_model_tokens"] += float(sum(segment["completion_mask"]))
+        write_live_trace(state, event="root_segment")
 
     async def env_response(self, messages: vf.Messages, state: vf.State, **kwargs) -> vf.Messages:
         del kwargs
@@ -126,10 +188,6 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         for code in code_block_strs:
             execution = repl.execute_code(code)
             code_blocks.append(CodeBlock(code=code, result=execution))
-            for child_call in execution.rlm_calls:
-                metadata = child_call.metadata or {}
-                if metadata.get("kind") == "recursive_query":
-                    state["used_recursion"] = True
             if execution.final_answer is not None and state.get("final_answer") is None:
                 state["final_answer"] = execution.final_answer
 
@@ -138,17 +196,34 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             if final_answer is not None:
                 state["final_answer"] = final_answer
 
-        if state.get("final_answer") is not None:
-            self._attach_debug_payload(state)
-            state["final_env_response"] = []
-            return []
-
         session = state["_sync_session"]
-        iteration = RLMIteration(prompt=messages, response=assistant_text, code_blocks=code_blocks)
+        iteration = RLMIteration(
+            prompt=messages,
+            response=assistant_text,
+            code_blocks=code_blocks,
+            final_answer=state.get("final_answer"),
+        )
         feedback_messages = make_feedback_messages(
             iteration,
             max_chars=self.runtime_config.execution_output_char_limit,
         )
+        root_trace = state.get("_root_trace")
+        if root_trace is not None:
+            append_step_trace(
+                root_trace,
+                assistant=assistant_text,
+                code_blocks=code_block_strs,
+                feedback=[message["content"] for message in feedback_messages],
+                final_answer=state.get("final_answer"),
+            )
+            write_live_trace(state, event="root_step")
+
+        if state.get("final_answer") is not None:
+            self._attach_debug_payload(state)
+            write_live_trace(state, event="root_complete")
+            state["final_env_response"] = []
+            return []
+
         next_iteration = len(state["trajectory"])
         if next_iteration >= self.runtime_config.max_iterations:
             next_message = {"role": "user", "content": runtime.build_finalize_message()}
@@ -163,6 +238,7 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         response_messages = [*feedback_messages, next_message]
         state["total_env_tokens"] += float(sum(session.count_text_tokens(message["content"]) for message in response_messages))
         self._attach_debug_payload(state)
+        write_live_trace(state, event="root_feedback")
         return response_messages
 
 
@@ -186,6 +262,8 @@ def load_environment(
     top_p: float = 1.0,
     tokenizer_name: str | None = None,
     prompt_variant: str = DEFAULT_PROMPT_VARIANT,
+    live_trace_dir: str | None = "outputs/rlm_rlvr/live_traces",
+    subcall_prompt_limit_ratio: float = 0.85,
     efficiency_penalty_coef: float = 0.02,
     inference_mode: str = "hosted",
     inference_base_url: str | None = None,
@@ -206,6 +284,8 @@ def load_environment(
         raise ValueError("turn_max_tokens and subcall_max_tokens must be >= 1")
     if max_prompt_tokens is not None and max_prompt_tokens < 1:
         raise ValueError("max_prompt_tokens must be >= 1")
+    if not 0 < subcall_prompt_limit_ratio <= 1:
+        raise ValueError("subcall_prompt_limit_ratio must be > 0 and <= 1")
     if not (0.0 <= top_p <= 1.0):
         raise ValueError("top_p must be between 0.0 and 1.0")
     if temperature < 0.0:
@@ -270,11 +350,16 @@ def load_environment(
         repl_backend=repl_backend,
         repl_backend_kwargs=repl_backend_kwargs,
         prompt_variant=prompt_variant,
+        live_trace_dir=live_trace_dir,
+        subcall_prompt_limit_ratio=subcall_prompt_limit_ratio,
     )
     system_prompt = build_system_prompt(
         depth=0,
         max_depth=max_depth,
         prompt_variant=prompt_variant,
+        max_prompt_tokens=max_prompt_tokens,
+        turn_max_tokens=turn_max_tokens,
+        subcall_max_tokens=subcall_max_tokens,
     )
     reward_rubric = build_rubric(
         judge_model=judge_model,

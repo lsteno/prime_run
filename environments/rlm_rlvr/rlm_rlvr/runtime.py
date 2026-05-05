@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import threading
 import time
 from typing import Any
 
@@ -9,9 +11,14 @@ from openai.types.chat.chat_completion import ChatCompletion
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from .external_rlm import CodeBlock, QueryMetadata, RLMIteration, build_system_prompt, build_user_prompt, find_code_blocks, find_final_answer, make_feedback_messages
+from .live_trace import write_live_trace
 from .prompt_variants import DEFAULT_PROMPT_VARIANT
 from .repl import create_repl
 from .trace import append_step_trace, make_call_trace, make_segment
+
+
+class SubcallPromptTooLargeError(ValueError):
+    pass
 
 
 @dataclass
@@ -31,6 +38,8 @@ class RuntimeConfig:
     repl_backend: str = "local"
     repl_backend_kwargs: dict[str, Any] | None = None
     prompt_variant: str = DEFAULT_PROMPT_VARIANT
+    live_trace_dir: str | None = "outputs/rlm_rlvr/live_traces"
+    subcall_prompt_limit_ratio: float = 0.85
 
 
 @dataclass
@@ -53,9 +62,11 @@ class SyncInferenceSession:
         model_name: str,
         tokenizer_name: str | None,
         max_prompt_tokens: int | None,
+        enable_vllm_extra_body: bool = False,
     ):
         self.model_name = model_name
         self.max_prompt_tokens = max_prompt_tokens
+        self.enable_vllm_extra_body = enable_vllm_extra_body
         self.client = OpenAI(
             base_url=base_url,
             api_key=api_key or "EMPTY",
@@ -77,70 +88,6 @@ class SyncInferenceSession:
 
     def count_text_tokens(self, text: str) -> int:
         return len(self.tokenizer.encode(text, add_special_tokens=False))
-
-    def _clone_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
-        return [{"role": str(message["role"]), "content": str(message["content"])} for message in messages]
-
-    def _drop_oldest_history_message(self, messages: list[dict[str, str]]) -> bool:
-        if not messages:
-            return False
-        drop_index = 1 if messages[0].get("role") == "system" else 0
-        if drop_index >= len(messages) - 1:
-            return False
-        messages.pop(drop_index)
-        return True
-
-    def _decode_tail_tokens(self, token_ids: list[int], *, fallback_text: str) -> str:
-        decode = getattr(self.tokenizer, "decode", None)
-        if callable(decode):
-            text = str(decode(token_ids, skip_special_tokens=False)).strip()
-            if text:
-                return text
-        approx_chars = max(1, int(len(fallback_text) * len(token_ids) / max(len(self.tokenizer.encode(fallback_text, add_special_tokens=False)), 1)))
-        return fallback_text[-approx_chars:].strip() or fallback_text[-approx_chars:]
-
-    def _truncate_last_message(self, messages: list[dict[str, str]], *, overflow_tokens: int) -> bool:
-        if not messages:
-            return False
-        last_index = len(messages) - 1
-        content = str(messages[last_index].get("content", ""))
-        token_ids = self.tokenizer.encode(content, add_special_tokens=False)
-        if len(token_ids) <= 1:
-            return False
-        trim_tokens = min(len(token_ids) - 1, max(overflow_tokens + 16, len(token_ids) // 8, 1))
-        keep_tokens = max(1, len(token_ids) - trim_tokens)
-        new_content = self._decode_tail_tokens(token_ids[-keep_tokens:], fallback_text=content)
-        if new_content == content:
-            return False
-        messages[last_index] = {**messages[last_index], "content": new_content}
-        return True
-
-    def _fit_messages_to_prompt_budget(
-        self,
-        messages: list[dict[str, str]],
-        *,
-        max_prompt_tokens: int | None = None,
-    ) -> tuple[list[dict[str, str]], list[int]]:
-        budget = self.max_prompt_tokens if max_prompt_tokens is None else max_prompt_tokens
-        trimmed_messages = self._clone_messages(messages)
-        prompt_ids = self.render_prompt_ids(trimmed_messages, add_generation_prompt=True)
-        if budget is None:
-            return trimmed_messages, prompt_ids
-
-        while len(prompt_ids) > budget:
-            overflow_tokens = len(prompt_ids) - budget
-            if self._drop_oldest_history_message(trimmed_messages):
-                prompt_ids = self.render_prompt_ids(trimmed_messages, add_generation_prompt=True)
-                continue
-            if not self._truncate_last_message(trimmed_messages, overflow_tokens=overflow_tokens):
-                break
-            prompt_ids = self.render_prompt_ids(trimmed_messages, add_generation_prompt=True)
-        return trimmed_messages, prompt_ids
-
-    @staticmethod
-    def _is_prompt_too_long_error(exc: Exception) -> bool:
-        message = str(exc)
-        return "maximum context length" in message and "prompt" in message
 
     @staticmethod
     def _coerce_token_ids(token_ids: Any, *, fallback: list[int]) -> list[int]:
@@ -169,40 +116,25 @@ class SyncInferenceSession:
         temperature: float,
         top_p: float,
     ) -> tuple[str, TokenPayload]:
-        request_messages, prompt_ids = self._fit_messages_to_prompt_budget(messages)
         request_body = {
             "model": self.model_name,
-            "messages": request_messages,
+            "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
             "logprobs": True,
-            "extra_body": {
+        }
+        if self.enable_vllm_extra_body:
+            request_body.update({
                 "return_token_ids": True,
                 "top_k": -1,
                 "min_p": 0.0,
-            },
-        }
-        try:
-            response = self.client.post(
-                "chat/completions",
-                body=request_body,
-                cast_to=ChatCompletion,
-            )
-        except Exception as exc:
-            if not self._is_prompt_too_long_error(exc):
-                raise
-            retry_budget = max((self.max_prompt_tokens or len(prompt_ids)) - 32, 1)
-            request_messages, prompt_ids = self._fit_messages_to_prompt_budget(
-                request_messages,
-                max_prompt_tokens=retry_budget,
-            )
-            request_body["messages"] = request_messages
-            response = self.client.post(
-                "chat/completions",
-                body=request_body,
-                cast_to=ChatCompletion,
-            )
+            })
+        response = self.client.post(
+            "chat/completions",
+            body=request_body,
+            cast_to=ChatCompletion,
+        )
         assert response.choices is not None and len(response.choices) == 1
         choice = response.choices[0]
         assert choice.message is not None
@@ -211,6 +143,7 @@ class SyncInferenceSession:
             getattr(choice, "token_ids", None),
             fallback=self.tokenizer.encode(text, add_special_tokens=False),
         )
+        prompt_ids = self.render_prompt_ids(messages, add_generation_prompt=True)
         prompt_token_ids = self._coerce_token_ids(getattr(response, "prompt_token_ids", None), fallback=prompt_ids)
         completion_logprobs = self._coerce_logprobs(getattr(choice, "logprobs", None), completion_len=len(completion_ids))
         payload = TokenPayload(
@@ -223,26 +156,212 @@ class SyncInferenceSession:
 
 
 class RecursiveRuntime:
+    _MESSAGE_OVERHEAD_CHARS = 32
+    _GENERATION_PROMPT_OVERHEAD_CHARS = 16
+    _CHARS_PER_TOKEN_ESTIMATE = 4.0
+    _DEFAULT_BATCH_MAX_WORKERS = 8
+
     def __init__(self, state: dict[str, Any], config: RuntimeConfig):
         self.state = state
         self.config = config
+        self._state_lock = threading.RLock()
+        self._thread_context = threading.local()
 
     @property
     def session(self) -> SyncInferenceSession:
         return self.state["_sync_session"]
 
+    def _context_window_tokens(self) -> int | None:
+        if self.config.max_prompt_tokens is not None:
+            return int(self.config.max_prompt_tokens)
+
+        tokenizer = getattr(self.session, "tokenizer", None)
+        model_max_length = getattr(tokenizer, "model_max_length", None)
+        if isinstance(model_max_length, int) and 0 < model_max_length <= 10_000_000:
+            return model_max_length
+        return None
+
+    def _subcall_prompt_limit_tokens(self) -> int | None:
+        context_window = self._context_window_tokens()
+        if context_window is None:
+            return None
+        return max(1, int(context_window * float(self.config.subcall_prompt_limit_ratio)))
+
+    def _current_call_depth(self) -> int:
+        depth = getattr(self._thread_context, "call_depth", None)
+        if depth is not None:
+            return int(depth)
+        return int(self.state.get("current_call_depth", 0))
+
+    def _current_branch_max_depth(self) -> int:
+        max_depth = getattr(self._thread_context, "branch_max_depth", None)
+        if max_depth is not None:
+            return int(max_depth)
+        return int(self.state.get("current_branch_max_depth", self.config.max_depth))
+
+    def _set_thread_context(self, *, depth: int, max_depth: int) -> tuple[int | None, int | None]:
+        previous_depth = getattr(self._thread_context, "call_depth", None)
+        previous_max_depth = getattr(self._thread_context, "branch_max_depth", None)
+        self._thread_context.call_depth = int(depth)
+        self._thread_context.branch_max_depth = int(max_depth)
+        return previous_depth, previous_max_depth
+
+    def _restore_thread_context(self, previous: tuple[int | None, int | None]) -> None:
+        previous_depth, previous_max_depth = previous
+        if previous_depth is None:
+            if hasattr(self._thread_context, "call_depth"):
+                del self._thread_context.call_depth
+        else:
+            self._thread_context.call_depth = int(previous_depth)
+        if previous_max_depth is None:
+            if hasattr(self._thread_context, "branch_max_depth"):
+                del self._thread_context.branch_max_depth
+        else:
+            self._thread_context.branch_max_depth = int(previous_max_depth)
+
+    def _estimate_message_chars(self, messages: list[dict[str, str]]) -> int:
+        total = self._GENERATION_PROMPT_OVERHEAD_CHARS
+        for message in messages:
+            total += self._MESSAGE_OVERHEAD_CHARS
+            total += len(str(message.get("role", "")))
+            total += len(str(message.get("content", "")))
+        return total
+
+    def _subcall_prompt_limit_chars(self) -> tuple[int | None, int | None, int | None]:
+        context_window = self._context_window_tokens()
+        limit_tokens = self._subcall_prompt_limit_tokens()
+        if context_window is None or limit_tokens is None:
+            return context_window, limit_tokens, None
+        limit_chars = max(1, int(limit_tokens * self._CHARS_PER_TOKEN_ESTIMATE))
+        return context_window, limit_tokens, limit_chars
+
+    def _estimate_subcall_prompt_chars(self, messages: list[dict[str, str]]) -> int:
+        return self._estimate_message_chars(messages)
+
+    def _oversized_subcall_message(
+        self,
+        *,
+        kind: str,
+        oversized: list[tuple[int, int]],
+        limit_chars: int,
+        limit_tokens: int,
+        context_window: int,
+    ) -> str:
+        percent = int(float(self.config.subcall_prompt_limit_ratio) * 100)
+        if len(oversized) == 1:
+            index, prompt_chars = oversized[0]
+            prefix = f"{kind} prompt is too large" if index == 0 else f"{kind} prompt at index {index} is too large"
+            return (
+                f"{prefix}: estimated prompt size is {prompt_chars} characters, which exceeds the approximate "
+                f"{percent}% subcall prompt budget ({limit_chars} chars ~= {limit_tokens}/{context_window} tokens). "
+                "Shorten the prompt or pass a smaller excerpt, then retry."
+            )
+
+        details = ", ".join(f"{index} ({prompt_chars} chars)" for index, prompt_chars in oversized)
+        return (
+            f"{kind} prompts are too large: estimated prompt sizes exceed the approximate {percent}% "
+            f"subcall prompt budget ({limit_chars} chars ~= {limit_tokens}/{context_window} tokens) for indices {details}. "
+            "Shorten those prompts or pass smaller excerpts, then retry."
+        )
+
+    def _validate_subcall_messages(
+        self,
+        *,
+        kind: str,
+        message_batches: list[list[dict[str, str]]],
+    ) -> None:
+        context_window, limit_tokens, limit_chars = self._subcall_prompt_limit_chars()
+        if context_window is None or limit_tokens is None or limit_chars is None:
+            return
+        oversized: list[tuple[int, int]] = []
+        for index, messages in enumerate(message_batches):
+            prompt_chars = self._estimate_subcall_prompt_chars(messages)
+            if prompt_chars > limit_chars:
+                oversized.append((index, prompt_chars))
+        if oversized:
+            raise SubcallPromptTooLargeError(
+                self._oversized_subcall_message(
+                    kind=kind,
+                    oversized=oversized,
+                    limit_chars=limit_chars,
+                    limit_tokens=limit_tokens,
+                    context_window=context_window,
+                )
+            )
+
+    def _write_live_trace(self, *, event: str, active_trace: dict[str, Any] | None = None) -> None:
+        with self._state_lock:
+            write_live_trace(self.state, event=event, active_trace=active_trace)
+
+    def _recursive_initial_messages(
+        self,
+        *,
+        prompt: str,
+        depth: int,
+        max_depth: int,
+        context_payload: str | None,
+    ) -> list[dict[str, str]]:
+        repl_context = prompt if context_payload is None else context_payload
+        context_metadata = QueryMetadata(repl_context)
+        return [
+            {
+                "role": "system",
+                "content": build_system_prompt(
+                    depth=depth,
+                    max_depth=max_depth,
+                    prompt_variant=self.config.prompt_variant,
+                    max_prompt_tokens=self.config.max_prompt_tokens,
+                    turn_max_tokens=self.config.turn_max_tokens,
+                    subcall_max_tokens=self.config.subcall_max_tokens,
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Your context is a {context_metadata.context_type} with "
+                    f"{context_metadata.context_total_length} total characters, and is broken up into chunks "
+                    f"of char lengths: {context_metadata.context_lengths}."
+                ),
+            },
+        ]
+
+    def _recursive_first_turn_messages(
+        self,
+        *,
+        prompt: str,
+        depth: int,
+        max_depth: int,
+        context_payload: str | None,
+    ) -> list[dict[str, str]]:
+        return [
+            *self._recursive_initial_messages(
+                prompt=prompt,
+                depth=depth,
+                max_depth=max_depth,
+                context_payload=context_payload,
+            ),
+            build_user_prompt(
+                root_prompt=prompt,
+                iteration=0,
+                context_count=1,
+                history_count=0,
+            ),
+        ]
+
     def build_finalize_message(self) -> str:
         return "Provide only the final answer now. No explanation. Use FINAL(...) or FINAL_VAR(...)."
 
     def _next_segment_order(self) -> int:
-        order = int(self.state["rlm_segment_counter"])
-        self.state["rlm_segment_counter"] = order + 1
-        return order
+        with self._state_lock:
+            order = int(self.state["rlm_segment_counter"])
+            self.state["rlm_segment_counter"] = order + 1
+            return order
 
     def _next_call_id(self) -> int:
-        call_id = int(self.state["rlm_call_counter"])
-        self.state["rlm_call_counter"] = call_id + 1
-        return call_id
+        with self._state_lock:
+            call_id = int(self.state["rlm_call_counter"])
+            self.state["rlm_call_counter"] = call_id + 1
+            return call_id
 
     def _append_segment(self, *, payload: TokenPayload, depth: int, kind: str, response_text: str) -> None:
         segment = make_segment(
@@ -256,13 +375,120 @@ class RecursiveRuntime:
             temperature=float(self.state.get("sampling_temperature", self.config.temperature)),
             response_text=response_text,
         )
-        self.state["rlm_segments"].append(segment)
-        self.state["total_model_tokens"] += float(sum(payload.completion_mask))
-        self.state["max_depth_reached"] = max(int(self.state["max_depth_reached"]), depth)
+        with self._state_lock:
+            self.state["rlm_segments"].append(segment)
+            self.state["total_model_tokens"] += float(sum(payload.completion_mask))
+            self.state["max_depth_reached"] = max(int(self.state["max_depth_reached"]), depth)
+        self._write_live_trace(event=f"segment:{kind}")
+
+    def _record_subcall(self, *, kind: str, depth: int) -> None:
+        with self._state_lock:
+            self.state["used_recursion"] = True
+            self.state["num_subcalls"] += 1
+            self.state["max_depth_reached"] = max(int(self.state["max_depth_reached"]), depth)
+            if kind == "plain_query":
+                self.state["used_llm_subcalls"] = True
+                self.state["num_llm_subcalls"] += 1
+            elif kind == "recursive_query":
+                self.state["used_rlm_subcalls"] = True
+                self.state["num_rlm_subcalls"] += 1
+            else:
+                raise ValueError(f"Unsupported subcall kind: {kind}")
+
+    def _plain_query_messages(self, prompt: str) -> list[dict[str, str]]:
+        return [{"role": "user", "content": prompt}]
+
+    def _recursive_query_messages(
+        self,
+        prompt: str,
+        *,
+        child_depth: int,
+        effective_max_depth: int,
+    ) -> list[dict[str, str]]:
+        return self._recursive_first_turn_messages(
+            prompt=prompt,
+            depth=child_depth,
+            max_depth=effective_max_depth,
+            context_payload=None,
+        )
+
+    def validate_plain_query_batch(self, prompts: list[str]) -> None:
+        self._validate_subcall_messages(
+            kind="llm_query",
+            message_batches=[self._plain_query_messages(prompt) for prompt in prompts],
+        )
+
+    def validate_recursive_query_batch(
+        self,
+        prompts: list[str],
+        *,
+        max_depth: int | None = None,
+    ) -> None:
+        parent_depth = self._current_call_depth()
+        branch_max_depth = self._current_branch_max_depth()
+        message_batches: list[list[dict[str, str]]] = []
+        for prompt in prompts:
+            child_depth = parent_depth + 1
+            if max_depth is None:
+                effective_max_depth = branch_max_depth
+            else:
+                effective_max_depth = min(branch_max_depth, child_depth + max(0, int(max_depth)))
+            if child_depth > effective_max_depth:
+                message_batches.append(self._plain_query_messages(prompt))
+            else:
+                message_batches.append(
+                    self._recursive_query_messages(
+                        prompt,
+                        child_depth=child_depth,
+                        effective_max_depth=effective_max_depth,
+                    )
+                )
+        self._validate_subcall_messages(kind="rlm_query", message_batches=message_batches)
+
+    def batch_max_workers(self, prompt_count: int, requested_max_workers: int | None = None) -> int:
+        if prompt_count <= 0:
+            return 1
+        if requested_max_workers is not None:
+            return max(1, min(int(requested_max_workers), prompt_count))
+        return max(1, min(prompt_count, self._DEFAULT_BATCH_MAX_WORKERS))
+
+    def run_plain_query_batch(
+        self,
+        prompts: list[str],
+        *,
+        model: str | None = None,
+        max_workers: int | None = None,
+    ) -> list[dict[str, Any]]:
+        self.validate_plain_query_batch(prompts)
+        if not prompts:
+            return []
+        workers = self.batch_max_workers(len(prompts), requested_max_workers=max_workers)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(self._plain_query, prompt, model) for prompt in prompts]
+            return [future.result() for future in futures]
+
+    def run_recursive_query_batch(
+        self,
+        prompts: list[str],
+        *,
+        model: str | None = None,
+        max_depth: int | None = None,
+        max_workers: int | None = None,
+    ) -> list[dict[str, Any]]:
+        self.validate_recursive_query_batch(prompts, max_depth=max_depth)
+        if not prompts:
+            return []
+        workers = self.batch_max_workers(len(prompts), requested_max_workers=max_workers)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(self._recursive_query, prompt, model, max_depth) for prompt in prompts]
+            return [future.result() for future in futures]
 
     def _plain_query(self, prompt: str, model: str | None = None) -> dict[str, Any]:
         start_time = time.perf_counter()
-        messages = [{"role": "user", "content": prompt}]
+        messages = self._plain_query_messages(prompt)
+        self._validate_subcall_messages(kind="llm_query", message_batches=[messages])
+        depth = max(1, self._current_call_depth())
+        self._record_subcall(kind="plain_query", depth=depth)
         text, payload = self.session.generate(
             messages=messages,
             max_tokens=self.config.subcall_max_tokens,
@@ -271,7 +497,7 @@ class RecursiveRuntime:
         )
         self._append_segment(
             payload=payload,
-            depth=int(self.state["current_call_depth"]),
+            depth=depth,
             kind="plain_query",
             response_text=text,
         )
@@ -280,7 +506,7 @@ class RecursiveRuntime:
             "model": model or self.session.model_name,
             "response": text,
             "final_answer": find_final_answer(text) or text,
-            "depth": int(self.state["current_call_depth"]),
+            "depth": depth,
             "kind": "plain_query",
             "execution_time": time.perf_counter() - start_time,
         }
@@ -291,17 +517,27 @@ class RecursiveRuntime:
         model: str | None = None,
         max_depth: int | None = None,
     ) -> dict[str, Any]:
-        child_depth = int(self.state["current_call_depth"]) + 1
-        branch_max_depth = int(self.state.get("current_branch_max_depth", self.config.max_depth))
+        child_depth = self._current_call_depth() + 1
+        branch_max_depth = self._current_branch_max_depth()
         if max_depth is None:
             effective_max_depth = branch_max_depth
         else:
             effective_max_depth = min(branch_max_depth, child_depth + max(0, int(max_depth)))
-        self.state["used_recursion"] = True
-        self.state["num_subcalls"] += 1
 
         if child_depth > effective_max_depth:
             return self._plain_query(prompt, model)
+
+        self._validate_subcall_messages(
+            kind="rlm_query",
+            message_batches=[
+                self._recursive_query_messages(
+                    prompt,
+                    child_depth=child_depth,
+                    effective_max_depth=effective_max_depth,
+                )
+            ],
+        )
+        self._record_subcall(kind="recursive_query", depth=child_depth)
 
         result = self.run_call(prompt=prompt, depth=child_depth, max_depth=effective_max_depth, context_payload=None)
         return {
@@ -326,7 +562,6 @@ class RecursiveRuntime:
         start_time = time.perf_counter()
         call_id = self._next_call_id()
         repl_context = prompt if context_payload is None else context_payload
-        context_metadata = QueryMetadata(repl_context)
         trace = make_call_trace(call_id=call_id, depth=depth, prompt=prompt)
         repl = create_repl(
             backend=self.config.repl_backend,
@@ -334,32 +569,28 @@ class RecursiveRuntime:
             context_payload=repl_context,
             llm_query_fn=self._plain_query,
             rlm_query_fn=self._recursive_query,
+            llm_query_batch_fn=lambda prompts, model, max_workers: self.run_plain_query_batch(
+                prompts,
+                model=model,
+                max_workers=max_workers,
+            ),
+            rlm_query_batch_fn=lambda prompts, model, child_max_depth, max_workers: self.run_recursive_query_batch(
+                prompts,
+                model=model,
+                max_depth=child_max_depth,
+                max_workers=max_workers,
+            ),
         )
-        message_history: list[dict[str, str]] = [
-            {
-                "role": "system",
-                "content": build_system_prompt(
-                    depth=depth,
-                    max_depth=max_depth,
-                    prompt_variant=self.config.prompt_variant,
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Your context is a {context_metadata.context_type} with "
-                    f"{context_metadata.context_total_length} total characters, and is broken up into chunks "
-                    f"of char lengths: {context_metadata.context_lengths}."
-                ),
-            },
-        ]
+        message_history = self._recursive_initial_messages(
+            prompt=prompt,
+            depth=depth,
+            max_depth=max_depth,
+            context_payload=context_payload,
+        )
         final_answer: str | None = None
         response_text = ""
 
-        previous_depth = int(self.state["current_call_depth"])
-        previous_branch_max_depth = int(self.state.get("current_branch_max_depth", self.config.max_depth))
-        self.state["current_call_depth"] = depth
-        self.state["current_branch_max_depth"] = max_depth
+        previous_context = self._set_thread_context(depth=depth, max_depth=max_depth)
         try:
             for iteration_index in range(self.config.max_iterations):
                 current_prompt = message_history + [
@@ -386,15 +617,12 @@ class RecursiveRuntime:
                 code_block_strs = find_code_blocks(response_text)
                 code_blocks: list[CodeBlock] = []
                 if code_block_strs:
-                    self.state["used_repl"] = True
+                    with self._state_lock:
+                        self.state["used_repl"] = True
 
                 for code in code_block_strs:
                     execution = repl.execute_code(code)
                     code_blocks.append(CodeBlock(code=code, result=execution))
-                    for child_call in execution.rlm_calls:
-                        metadata = child_call.metadata or {}
-                        if metadata.get("kind") == "recursive_query":
-                            self.state["used_recursion"] = True
                     if final_answer is None and execution.final_answer is not None:
                         final_answer = execution.final_answer
 
@@ -421,6 +649,10 @@ class RecursiveRuntime:
                     code_blocks=code_block_strs,
                     feedback=feedback_messages,
                     final_answer=final_answer,
+                )
+                self._write_live_trace(
+                    event=f"recursive_step:{depth}:{iteration_index}",
+                    active_trace=trace,
                 )
 
                 if final_answer is not None:
@@ -461,14 +693,16 @@ class RecursiveRuntime:
                     feedback=[],
                     final_answer=final_answer,
                 )
+                self._write_live_trace(event=f"recursive_finalize:{depth}", active_trace=trace)
         finally:
-            self.state["current_call_depth"] = previous_depth
-            self.state["current_branch_max_depth"] = previous_branch_max_depth
+            self._restore_thread_context(previous_context)
             close = getattr(repl, "close", None)
             if callable(close):
                 close()
 
-        self.state["rlm_trace"].append(trace)
+        with self._state_lock:
+            self.state["rlm_trace"].append(trace)
+        self._write_live_trace(event=f"recursive_complete:{depth}")
         return {
             "response_text": response_text,
             "final_answer": final_answer,

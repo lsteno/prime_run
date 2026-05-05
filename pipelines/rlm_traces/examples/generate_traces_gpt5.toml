@@ -12,7 +12,7 @@ max_examples = 50
 seed = 42
 
 [rollout]
-prompt_variants = ["balanced_v1"]
+prompt_variants = ["sanjaya_text_v1"]
 max_iterations = 19
 max_depth = 2
 turn_max_tokens = 512

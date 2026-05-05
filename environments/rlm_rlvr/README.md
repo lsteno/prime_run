@@ -40,7 +40,7 @@ Notes:
 - Install with Prime CLI (`prime env install rlm_rlvr -p /home/coder/prime_run/environments`) to ensure dependencies are available.
 - Set `OPENROUTER_API_KEY` so the semantic judge can score outputs. For managed hosted training, add it via `env_file`. For self-managed `prime-rl` runs on Prime Intellect on-demand GPUs, export it directly in the pod shell.
 - `repl_backend` currently supports only `"local"`; remote REPL backends are future work.
-- Use `prompt_variant` to switch between the default upstream prompt and the local balanced prompt variants for inference bakeoffs.
+- The default prompt is `sanjaya_text_v1`. `prompt_variant="default"` is kept as a compatibility alias for the same prompt.
 - Local parquet mode is opt-in: pass `data_paths` explicitly. If `eval_data_paths` is omitted, eval defaults to a deterministic 10% holdout from `data_paths`.
 - `inference_mode = "hosted"` is for managed hosted training. `inference_mode = "local"` is the standard setting for self-managed `prime-rl` runs on on-demand GPUs.
 - In the standard self-managed `prime-rl` path, the launcher handles the local inference base URL and API wiring. You do not need to set `RLM_LOCAL_INFERENCE_BASE_URL` or `RLM_LOCAL_INFERENCE_API_KEY` unless you are overriding the default local server.
@@ -66,7 +66,9 @@ Notes:
 | `temperature` | `float` | `1.0` | Root and recursive sampling temperature |
 | `top_p` | `float` | `1.0` | Root and recursive nucleus sampling |
 | `tokenizer_name` | `str \| null` | `null` | Optional tokenizer override; defaults to the rollout model name |
-| `prompt_variant` | `str` | `"default"` | System prompt variant. Supported values: `default`, `balanced_v1`, `balanced_v2` |
+| `prompt_variant` | `str` | `"sanjaya_text_v1"` | System prompt variant. Supported values: `sanjaya_text_v1`, `default` where `default` is a compatibility alias |
+| `live_trace_dir` | `str \| null` | `"outputs/rlm_rlvr/live_traces"` | Directory for compact per-sample live traces updated after root and recursive steps. Set to `null` to disable |
+| `subcall_prompt_limit_ratio` | `float` | `0.85` | Blocks `llm_query*` and `rlm_query*` prompts whose estimated character size exceeds this fraction of the configured subcall context window, returning a REPL-visible error instead of truncating context |
 | `efficiency_penalty_coef` | `float` | `0.02` | Reserved for upcoming cost-aware reward shaping; it does not currently change the binary reward |
 | `inference_mode` | `str` | `"hosted"` | Inference routing mode. Use `hosted` for managed hosted training and `local` for self-managed `prime-rl` on local or on-demand GPUs |
 | `inference_base_url` | `str \| null` | `null` | Override the OpenAI-compatible inference endpoint. Usually unset for self-managed `prime-rl`, which wires the local inference server automatically |
@@ -88,14 +90,18 @@ Summarize key metrics your rubric emits and how they’re interpreted.
 | `correctness` | Same binary judge score exposed as a metric |
 | `judge_score` | Binary judge score for observability |
 | `used_repl` | Fraction of rollouts that executed at least one REPL block |
-| `used_recursion` | Fraction of rollouts that invoked `rlm_query(...)` |
-| `num_subcalls` | Number of recursive subcalls executed in the rollout |
-| `max_depth_reached` | Deepest recursive call depth reached |
+| `used_recursion` | Fraction of rollouts that invoked any `llm_query(...)` or `rlm_query(...)` subcall |
+| `used_llm_subcalls` | Fraction of rollouts that used at least one plain `llm_query(...)` subcall |
+| `used_rlm_subcalls` | Fraction of rollouts that used at least one recursive `rlm_query(...)` subcall |
+| `num_subcalls` | Total number of LLM plus RLM subcalls executed in the rollout |
+| `num_llm_subcalls` | Number of plain `llm_query(...)` subcalls executed in the rollout |
+| `num_rlm_subcalls` | Number of recursive `rlm_query(...)` subcalls executed in the rollout |
+| `max_depth_reached` | Deepest aggregate recursion depth reached, with plain LLM subcalls counted as depth 1 |
 
 ### Prime-RL Notes
 - The environment emits flattened recursive segments in `rlm_segments` so Prime-RL can train both root turns and recursive subcalls.
-- For Prime Intellect on-demand pods, start with `/home/coder/prime_run/configs/rlm_rlvr/ondemand_smoke_qwen3_4b.toml`, which keeps `orchestrator.use_token_client = false` and `inference_mode = "local"` for a lower-risk bring-up path.
-- After the pod path is stable, use `/home/coder/prime_run/configs/rlm_rlvr/ondemand_long_deep_qwen35_9b.toml` for the longer Qwen 3.5 9B run.
+- With `prime eval run -s`, completed rollout rows are written incrementally to `environments/rlm_rlvr/outputs/evals/<env>--<model>/<run_id>/results.jsonl`.
+- Long in-flight rollouts also update compact live trace files under `outputs/rlm_rlvr/live_traces/<prompt_variant>/<source_id>.json`. These include assistant text, executed code blocks, REPL feedback, final answer state, subcall counters, and compact segment token counts without duplicating full token id arrays.
 - Keep `orchestrator.use_token_client = false` for this environment. Recursive rollouts use message-based chat completions; the token-in/token-out endpoint is for linear TITO and prefill flows.
 - For local SFT warmup on an 8xH100 node, see `/home/coder/prime_run/configs/rlm_sft/README.md` and `/home/coder/prime_run/configs/rlm_sft/local_h100x8_qwen3_4b.toml`.
 

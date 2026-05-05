@@ -330,8 +330,12 @@ def init_state(
     state: dict[str, Any] = {
         "used_repl": False,
         "used_recursion": False,
+        "used_llm_subcalls": False,
+        "used_rlm_subcalls": False,
         "max_depth_reached": 0,
         "num_subcalls": 0,
+        "num_llm_subcalls": 0,
+        "num_rlm_subcalls": 0,
         "total_model_tokens": 0.0,
         "total_env_tokens": 0.0,
         "rlm_segments": [],
@@ -360,6 +364,17 @@ def init_state(
         context_payload="",
         llm_query_fn=runtime._plain_query,
         rlm_query_fn=runtime._recursive_query,
+        llm_query_batch_fn=lambda prompts, model, max_workers: runtime.run_plain_query_batch(
+            prompts,
+            model=model,
+            max_workers=max_workers,
+        ),
+        rlm_query_batch_fn=lambda prompts, model, max_depth, max_workers: runtime.run_recursive_query_batch(
+            prompts,
+            model=model,
+            max_depth=max_depth,
+            max_workers=max_workers,
+        ),
     )
     state["_root_repl"] = repl
     return state, session, runtime, repl
@@ -393,6 +408,17 @@ def run_rollout(
         context_payload=example.context,
         llm_query_fn=runtime._plain_query,
         rlm_query_fn=runtime._recursive_query,
+        llm_query_batch_fn=lambda prompts, model, max_workers: runtime.run_plain_query_batch(
+            prompts,
+            model=model,
+            max_workers=max_workers,
+        ),
+        rlm_query_batch_fn=lambda prompts, model, max_depth, max_workers: runtime.run_recursive_query_batch(
+            prompts,
+            model=model,
+            max_depth=max_depth,
+            max_workers=max_workers,
+        ),
     )
     repl = state["_root_repl"]
 
@@ -537,7 +563,11 @@ def run_rollout(
         "judge_raw_response": judge_raw_response,
         "used_repl": bool(state["used_repl"]),
         "used_recursion": bool(state["used_recursion"]),
+        "used_llm_subcalls": bool(state["used_llm_subcalls"]),
+        "used_rlm_subcalls": bool(state["used_rlm_subcalls"]),
         "num_subcalls": int(state["num_subcalls"]),
+        "num_llm_subcalls": int(state["num_llm_subcalls"]),
+        "num_rlm_subcalls": int(state["num_rlm_subcalls"]),
         "max_depth_reached": int(state["max_depth_reached"]),
         "total_model_tokens": float(state["total_model_tokens"]),
         "total_env_tokens": float(state["total_env_tokens"]),
@@ -646,9 +676,9 @@ def main() -> None:
         inference_base_url=model_endpoint.url,
         inference_api_key=model_endpoint.api_key,
         repl_backend=str(rollout_cfg.get("repl_backend", "local")),
-        prompt_variant=str((rollout_cfg.get("prompt_variants") or ["default"])[0]),
+        prompt_variant=str((rollout_cfg.get("prompt_variants") or ["sanjaya_text_v1"])[0]),
     )
-    prompt_variants = [str(item) for item in rollout_cfg.get("prompt_variants", ["default"])]
+    prompt_variants = [str(item) for item in rollout_cfg.get("prompt_variants", ["sanjaya_text_v1"])]
 
     examples = load_examples(config["dataset"])
     write_json(
