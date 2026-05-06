@@ -550,6 +550,14 @@ def test_load_environment_rejects_non_local_backend_before_key_checks() -> None:
         load_environment(repl_backend="docker")
 
 
+def test_extract_final_answer_accepts_markdown_wrapped_final() -> None:
+    from rlm_rlvr.parsing import extract_final_answer
+
+    assert extract_final_answer("`FINAL(Label: negative)`") == "Label: negative"
+    assert extract_final_answer("Final answer:\n`FINAL(User: 30836)`") == "User: 30836"
+    assert extract_final_answer("```repl\nprint(1)\n```\nFINAL(1849)") == "1849"
+
+
 def test_recursive_query_updates_depth_and_trace() -> None:
     class _StubSession:
         model_name = "fake-model"

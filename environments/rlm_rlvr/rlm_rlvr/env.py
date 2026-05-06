@@ -7,8 +7,9 @@ from openai import AsyncOpenAI
 import verifiers as vf
 
 from .dataset import build_datasets
-from .external_rlm import CodeBlock, RLMIteration, build_initial_messages, build_system_prompt, build_user_prompt, find_code_blocks, find_final_answer, make_feedback_messages
+from .external_rlm import CodeBlock, RLMIteration, build_initial_messages, build_system_prompt, build_user_prompt, find_code_blocks, make_feedback_messages
 from .live_trace import write_live_trace
+from .parsing import extract_final_answer
 from .prompt_variants import DEFAULT_PROMPT_VARIANT, PROMPT_VARIANTS
 from .repl import create_repl
 from .reward import add_metrics, build_rubric
@@ -213,7 +214,7 @@ class RLMRLVREnv(vf.MultiTurnEnv):
                 state["final_answer"] = execution.final_answer
 
         if state.get("final_answer") is None:
-            final_answer = find_final_answer(assistant_text, environment=repl)
+            final_answer = extract_final_answer(assistant_text, environment=repl)
             if final_answer is not None:
                 state["final_answer"] = final_answer
 

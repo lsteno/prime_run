@@ -10,8 +10,9 @@ from openai import OpenAI
 from openai.types.chat.chat_completion import ChatCompletion
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from .external_rlm import CodeBlock, QueryMetadata, RLMIteration, build_system_prompt, build_user_prompt, find_code_blocks, find_final_answer, make_feedback_messages
+from .external_rlm import CodeBlock, QueryMetadata, RLMIteration, build_system_prompt, build_user_prompt, find_code_blocks, make_feedback_messages
 from .live_trace import write_live_trace
+from .parsing import extract_final_answer
 from .prompt_variants import DEFAULT_PROMPT_VARIANT
 from .repl import create_repl
 from .trace import append_step_trace, make_call_trace, make_segment, prompt_provenance
@@ -575,7 +576,7 @@ class RecursiveRuntime:
             "prompt": prompt,
             "model": model or self.session.model_name,
             "response": text,
-            "final_answer": find_final_answer(text) or text,
+            "final_answer": extract_final_answer(text) or text,
             "depth": depth,
             "kind": "plain_query",
             "execution_time": time.perf_counter() - start_time,
@@ -718,7 +719,7 @@ class RecursiveRuntime:
                         final_answer = execution.final_answer
 
                 if final_answer is None:
-                    final_answer = find_final_answer(response_text, environment=repl)
+                    final_answer = extract_final_answer(response_text, environment=repl)
 
                 iteration = RLMIteration(
                     prompt=current_prompt,
@@ -783,7 +784,7 @@ class RecursiveRuntime:
                     call_id=call_id,
                     parent_call_id=parent_call_id,
                 )
-                final_answer = find_final_answer(response_text, environment=repl) or response_text.strip()
+                final_answer = extract_final_answer(response_text, environment=repl) or response_text.strip()
                 append_step_trace(
                     trace,
                     assistant=response_text,
