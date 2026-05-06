@@ -115,3 +115,104 @@ def test_build_rubric_applies_cost_penalty_on_exact_match(monkeypatch) -> None:
     assert state["cost_prompt_tokens"] == 400.0
     assert state["cost_completion_tokens"] == 250.0
     assert state["cost_total_tokens"] == 650.0
+
+
+def test_build_rubric_clips_exact_match_reward_at_zero(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+    )
+    reward_fn = rubric.funcs[0]
+    state = {
+        "final_answer": "42",
+        "efficiency_penalty_coef": 2.0,
+        "rlm_segments": [
+            {
+                "prompt_ids": list(range(600)),
+                "completion_ids": list(range(400)),
+            }
+        ],
+        "trajectory": [],
+    }
+
+    score = asyncio.run(reward_fn(state, [], "42", {"question": "What is the answer?"}))
+
+    assert score == 0.0
+    assert state["reward_correctness"] == 1.0
+    assert state["reward_efficiency_penalty"] == 2.0
+    assert state["reward_total"] == 0.0
+
+
+def test_build_rubric_no_answer_reward_is_zero_with_cost_penalty(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+    )
+    reward_fn = rubric.funcs[0]
+    state = {
+        "final_answer": "",
+        "efficiency_penalty_coef": 0.02,
+        "rlm_segments": [
+            {
+                "prompt_ids": list(range(600)),
+                "completion_ids": list(range(400)),
+            }
+        ],
+        "trajectory": [],
+    }
+
+    score = asyncio.run(reward_fn(state, [], "42", {"question": "What is the answer?"}))
+
+    assert score == 0.0
+    assert state["reward_correctness"] == 0.0
+    assert state["reward_efficiency_penalty"] == 0.02
+    assert state["reward_total"] == 0.0
+
+
+def test_build_rubric_incorrect_judge_reward_is_zero_with_cost_penalty(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    async def _judge_zero(*args, **kwargs):
+        del args, kwargs
+        return 0.0, "0", None
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    monkeypatch.setattr(reward_module, "_call_binary_judge", _judge_zero)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+    )
+    reward_fn = rubric.funcs[0]
+    state = {
+        "final_answer": "wrong",
+        "efficiency_penalty_coef": 0.02,
+        "rlm_segments": [
+            {
+                "prompt_ids": list(range(600)),
+                "completion_ids": list(range(400)),
+            }
+        ],
+        "trajectory": [],
+    }
+
+    score = asyncio.run(reward_fn(state, [], "42", {"question": "What is the answer?"}))
+
+    assert score == 0.0
+    assert state["reward_correctness"] == 0.0
+    assert state["reward_efficiency_penalty"] == 0.02
+    assert state["reward_total"] == 0.0

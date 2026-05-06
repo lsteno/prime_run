@@ -38,6 +38,8 @@ class RuntimeConfig:
     inference_api_key: str | None = None
     repl_backend: str = "local"
     repl_backend_kwargs: dict[str, Any] | None = None
+    repl_timeout_seconds: float | None = None
+    repl_fast_timeout_seconds: float | None = None
     prompt_variant: str = DEFAULT_PROMPT_VARIANT
     live_trace_dir: str | None = "outputs/rlm_rlvr/live_traces"
     subcall_prompt_limit_ratio: float = 0.85
@@ -737,6 +739,8 @@ class RecursiveRuntime:
                 max_depth=child_max_depth,
                 max_workers=max_workers,
             ),
+            repl_timeout_seconds=self.config.repl_timeout_seconds,
+            repl_fast_timeout_seconds=self.config.repl_fast_timeout_seconds,
         )
         message_history = self._recursive_initial_messages(
             prompt=prompt,

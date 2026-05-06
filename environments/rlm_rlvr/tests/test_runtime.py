@@ -10,7 +10,7 @@ from openai import AsyncOpenAI
 
 from rlm_rlvr.env import RLMRLVREnv, load_environment
 from rlm_rlvr.prompt_variants import DEFAULT_PROMPT_VARIANT
-from rlm_rlvr.repl import RecursiveLocalRepl
+from rlm_rlvr.repl import RecursiveLocalRepl, code_uses_subcalls
 from rlm_rlvr.runtime import RecursiveRuntime, RuntimeConfig, SubcallPromptTooLargeError, SyncInferenceSession, TokenPayload
 from rlm_rlvr.trace import make_call_trace
 
@@ -339,6 +339,56 @@ def test_recursive_local_repl_routes_llm_and_rlm_queries() -> None:
     assert "recursive-response:3" in result.stdout
     assert result.stderr == ""
     assert [call.metadata["kind"] for call in result.rlm_calls] == ["plain_query", "recursive_query"]
+
+
+def test_code_uses_subcalls_detects_query_helpers() -> None:
+    assert code_uses_subcalls("answer = llm_query('alpha')")
+    assert code_uses_subcalls("answers = rlm_query_batched(['alpha'])")
+    assert not code_uses_subcalls("answer = sum([1, 2, 3])")
+
+
+def test_recursive_local_repl_fast_timeout_interrupts_local_code() -> None:
+    repl = RecursiveLocalRepl(
+        context_payload="context",
+        llm_query_fn=lambda prompt, model: {"prompt": prompt, "model": model, "response": "ok"},
+        rlm_query_fn=lambda prompt, model, max_depth: {"prompt": prompt, "model": model, "response": "ok"},
+        repl_timeout_seconds=1.0,
+        repl_fast_timeout_seconds=0.01,
+    )
+
+    result = repl.execute_code("while True:\n    pass")
+
+    assert "REPL execution timed out after 0.01s" in result.stderr
+    assert result.final_answer is None
+    assert result.rlm_calls == []
+
+
+def test_recursive_local_repl_subcall_code_uses_long_timeout() -> None:
+    def slow_llm_query(prompt: str, model: str | None) -> dict[str, object]:
+        del model
+        time.sleep(0.05)
+        return {
+            "prompt": prompt,
+            "model": "test-model",
+            "response": "plain-response",
+            "kind": "plain_query",
+            "depth": 1,
+            "execution_time": 0.05,
+        }
+
+    repl = RecursiveLocalRepl(
+        context_payload="context",
+        llm_query_fn=slow_llm_query,
+        rlm_query_fn=lambda prompt, model, max_depth: {"prompt": prompt, "model": model, "response": "ok"},
+        repl_timeout_seconds=1.0,
+        repl_fast_timeout_seconds=0.01,
+    )
+
+    result = repl.execute_code("answer = llm_query('alpha')")
+
+    assert result.stderr == ""
+    assert result.locals["answer"] == "plain-response"
+    assert [call.metadata["kind"] for call in result.rlm_calls] == ["plain_query"]
 
 
 def test_plain_query_batch_runs_in_parallel() -> None:

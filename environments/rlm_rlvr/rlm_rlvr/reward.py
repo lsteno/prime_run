@@ -341,7 +341,7 @@ def build_rubric(
         efficiency_penalty, prompt_tokens, completion_tokens, total_tokens = _efficiency_penalty_from_state(state)
 
         if not predicted_answer:
-            total_reward = -efficiency_penalty
+            total_reward = 0.0
             _record_reward_breakdown(
                 state,
                 correctness=0.0,
@@ -362,7 +362,7 @@ def build_rubric(
             return total_reward
 
         if _is_exact_match(predicted_answer, expected_answers):
-            total_reward = 1.0 - efficiency_penalty
+            total_reward = max(0.0, 1.0 - efficiency_penalty)
             _record_reward_breakdown(
                 state,
                 correctness=1.0,
@@ -393,7 +393,7 @@ def build_rubric(
             judge_prompt=judge_prompt,
         )
 
-        total_reward = score - efficiency_penalty
+        total_reward = max(0.0, score - efficiency_penalty) if score > 0.0 else 0.0
         _record_reward_breakdown(
             state,
             correctness=score,

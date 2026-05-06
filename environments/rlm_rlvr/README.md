@@ -69,7 +69,7 @@ Notes:
 | `prompt_variant` | `str` | `"sanjaya_text_v1"` | System prompt variant. Supported values: `sanjaya_text_v1`, `default` where `default` is a compatibility alias |
 | `live_trace_dir` | `str \| null` | `"outputs/rlm_rlvr/live_traces"` | Directory for compact per-sample live traces updated after root and recursive steps. Set to `null` to disable |
 | `subcall_prompt_limit_ratio` | `float` | `0.85` | Blocks `llm_query*` and `rlm_query*` prompts whose estimated character size exceeds this fraction of the configured subcall context window, returning a REPL-visible error instead of truncating context |
-| `efficiency_penalty_coef` | `float` | `0.02` | Cost-aware shaping coefficient. Reward is `correctness - efficiency_penalty_coef * (rollout_prompt_tokens + rollout_completion_tokens) / 1000` |
+| `efficiency_penalty_coef` | `float` | `0.02` | Cost-aware shaping coefficient applied only to correct answers. Incorrect/no-answer rollouts receive `0`; correct rollouts receive `max(0, 1 - efficiency_penalty_coef * (rollout_prompt_tokens + rollout_completion_tokens) / 1000)` |
 | `inference_mode` | `str` | `"hosted"` | Inference routing mode. Use `hosted` for managed hosted training and `local` for self-managed `prime-rl` on local or on-demand GPUs |
 | `inference_base_url` | `str \| null` | `null` | Override the OpenAI-compatible inference endpoint. Usually unset for self-managed `prime-rl`, which wires the local inference server automatically |
 | `inference_api_key` | `str \| null` | `null` | Override API key for the inference endpoint. Usually unset for self-managed `prime-rl` local inference |
@@ -80,13 +80,15 @@ Notes:
 | `judge_app_title` | `str \| null` | `null` | Optional OpenRouter `X-Title` header |
 | `repl_backend` | `str` | `"local"` | RLM REPL backend. Only `local` is currently supported |
 | `repl_backend_kwargs` | `dict \| null` | `null` | Reserved for future backend-specific kwargs |
+| `repl_timeout_seconds` | `float \| null` | `null` | Optional wall-clock timeout for generated REPL code blocks that call `llm_query*` or `rlm_query*` helpers |
+| `repl_fast_timeout_seconds` | `float \| null` | `null` | Optional shorter wall-clock timeout for generated REPL code blocks with no LLM/RLM subcalls |
 
 ### Metrics
 Summarize key metrics your rubric emits and how they’re interpreted.
 
 | Metric | Meaning |
 | ------ | ------- |
-| `reward` | Semantic correctness minus optional token-cost penalty |
+| `reward` | Zero for incorrect/no-answer rollouts; correct rollouts minus optional token-cost penalty clipped at zero |
 | `correctness` | Raw binary judge score before cost shaping |
 | `judge_score` | Binary judge score for observability |
 | `efficiency_penalty` | Token-cost penalty subtracted from reward |

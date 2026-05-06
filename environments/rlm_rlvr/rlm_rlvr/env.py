@@ -164,6 +164,8 @@ class RLMRLVREnv(vf.MultiTurnEnv):
                 max_depth=max_depth,
                 max_workers=max_workers,
             ),
+            repl_timeout_seconds=self.runtime_config.repl_timeout_seconds,
+            repl_fast_timeout_seconds=self.runtime_config.repl_fast_timeout_seconds,
         )
         return await super().setup_state(state)
 
@@ -315,6 +317,8 @@ def load_environment(
     judge_app_title: str | None = None,
     repl_backend: str = "local",
     repl_backend_kwargs: dict[str, Any] | None = None,
+    repl_timeout_seconds: float | None = None,
+    repl_fast_timeout_seconds: float | None = None,
 ) -> vf.Environment:
     if max_iterations < 1:
         raise ValueError("max_iterations must be >= 1")
@@ -330,6 +334,10 @@ def load_environment(
         raise ValueError("max_total_subcalls must be >= 1")
     if max_batched_subcalls < 1:
         raise ValueError("max_batched_subcalls must be >= 1")
+    if repl_timeout_seconds is not None and repl_timeout_seconds <= 0:
+        raise ValueError("repl_timeout_seconds must be > 0")
+    if repl_fast_timeout_seconds is not None and repl_fast_timeout_seconds <= 0:
+        raise ValueError("repl_fast_timeout_seconds must be > 0")
     if not (0.0 <= top_p <= 1.0):
         raise ValueError("top_p must be between 0.0 and 1.0")
     if temperature < 0.0:
@@ -393,6 +401,8 @@ def load_environment(
         inference_api_key=inference_api_key,
         repl_backend=repl_backend,
         repl_backend_kwargs=repl_backend_kwargs,
+        repl_timeout_seconds=repl_timeout_seconds,
+        repl_fast_timeout_seconds=repl_fast_timeout_seconds,
         prompt_variant=prompt_variant,
         live_trace_dir=live_trace_dir,
         subcall_prompt_limit_ratio=subcall_prompt_limit_ratio,

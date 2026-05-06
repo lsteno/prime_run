@@ -132,6 +132,8 @@ inference_mode = "local"
 inference_base_url = "http://localhost:8000/v1"
 inference_api_key = "local-vllm"
 repl_backend = "local"
+repl_timeout_seconds = 900
+repl_fast_timeout_seconds = 30
 judge_model = "z-ai/glm-5"
 live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-8xa100-40gb-budgeted/live_traces"
 
@@ -176,6 +178,8 @@ inference_mode = "local"
 inference_base_url = "http://localhost:8000/v1"
 inference_api_key = "local-vllm"
 repl_backend = "local"
+repl_timeout_seconds = 900
+repl_fast_timeout_seconds = 30
 judge_model = "z-ai/glm-5"
 live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-8xa100-40gb-budgeted/live_traces_eval"
 
