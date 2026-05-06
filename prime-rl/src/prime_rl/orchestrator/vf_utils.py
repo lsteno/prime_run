@@ -85,6 +85,7 @@ async def run_rollout(
     sampling_args: dict,
     max_retries: int = DEFAULT_RETRIES,
     state_columns: list[str] = DEFAULT_STATE_COLUMNS,
+    rollout_timeout_seconds: float | None = None,
 ) -> vf.RolloutOutput:
     """
     Wrapper for vf.Environment.run_rollout().
@@ -93,7 +94,7 @@ async def run_rollout(
     """
     state_columns = state_columns + REQUIRED_STATE_COLUMNS
     rollout_input = vf.RolloutInput(**example)
-    return await env.run_rollout(
+    rollout = env.run_rollout(
         rollout_input,
         client=client,
         model=model_name,
@@ -101,6 +102,12 @@ async def run_rollout(
         max_retries=max_retries,
         state_columns=state_columns,
     )
+    try:
+        if rollout_timeout_seconds is None:
+            return await rollout
+        return await asyncio.wait_for(rollout, timeout=rollout_timeout_seconds)
+    except TimeoutError:
+        return make_timeout_rollout(example, sampling_args, rollout_timeout_seconds)
 
 
 async def run_group(
@@ -112,6 +119,7 @@ async def run_group(
     sampling_args: dict,
     max_retries: int = DEFAULT_RETRIES,
     state_columns: list[str] = DEFAULT_STATE_COLUMNS,
+    rollout_timeout_seconds: float | None = None,
 ) -> list[vf.RolloutOutput]:
     """
     Wrapper for vf.Environment.run_group().
@@ -120,13 +128,54 @@ async def run_group(
     """
     state_columns = state_columns + REQUIRED_STATE_COLUMNS
     group_inputs = [vf.RolloutInput(**example) for _ in range(rollouts_per_example)]
-    return await env.run_group(
+    group = env.run_group(
         group_inputs,
         client=client,
         model=model_name,
         sampling_args=sampling_args,
         max_retries=max_retries,
         state_columns=state_columns,
+    )
+    try:
+        if rollout_timeout_seconds is None:
+            return await group
+        return await asyncio.wait_for(group, timeout=rollout_timeout_seconds)
+    except TimeoutError:
+        return [
+            make_timeout_rollout(example, sampling_args, rollout_timeout_seconds)
+            for _ in range(rollouts_per_example)
+        ]
+
+
+def make_timeout_rollout(
+    example: dict,
+    sampling_args: dict,
+    rollout_timeout_seconds: float,
+) -> vf.RolloutOutput:
+    """Create a non-trainable rollout output for a wall-clock timeout."""
+    message = f"rollout exceeded rollout_timeout_seconds={rollout_timeout_seconds}"
+    return vf.RolloutOutput(
+        example_id=example.get("example_id", -1),
+        task=example.get("task", ""),
+        prompt=example.get("prompt"),
+        completion=None,
+        reward=0.0,
+        timing={"total_ms": rollout_timeout_seconds * 1000.0},
+        is_completed=False,
+        is_truncated=False,
+        metrics={"rollout/timeout": 1.0},
+        answer="",
+        info=example.get("info", {}),
+        error={
+            "error": message,
+            "error_chain_repr": message,
+            "error_chain_str": message,
+        },
+        stop_condition="rollout_timeout",
+        trajectory=[],
+        tool_defs=[],
+        token_usage={"input_tokens": 0.0, "output_tokens": 0.0},
+        sampling_args=sampling_args,
     )
 
 
@@ -142,6 +191,7 @@ async def generate(
     max_retries: int = DEFAULT_RETRIES,
     state_columns: list[str] = DEFAULT_STATE_COLUMNS,
     pbar_description: str = "Generating rollouts",
+    rollout_timeout_seconds: float | None = None,
 ) -> list[vf.RolloutOutput]:
     """
     Wrapper for vf.Environment.generate().
@@ -174,6 +224,7 @@ async def generate(
             max_retries=max_retries,
             state_columns=state_columns,
             sampling_args=sampling_args,
+            rollout_timeout_seconds=rollout_timeout_seconds,
         )
         pbar.update(rollouts_per_example)
         return result
@@ -198,6 +249,7 @@ async def evaluate(
     get_client: Callable[[], Awaitable[vf.ClientConfig]] | None = None,
     max_retries: int = DEFAULT_RETRIES,
     state_columns: list[str] = DEFAULT_STATE_COLUMNS,
+    rollout_timeout_seconds: float | None = None,
 ) -> list[vf.RolloutOutput]:
     """
     Wrapper for vf.Environment.evaluate().
@@ -221,6 +273,7 @@ async def evaluate(
         sampling_args=sampling_args,
         max_retries=max_retries,
         state_columns=state_columns,
+        rollout_timeout_seconds=rollout_timeout_seconds,
     )
     return outputs
 

@@ -41,6 +41,9 @@ class RuntimeConfig:
     prompt_variant: str = DEFAULT_PROMPT_VARIANT
     live_trace_dir: str | None = "outputs/rlm_rlvr/live_traces"
     subcall_prompt_limit_ratio: float = 0.85
+    subcall_budget_enabled: bool = False
+    max_total_subcalls: int = 40
+    max_batched_subcalls: int = 40
 
 
 @dataclass
@@ -350,6 +353,9 @@ class RecursiveRuntime:
                     max_prompt_tokens=self.config.max_prompt_tokens,
                     turn_max_tokens=self.config.turn_max_tokens,
                     subcall_max_tokens=self.config.subcall_max_tokens,
+                    subcall_budget_enabled=self.config.subcall_budget_enabled,
+                    max_total_subcalls=self.config.max_total_subcalls,
+                    max_batched_subcalls=self.config.max_batched_subcalls,
                 ),
             },
             {
@@ -387,6 +393,14 @@ class RecursiveRuntime:
 
     def build_finalize_message(self) -> str:
         return "Provide only the final answer now. No explanation. Use FINAL(...) or FINAL_VAR(...)."
+
+    def budget_feedback_message(self) -> dict[str, str] | None:
+        if not self.config.subcall_budget_enabled:
+            return None
+        with self._state_lock:
+            remaining = int(self.state.get("subcall_budget_remaining", self.config.max_total_subcalls))
+            total = int(self.state.get("subcall_budget_total", self.config.max_total_subcalls))
+        return {"role": "user", "content": f"Subcall budget remaining: {remaining}/{total}."}
 
     def _next_segment_order(self) -> int:
         with self._state_lock:
@@ -461,6 +475,44 @@ class RecursiveRuntime:
             else:
                 raise ValueError(f"Unsupported subcall kind: {kind}")
 
+    def _budget_error_payload(self, *, prompt: str, model: str | None, kind: str) -> dict[str, Any]:
+        with self._state_lock:
+            remaining = int(self.state.get("subcall_budget_remaining", 0))
+            total = int(self.state.get("subcall_budget_total", self.config.max_total_subcalls))
+        if remaining > 0:
+            message = (
+                f"Error: subcall batch fanout limit reached ({self.config.max_batched_subcalls} prompts maximum; "
+                f"{remaining}/{total} calls remaining)."
+            )
+        else:
+            message = f"Error: subcall budget exhausted ({remaining}/{total} calls remaining)."
+        return {
+            "prompt": prompt,
+            "model": model or self.session.model_name,
+            "response": message,
+            "final_answer": None,
+            "depth": self._current_call_depth(),
+            "kind": kind,
+            "execution_time": 0.0,
+            "budget_error": True,
+        }
+
+    def _reserve_subcall_budget(self, requested: int) -> int:
+        if not self.config.subcall_budget_enabled:
+            return requested
+        if requested <= 0:
+            return 0
+        with self._state_lock:
+            remaining = int(self.state.get("subcall_budget_remaining", self.config.max_total_subcalls))
+            allowed = max(0, min(requested, remaining, int(self.config.max_batched_subcalls)))
+            self.state["subcall_budget_remaining"] = remaining - allowed
+            if self.state["subcall_budget_remaining"] <= 0:
+                self.state["subcall_budget_exhausted"] = True
+            return allowed
+
+    def _try_consume_subcall_budget(self) -> bool:
+        return self._reserve_subcall_budget(1) == 1
+
     def _plain_query_messages(self, prompt: str) -> list[dict[str, str]]:
         return [{"role": "user", "content": prompt}]
 
@@ -525,13 +577,23 @@ class RecursiveRuntime:
         model: str | None = None,
         max_workers: int | None = None,
     ) -> list[dict[str, Any]]:
-        self.validate_plain_query_batch(prompts)
         if not prompts:
             return []
-        workers = self.batch_max_workers(len(prompts), requested_max_workers=max_workers)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(self._plain_query, prompt, model) for prompt in prompts]
-            return [future.result() for future in futures]
+        allowed = self._reserve_subcall_budget(len(prompts))
+        scheduled_prompts = prompts[:allowed]
+        skipped_prompts = prompts[allowed:]
+        self.validate_plain_query_batch(scheduled_prompts)
+        payloads: list[dict[str, Any]] = []
+        if scheduled_prompts:
+            workers = self.batch_max_workers(len(scheduled_prompts), requested_max_workers=max_workers)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(self._plain_query, prompt, model, False) for prompt in scheduled_prompts]
+                payloads.extend(future.result() for future in futures)
+        payloads.extend(
+            self._budget_error_payload(prompt=prompt, model=model, kind="plain_query")
+            for prompt in skipped_prompts
+        )
+        return payloads
 
     def run_recursive_query_batch(
         self,
@@ -541,18 +603,30 @@ class RecursiveRuntime:
         max_depth: int | None = None,
         max_workers: int | None = None,
     ) -> list[dict[str, Any]]:
-        self.validate_recursive_query_batch(prompts, max_depth=max_depth)
         if not prompts:
             return []
-        workers = self.batch_max_workers(len(prompts), requested_max_workers=max_workers)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(self._recursive_query, prompt, model, max_depth) for prompt in prompts]
-            return [future.result() for future in futures]
+        allowed = self._reserve_subcall_budget(len(prompts))
+        scheduled_prompts = prompts[:allowed]
+        skipped_prompts = prompts[allowed:]
+        self.validate_recursive_query_batch(scheduled_prompts, max_depth=max_depth)
+        payloads: list[dict[str, Any]] = []
+        if scheduled_prompts:
+            workers = self.batch_max_workers(len(scheduled_prompts), requested_max_workers=max_workers)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(self._recursive_query, prompt, model, max_depth, False) for prompt in scheduled_prompts]
+                payloads.extend(future.result() for future in futures)
+        payloads.extend(
+            self._budget_error_payload(prompt=prompt, model=model, kind="recursive_query")
+            for prompt in skipped_prompts
+        )
+        return payloads
 
-    def _plain_query(self, prompt: str, model: str | None = None) -> dict[str, Any]:
+    def _plain_query(self, prompt: str, model: str | None = None, consume_budget: bool = True) -> dict[str, Any]:
         start_time = time.perf_counter()
         messages = self._plain_query_messages(prompt)
         self._validate_subcall_messages(kind="llm_query", message_batches=[messages])
+        if consume_budget and not self._try_consume_subcall_budget():
+            return self._budget_error_payload(prompt=prompt, model=model, kind="plain_query")
         depth = max(1, self._current_call_depth())
         self._record_subcall(kind="plain_query", depth=depth)
         text, payload = self.session.generate(
@@ -587,6 +661,7 @@ class RecursiveRuntime:
         prompt: str,
         model: str | None = None,
         max_depth: int | None = None,
+        consume_budget: bool = True,
     ) -> dict[str, Any]:
         child_depth = self._current_call_depth() + 1
         branch_max_depth = self._current_branch_max_depth()
@@ -596,7 +671,7 @@ class RecursiveRuntime:
             effective_max_depth = min(branch_max_depth, child_depth + max(0, int(max_depth)))
 
         if child_depth > effective_max_depth:
-            return self._plain_query(prompt, model)
+            return self._plain_query(prompt, model, consume_budget=consume_budget)
 
         self._validate_subcall_messages(
             kind="rlm_query",
@@ -608,6 +683,8 @@ class RecursiveRuntime:
                 )
             ],
         )
+        if consume_budget and not self._try_consume_subcall_budget():
+            return self._budget_error_payload(prompt=prompt, model=model, kind="recursive_query")
         self._record_subcall(kind="recursive_query", depth=child_depth)
 
         result = self.run_call(
@@ -734,6 +811,9 @@ class RecursiveRuntime:
                         max_chars=self.config.execution_output_char_limit,
                     )
                 ]
+                budget_message = self.budget_feedback_message()
+                if budget_message is not None:
+                    feedback_messages.append(budget_message["content"])
 
                 append_step_trace(
                     trace,
@@ -751,12 +831,13 @@ class RecursiveRuntime:
                     break
 
                 message_history.append({"role": "assistant", "content": response_text})
-                message_history.extend(
-                    make_feedback_messages(
-                        iteration,
-                        max_chars=self.config.execution_output_char_limit,
-                    )
+                formatted_feedback = make_feedback_messages(
+                    iteration,
+                    max_chars=self.config.execution_output_char_limit,
                 )
+                if budget_message is not None:
+                    formatted_feedback.append(budget_message)
+                message_history.extend(formatted_feedback)
 
             if final_answer is None:
                 finalize_prompt = message_history + [

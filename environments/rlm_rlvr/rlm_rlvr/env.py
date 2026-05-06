@@ -61,6 +61,10 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             "num_subcalls": int(state.get("num_subcalls", 0)),
             "num_llm_subcalls": int(state.get("num_llm_subcalls", 0)),
             "num_rlm_subcalls": int(state.get("num_rlm_subcalls", 0)),
+            "subcall_budget_enabled": bool(state.get("subcall_budget_enabled", False)),
+            "subcall_budget_total": int(state.get("subcall_budget_total", 0)),
+            "subcall_budget_remaining": int(state.get("subcall_budget_remaining", 0)),
+            "subcall_budget_exhausted": bool(state.get("subcall_budget_exhausted", False)),
             "final_answer": state.get("final_answer"),
             "sample_metadata": self._sample_metadata(state.get("info") or {}),
             "trace": state.get("rlm_trace") or [],
@@ -91,6 +95,10 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         state["num_subcalls"] = 0
         state["num_llm_subcalls"] = 0
         state["num_rlm_subcalls"] = 0
+        state["subcall_budget_enabled"] = bool(self.runtime_config.subcall_budget_enabled)
+        state["subcall_budget_total"] = int(self.runtime_config.max_total_subcalls)
+        state["subcall_budget_remaining"] = int(self.runtime_config.max_total_subcalls)
+        state["subcall_budget_exhausted"] = False
         state["total_model_tokens"] = 0.0
         state["total_env_tokens"] = 0.0
         state["total_prompt_tokens"] = 0.0
@@ -134,6 +142,9 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             max_prompt_tokens=self.runtime_config.max_prompt_tokens,
             turn_max_tokens=self.runtime_config.turn_max_tokens,
             subcall_max_tokens=self.runtime_config.subcall_max_tokens,
+            subcall_budget_enabled=self.runtime_config.subcall_budget_enabled,
+            max_total_subcalls=self.runtime_config.max_total_subcalls,
+            max_batched_subcalls=self.runtime_config.max_batched_subcalls,
         )
         write_live_trace(state, event="setup_state")
         state["_root_repl"] = create_repl(
@@ -229,6 +240,10 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             iteration,
             max_chars=self.runtime_config.execution_output_char_limit,
         )
+        budget_feedback = getattr(runtime, "budget_feedback_message", None)
+        budget_message = budget_feedback() if callable(budget_feedback) else None
+        if budget_message is not None:
+            feedback_messages.append(budget_message)
         root_trace = state.get("_root_trace")
         if root_trace is not None:
             append_step_trace(
@@ -286,6 +301,9 @@ def load_environment(
     prompt_variant: str = DEFAULT_PROMPT_VARIANT,
     live_trace_dir: str | None = "outputs/rlm_rlvr/live_traces",
     subcall_prompt_limit_ratio: float = 0.85,
+    subcall_budget_enabled: bool = False,
+    max_total_subcalls: int = 40,
+    max_batched_subcalls: int = 40,
     efficiency_penalty_coef: float = 0.02,
     inference_mode: str = "hosted",
     inference_base_url: str | None = None,
@@ -308,6 +326,10 @@ def load_environment(
         raise ValueError("max_prompt_tokens must be >= 1")
     if not 0 < subcall_prompt_limit_ratio <= 1:
         raise ValueError("subcall_prompt_limit_ratio must be > 0 and <= 1")
+    if max_total_subcalls < 1:
+        raise ValueError("max_total_subcalls must be >= 1")
+    if max_batched_subcalls < 1:
+        raise ValueError("max_batched_subcalls must be >= 1")
     if not (0.0 <= top_p <= 1.0):
         raise ValueError("top_p must be between 0.0 and 1.0")
     if temperature < 0.0:
@@ -374,6 +396,9 @@ def load_environment(
         prompt_variant=prompt_variant,
         live_trace_dir=live_trace_dir,
         subcall_prompt_limit_ratio=subcall_prompt_limit_ratio,
+        subcall_budget_enabled=subcall_budget_enabled,
+        max_total_subcalls=max_total_subcalls,
+        max_batched_subcalls=max_batched_subcalls,
     )
     system_prompt = build_system_prompt(
         depth=0,
@@ -382,6 +407,9 @@ def load_environment(
         max_prompt_tokens=max_prompt_tokens,
         turn_max_tokens=turn_max_tokens,
         subcall_max_tokens=subcall_max_tokens,
+        subcall_budget_enabled=subcall_budget_enabled,
+        max_total_subcalls=max_total_subcalls,
+        max_batched_subcalls=max_batched_subcalls,
     )
     reward_rubric = build_rubric(
         judge_model=judge_model,

@@ -769,6 +769,17 @@ class OrchestratorConfig(BaseConfig):
         ),
     ] = None
 
+    rollout_timeout_seconds: Annotated[
+        float | None,
+        Field(
+            gt=0,
+            description=(
+                "Wall-clock timeout in seconds for each rollout request. If None, rollouts use the "
+                "environment client's default timeout behavior."
+            ),
+        ),
+    ] = None
+
     tasks_per_minute: Annotated[
         int | None,
         Field(

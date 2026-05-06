@@ -49,14 +49,13 @@ The REPL only executes Python that appears inside fenced ```repl ... ``` code bl
 - Use the batched variants when you have multiple independent sub-tasks.
 - Child calls do not automatically inherit `context`; pass the relevant context excerpt explicitly in every subcall prompt.
 - Be context-aware: read only the context you need, and delegate only the smallest relevant excerpts to subcalls.
-- When recursion budget remains, make at least one narrow recursive call with `rlm_query` or `rlm_query_batched` before finalizing, using only the smallest relevant context excerpt.
 - Print intermediate results so you can observe them in the next iteration.
 - Only finalize after you have read and synthesized the results from your analysis.
 - Be efficient: batch related operations in one code block. Aim for 3-5 iterations, not 15.
 
 ## Strategy: Decompose, Delegate, Verify
 
-You are an orchestrator. Break the problem into sub-problems and delegate them to child agents via `rlm_query` / `rlm_query_batched`. Do NOT try to solve everything yourself in a single long loop.
+You are an orchestrator. Break the problem into sub-problems when decomposition is useful, and delegate complex or large sub-problems to child agents via `rlm_query` / `rlm_query_batched`. Do NOT try to solve everything yourself in a single long loop.
 
 ### When to use rlm_query vs llm_query
 
@@ -81,9 +80,10 @@ Child agents may hallucinate. You MUST verify their claims before including them
 **Parallel analysis by chunk** -- for long context, split into chunks and analyze each independently:
 ```repl
 chunks = [context[i:i+50000] for i in range(0, len(context), 50000)]
+selected_chunks = chunks[:4]  # inspect/search first, then keep only the most relevant chunks
 prompts = [
     "Analyze this chunk for evidence relevant to the question. If none found, say NOT_FOUND.\\n\\n" + chunk
-    for chunk in chunks
+    for chunk in selected_chunks
 ]
 results = rlm_query_batched(prompts)
 print(results)
@@ -95,7 +95,7 @@ sub_tasks = [
     "Find evidence for aspect A in this context excerpt. If none found, say NOT_FOUND.\\n\\n" + context[:50000],
     "Find evidence for aspect B in this context excerpt. If none found, say NOT_FOUND.\\n\\n" + context[:50000],
 ]
-results = rlm_query_batched(sub_tasks)
+results = llm_query_batched(sub_tasks)
 print(results)
 ```
 
@@ -109,7 +109,7 @@ print(detail)
 ### Orchestrator workflow
 
 1. **Iteration 1-2**: Gather high-level context. Inspect type, length, headers, samples, and obvious structure.
-2. **Iteration 3**: Delegate independent sub-problems via `rlm_query_batched`. Each child prompt must include the task, relevant context excerpt, evidence format, and "say NOT_FOUND if no evidence."
+2. **Iteration 3**: Delegate only selected independent sub-problems via `llm_query_batched` or, when they need code/iteration, a small `rlm_query_batched` call. Each child prompt must include the task, relevant context excerpt, evidence format, and "say NOT_FOUND if no evidence."
 3. **Iteration 4**: Receive child results. Cross-check key claims with your own code or focused LLM calls. Discard anything unverified.
 4. **Iteration 5**: Combine verified results and finalize.
 

@@ -78,6 +78,7 @@ def test_schedule_rollout_uses_task_retry_config():
         scheduler.model_name = "test-model"
         scheduler.sampling_args = {"temperature": 0.7}
         scheduler.max_retries_by_task = {"rlm_rlvr": 3}
+        scheduler.config = SimpleNamespace(rollout_timeout_seconds=12.5)
 
         client = SimpleNamespace(api_base_url="http://test", extra_headers={})
 
@@ -91,6 +92,7 @@ def test_schedule_rollout_uses_task_retry_config():
 
         async def fake_run_rollout(**kwargs):
             captured["max_retries"] = kwargs["max_retries"]
+            captured["rollout_timeout_seconds"] = kwargs["rollout_timeout_seconds"]
             return {"trajectory": [], "error": None}
 
         scheduler_module.run_rollout = fake_run_rollout
@@ -103,5 +105,6 @@ def test_schedule_rollout_uses_task_retry_config():
             scheduler_module.run_rollout = original_run_rollout
 
         assert captured["max_retries"] == 3
+        assert captured["rollout_timeout_seconds"] == 12.5
 
     asyncio.run(run())

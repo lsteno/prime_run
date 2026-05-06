@@ -88,6 +88,10 @@ def _runtime_state(**overrides):
         "num_subcalls": 0,
         "num_llm_subcalls": 0,
         "num_rlm_subcalls": 0,
+        "subcall_budget_enabled": False,
+        "subcall_budget_total": 40,
+        "subcall_budget_remaining": 40,
+        "subcall_budget_exhausted": False,
         "sampling_temperature": 0.0,
     }
     state.update(overrides)
@@ -343,8 +347,8 @@ def test_plain_query_batch_runs_in_parallel() -> None:
         RuntimeConfig(max_prompt_tokens=4096, live_trace_dir=None),
     )
 
-    def fake_plain_query(prompt: str, model: str | None = None) -> dict[str, object]:
-        del model
+    def fake_plain_query(prompt: str, model: str | None = None, consume_budget: bool = True) -> dict[str, object]:
+        del model, consume_budget
         time.sleep(0.05)
         return {
             "prompt": prompt,
@@ -379,8 +383,9 @@ def test_recursive_query_batch_runs_in_parallel() -> None:
         prompt: str,
         model: str | None = None,
         max_depth: int | None = None,
+        consume_budget: bool = True,
     ) -> dict[str, object]:
-        del model, max_depth
+        del model, max_depth, consume_budget
         time.sleep(0.05)
         return {
             "prompt": prompt,
@@ -460,6 +465,182 @@ def test_recursive_local_repl_batched_calls_preserve_pending_call_order() -> Non
     assert llm_responses == ["plain:alpha", "plain:beta"]
     assert rlm_responses == ["recursive:gamma", "recursive:delta"]
     assert [call.prompt for call in repl._pending_llm_calls] == ["alpha", "beta", "gamma", "delta"]
+
+
+def test_plain_query_budget_exhaustion_returns_visible_error_without_generation() -> None:
+    class _BudgetSession:
+        model_name = "fake-model"
+
+        def generate(self, **kwargs):
+            del kwargs
+            raise AssertionError("budget-exhausted subcall should not generate")
+
+    state = _runtime_state(
+        _sync_session=_BudgetSession(),
+        subcall_budget_enabled=True,
+        subcall_budget_total=1,
+        subcall_budget_remaining=0,
+        subcall_budget_exhausted=True,
+    )
+    runtime = RecursiveRuntime(
+        state,
+        RuntimeConfig(subcall_budget_enabled=True, max_total_subcalls=1, live_trace_dir=None),
+    )
+
+    payload = runtime._plain_query("blocked")
+
+    assert payload["budget_error"] is True
+    assert payload["response"] == "Error: subcall budget exhausted (0/1 calls remaining)."
+    assert state["num_subcalls"] == 0
+
+
+def test_enabled_budget_decrements_single_llm_and_rlm_subcalls() -> None:
+    class _StubSession:
+        model_name = "fake-model"
+
+        def generate(self, *, messages, max_tokens: int, temperature: float, top_p: float):
+            del messages, max_tokens, temperature, top_p
+            return (
+                "FINAL(42)",
+                TokenPayload(
+                    prompt_ids=[11],
+                    completion_ids=[21],
+                    completion_logprobs=[0.0],
+                    completion_mask=[True],
+                ),
+            )
+
+    state = _runtime_state(
+        _sync_session=_StubSession(),
+        subcall_budget_enabled=True,
+        subcall_budget_total=2,
+        subcall_budget_remaining=2,
+    )
+    runtime = RecursiveRuntime(
+        state,
+        RuntimeConfig(
+            subcall_budget_enabled=True,
+            max_total_subcalls=2,
+            max_depth=2,
+            max_iterations=1,
+            turn_max_tokens=8,
+            subcall_max_tokens=4,
+            live_trace_dir=None,
+        ),
+    )
+
+    runtime._plain_query("plain")
+    runtime._recursive_query("recursive")
+
+    assert state["subcall_budget_remaining"] == 0
+    assert state["subcall_budget_exhausted"] is True
+    assert state["num_subcalls"] == 2
+    assert state["num_llm_subcalls"] == 1
+    assert state["num_rlm_subcalls"] == 1
+
+
+def test_batched_budget_clips_prompts_and_returns_budget_errors() -> None:
+    runtime = RecursiveRuntime(
+        _runtime_state(
+            _sync_session=SimpleNamespace(model_name="fake-model"),
+            subcall_budget_enabled=True,
+            subcall_budget_total=2,
+            subcall_budget_remaining=2,
+        ),
+        RuntimeConfig(
+            subcall_budget_enabled=True,
+            max_total_subcalls=2,
+            max_batched_subcalls=2,
+            max_prompt_tokens=4096,
+            live_trace_dir=None,
+        ),
+    )
+
+    def fake_plain_query(prompt: str, model: str | None = None, consume_budget: bool = True) -> dict[str, object]:
+        del model, consume_budget
+        return {
+            "prompt": prompt,
+            "model": "fake-model",
+            "response": f"response:{prompt}",
+            "kind": "plain_query",
+            "depth": 1,
+            "execution_time": 0.01,
+        }
+
+    runtime._plain_query = fake_plain_query  # type: ignore[method-assign]
+
+    payloads = runtime.run_plain_query_batch(["alpha", "beta", "gamma"])
+
+    assert [payload["response"] for payload in payloads] == [
+        "response:alpha",
+        "response:beta",
+        "Error: subcall budget exhausted (0/2 calls remaining).",
+    ]
+    assert payloads[2]["budget_error"] is True
+    assert runtime.state["subcall_budget_remaining"] == 0
+
+
+def test_batch_fanout_limit_does_not_mark_budget_exhausted_when_calls_remain() -> None:
+    runtime = RecursiveRuntime(
+        _runtime_state(
+            _sync_session=SimpleNamespace(model_name="fake-model"),
+            subcall_budget_enabled=True,
+            subcall_budget_total=10,
+            subcall_budget_remaining=10,
+        ),
+        RuntimeConfig(
+            subcall_budget_enabled=True,
+            max_total_subcalls=10,
+            max_batched_subcalls=2,
+            max_prompt_tokens=4096,
+            live_trace_dir=None,
+        ),
+    )
+
+    def fake_plain_query(prompt: str, model: str | None = None, consume_budget: bool = True) -> dict[str, object]:
+        del model, consume_budget
+        return {
+            "prompt": prompt,
+            "model": "fake-model",
+            "response": f"response:{prompt}",
+            "kind": "plain_query",
+            "depth": 1,
+            "execution_time": 0.01,
+        }
+
+    runtime._plain_query = fake_plain_query  # type: ignore[method-assign]
+
+    payloads = runtime.run_plain_query_batch(["alpha", "beta", "gamma"])
+
+    assert payloads[2]["response"] == "Error: subcall batch fanout limit reached (2 prompts maximum; 8/10 calls remaining)."
+    assert runtime.state["subcall_budget_remaining"] == 8
+    assert runtime.state["subcall_budget_exhausted"] is False
+
+
+def test_budget_feedback_message_is_numeric_only() -> None:
+    runtime = RecursiveRuntime(
+        _runtime_state(
+            _sync_session=SimpleNamespace(model_name="fake-model"),
+            subcall_budget_enabled=True,
+            subcall_budget_total=40,
+            subcall_budget_remaining=17,
+        ),
+        RuntimeConfig(subcall_budget_enabled=True, max_total_subcalls=40, live_trace_dir=None),
+    )
+
+    assert runtime.budget_feedback_message() == {
+        "role": "user",
+        "content": "Subcall budget remaining: 17/40.",
+    }
+
+
+def test_disabled_budget_feedback_is_absent() -> None:
+    runtime = RecursiveRuntime(
+        _runtime_state(_sync_session=SimpleNamespace(model_name="fake-model")),
+        RuntimeConfig(live_trace_dir=None),
+    )
+
+    assert runtime.budget_feedback_message() is None
 
 
 def test_oversized_llm_subcall_is_blocked_and_visible_in_repl() -> None:
