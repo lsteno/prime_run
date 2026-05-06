@@ -13,7 +13,7 @@ from .prompt_variants import DEFAULT_PROMPT_VARIANT, PROMPT_VARIANTS
 from .repl import create_repl
 from .reward import add_metrics, build_rubric
 from .runtime import RecursiveRuntime, RuntimeConfig, SyncInferenceSession
-from .trace import append_step_trace, make_call_trace, make_segment
+from .trace import append_step_trace, make_call_trace, make_segment, prompt_provenance
 
 
 class RLMRLVREnv(vf.MultiTurnEnv):
@@ -92,11 +92,16 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         state["num_rlm_subcalls"] = 0
         state["total_model_tokens"] = 0.0
         state["total_env_tokens"] = 0.0
+        state["total_prompt_tokens"] = 0.0
+        state["total_completion_tokens"] = 0.0
+        state["total_rollout_tokens"] = 0.0
         state["rlm_segments"] = []
         state["rlm_trace"] = []
         state["rlm_segment_counter"] = 0
         state["rlm_call_counter"] = 1
         state["current_call_depth"] = 0
+        state["current_call_id"] = 0
+        state["current_parent_call_id"] = None
         state["current_branch_max_depth"] = self.runtime_config.max_depth
         state["final_answer"] = None
         state["prompt_variant"] = self.runtime_config.prompt_variant
@@ -157,21 +162,37 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             return
 
         temperature = float((state.get("sampling_args") or {}).get("temperature", self.runtime_config.temperature))
+        prompt_messages = trajectory_step.get("prompt") or []
+        provenance = prompt_provenance(prompt_messages if isinstance(prompt_messages, list) else [])
         segment = make_segment(
             order=int(state["rlm_segment_counter"]),
+            call_id=0,
+            parent_call_id=None,
             depth=0,
+            turn_index=max(0, len(state.get("trajectory") or []) - 1),
             kind="root_turn",
+            train_scope="root_turn",
+            is_trainable_rlm_turn=True,
+            response_source="root",
             prompt_ids=list(tokens["prompt_ids"]),
             completion_ids=list(tokens["completion_ids"]),
             completion_logprobs=[float(value) for value in tokens["completion_logprobs"]],
             completion_mask=[bool(value) for value in tokens["completion_mask"]],
             temperature=temperature,
             response_text=trajectory_step["completion"][-1].get("content", ""),
+            prompt_fingerprint=provenance["prompt_fingerprint"],
+            prompt_message_count=provenance["prompt_message_count"],
+            prompt_char_count=provenance["prompt_char_count"],
         )
         trajectory_step["extras"]["rlm_segment_order"] = segment["order"]
         state["rlm_segment_counter"] += 1
         state["rlm_segments"].append(segment)
-        state["total_model_tokens"] += float(sum(segment["completion_mask"]))
+        prompt_token_count = float(len(segment["prompt_ids"]))
+        completion_token_count = float(len(segment["completion_ids"]))
+        state["total_model_tokens"] = float(state.get("total_model_tokens", 0.0)) + completion_token_count
+        state["total_prompt_tokens"] = float(state.get("total_prompt_tokens", 0.0)) + prompt_token_count
+        state["total_completion_tokens"] = float(state.get("total_completion_tokens", 0.0)) + completion_token_count
+        state["total_rollout_tokens"] = float(state.get("total_rollout_tokens", 0.0)) + prompt_token_count + completion_token_count
         write_live_trace(state, event="root_segment")
 
     async def env_response(self, messages: vf.Messages, state: vf.State, **kwargs) -> vf.Messages:

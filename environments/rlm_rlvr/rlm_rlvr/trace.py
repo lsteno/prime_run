@@ -1,26 +1,68 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
+
+
+def _normalize_prompt_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    for message in messages:
+        normalized.append(
+            {
+                "role": str(message.get("role", "")),
+                "content": str(message.get("content", "")),
+            }
+        )
+    return normalized
+
+
+def prompt_provenance(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    normalized = _normalize_prompt_messages(messages)
+    serialized = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return {
+        "prompt_fingerprint": hashlib.sha1(serialized.encode("utf-8")).hexdigest(),
+        "prompt_message_count": len(normalized),
+        "prompt_char_count": sum(len(message["role"]) + len(message["content"]) for message in normalized),
+    }
 
 
 def make_segment(
     *,
     order: int,
+    call_id: int,
+    parent_call_id: int | None,
     depth: int,
+    turn_index: int,
     kind: str,
+    train_scope: str,
+    is_trainable_rlm_turn: bool,
+    response_source: str,
     prompt_ids: list[int],
     completion_ids: list[int],
     completion_logprobs: list[float],
     completion_mask: list[bool] | None = None,
     temperature: float,
     response_text: str,
+    prompt_fingerprint: str | None = None,
+    prompt_message_count: int | None = None,
+    prompt_char_count: int | None = None,
 ) -> dict[str, Any]:
     if completion_mask is None:
         completion_mask = [True] * len(completion_ids)
     return {
         "order": order,
+        "call_id": int(call_id),
+        "parent_call_id": None if parent_call_id is None else int(parent_call_id),
         "depth": depth,
+        "turn_index": int(turn_index),
         "kind": kind,
+        "train_scope": train_scope,
+        "is_trainable_rlm_turn": bool(is_trainable_rlm_turn),
+        "response_source": response_source,
+        "prompt_fingerprint": prompt_fingerprint,
+        "prompt_message_count": prompt_message_count,
+        "prompt_char_count": prompt_char_count,
         "prompt_ids": list(prompt_ids),
         "completion_ids": list(completion_ids),
         "completion_logprobs": [float(value) for value in completion_logprobs],

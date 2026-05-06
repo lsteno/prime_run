@@ -13,11 +13,11 @@
 - ✅ Parallelize llm query batched
 - ✅ _raise_if_subcall_prompt_too_large(...) is stupid and slow and _fit_messages_to_prompt_budget(...) cuts away context! Bad! Simplify the guard by using character count estimates and remove _fit_messages_to_prompt_budget(...) to avoid loss of context (just raise error if prompt too big) also raise single error for multiple too long calls (e.g. batched call)
 - ✅ Update tracking of recursion to distinguish between llm subcalls and rlm subcalls
-- Potentially only train on root turns?
-- Strengthen how we track which subcall generated what so model is rewarded/trained exactly on the context it had at a certain time, this should fix the error we get where it says output is more than seq_len
-- Make sure responses from tools are masked so we don't train on tool/REPL outputs
-- Diagnose why we don't get su-rlm calls, is it broken or do the models just not use it?
-- Still need to add cost awerness in the reward!!!
+- ✅ Only train on root turns
+- ✅ Strengthen how we track which subcall generated what so model is rewarded/trained exactly on the context it had at a certain time, this should fix the error we get where it says output is more than seq_len
+- ✅ Make sure responses from tools are masked so we don't train on tool/REPL outputs
+- ✅ Diagnose why we don't get sub-rlm calls, is it broken or do the models just not use it?
+- ✅ Still need to add cost awerness in the reward!!!
 
 ## Scope Decisions
 

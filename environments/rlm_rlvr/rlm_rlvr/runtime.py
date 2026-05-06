@@ -14,7 +14,7 @@ from .external_rlm import CodeBlock, QueryMetadata, RLMIteration, build_system_p
 from .live_trace import write_live_trace
 from .prompt_variants import DEFAULT_PROMPT_VARIANT
 from .repl import create_repl
-from .trace import append_step_trace, make_call_trace, make_segment
+from .trace import append_step_trace, make_call_trace, make_segment, prompt_provenance
 
 
 class SubcallPromptTooLargeError(ValueError):
@@ -193,21 +193,57 @@ class RecursiveRuntime:
             return int(depth)
         return int(self.state.get("current_call_depth", 0))
 
+    def _current_call_id(self) -> int:
+        call_id = getattr(self._thread_context, "call_id", None)
+        if call_id is not None:
+            return int(call_id)
+        return int(self.state.get("current_call_id", 0))
+
+    def _current_parent_call_id(self) -> int | None:
+        parent_call_id = getattr(self._thread_context, "parent_call_id", None)
+        if parent_call_id is not None:
+            return int(parent_call_id)
+        state_parent = self.state.get("current_parent_call_id")
+        return None if state_parent is None else int(state_parent)
+
     def _current_branch_max_depth(self) -> int:
         max_depth = getattr(self._thread_context, "branch_max_depth", None)
         if max_depth is not None:
             return int(max_depth)
         return int(self.state.get("current_branch_max_depth", self.config.max_depth))
 
-    def _set_thread_context(self, *, depth: int, max_depth: int) -> tuple[int | None, int | None]:
+    def _set_thread_context(
+        self,
+        *,
+        call_id: int,
+        parent_call_id: int | None,
+        depth: int,
+        max_depth: int,
+    ) -> tuple[int | None, int | None, int | None, int | None]:
+        previous_call_id = getattr(self._thread_context, "call_id", None)
+        previous_parent_call_id = getattr(self._thread_context, "parent_call_id", None)
         previous_depth = getattr(self._thread_context, "call_depth", None)
         previous_max_depth = getattr(self._thread_context, "branch_max_depth", None)
+        self._thread_context.call_id = int(call_id)
+        if parent_call_id is None:
+            self._thread_context.parent_call_id = None
+        else:
+            self._thread_context.parent_call_id = int(parent_call_id)
         self._thread_context.call_depth = int(depth)
         self._thread_context.branch_max_depth = int(max_depth)
-        return previous_depth, previous_max_depth
+        return previous_call_id, previous_parent_call_id, previous_depth, previous_max_depth
 
-    def _restore_thread_context(self, previous: tuple[int | None, int | None]) -> None:
-        previous_depth, previous_max_depth = previous
+    def _restore_thread_context(self, previous: tuple[int | None, int | None, int | None, int | None]) -> None:
+        previous_call_id, previous_parent_call_id, previous_depth, previous_max_depth = previous
+        if previous_call_id is None:
+            if hasattr(self._thread_context, "call_id"):
+                del self._thread_context.call_id
+        else:
+            self._thread_context.call_id = int(previous_call_id)
+        if previous_parent_call_id is None:
+            self._thread_context.parent_call_id = None
+        else:
+            self._thread_context.parent_call_id = int(previous_parent_call_id)
         if previous_depth is None:
             if hasattr(self._thread_context, "call_depth"):
                 del self._thread_context.call_depth
@@ -363,21 +399,50 @@ class RecursiveRuntime:
             self.state["rlm_call_counter"] = call_id + 1
             return call_id
 
-    def _append_segment(self, *, payload: TokenPayload, depth: int, kind: str, response_text: str) -> None:
+    def _append_segment(
+        self,
+        *,
+        payload: TokenPayload,
+        depth: int,
+        turn_index: int,
+        kind: str,
+        train_scope: str,
+        is_trainable_rlm_turn: bool,
+        response_source: str,
+        response_text: str,
+        messages: list[dict[str, str]],
+        call_id: int | None = None,
+        parent_call_id: int | None = None,
+    ) -> None:
+        provenance = prompt_provenance(messages)
         segment = make_segment(
             order=self._next_segment_order(),
+            call_id=self._current_call_id() if call_id is None else call_id,
+            parent_call_id=self._current_parent_call_id() if parent_call_id is None else parent_call_id,
             depth=depth,
+            turn_index=turn_index,
             kind=kind,
+            train_scope=train_scope,
+            is_trainable_rlm_turn=is_trainable_rlm_turn,
+            response_source=response_source,
             prompt_ids=payload.prompt_ids,
             completion_ids=payload.completion_ids,
             completion_logprobs=payload.completion_logprobs,
             completion_mask=payload.completion_mask,
             temperature=float(self.state.get("sampling_temperature", self.config.temperature)),
             response_text=response_text,
+            prompt_fingerprint=provenance["prompt_fingerprint"],
+            prompt_message_count=provenance["prompt_message_count"],
+            prompt_char_count=provenance["prompt_char_count"],
         )
         with self._state_lock:
             self.state["rlm_segments"].append(segment)
-            self.state["total_model_tokens"] += float(sum(payload.completion_mask))
+            prompt_token_count = float(len(payload.prompt_ids))
+            completion_token_count = float(len(payload.completion_ids))
+            self.state["total_model_tokens"] += completion_token_count
+            self.state["total_prompt_tokens"] = float(self.state.get("total_prompt_tokens", 0.0)) + prompt_token_count
+            self.state["total_completion_tokens"] = float(self.state.get("total_completion_tokens", 0.0)) + completion_token_count
+            self.state["total_rollout_tokens"] = float(self.state.get("total_rollout_tokens", 0.0)) + prompt_token_count + completion_token_count
             self.state["max_depth_reached"] = max(int(self.state["max_depth_reached"]), depth)
         self._write_live_trace(event=f"segment:{kind}")
 
@@ -498,8 +563,13 @@ class RecursiveRuntime:
         self._append_segment(
             payload=payload,
             depth=depth,
+            turn_index=-1,
             kind="plain_query",
+            train_scope="llm_subcall",
+            is_trainable_rlm_turn=False,
+            response_source="llm_subcall",
             response_text=text,
+            messages=messages,
         )
         return {
             "prompt": prompt,
@@ -539,7 +609,13 @@ class RecursiveRuntime:
         )
         self._record_subcall(kind="recursive_query", depth=child_depth)
 
-        result = self.run_call(prompt=prompt, depth=child_depth, max_depth=effective_max_depth, context_payload=None)
+        result = self.run_call(
+            prompt=prompt,
+            depth=child_depth,
+            max_depth=effective_max_depth,
+            context_payload=None,
+            parent_call_id=self._current_call_id(),
+        )
         return {
             "prompt": prompt,
             "model": model or self.session.model_name,
@@ -547,6 +623,8 @@ class RecursiveRuntime:
             "final_answer": result["final_answer"],
             "depth": child_depth,
             "kind": "recursive_query",
+            "call_id": result["call_id"],
+            "parent_call_id": result["parent_call_id"],
             "trace": result["trace"],
             "execution_time": float(result.get("execution_time", 0.0)),
         }
@@ -558,6 +636,7 @@ class RecursiveRuntime:
         depth: int,
         max_depth: int,
         context_payload: str | None,
+        parent_call_id: int | None = None,
     ) -> dict[str, Any]:
         start_time = time.perf_counter()
         call_id = self._next_call_id()
@@ -590,7 +669,12 @@ class RecursiveRuntime:
         final_answer: str | None = None
         response_text = ""
 
-        previous_context = self._set_thread_context(depth=depth, max_depth=max_depth)
+        previous_context = self._set_thread_context(
+            call_id=call_id,
+            parent_call_id=parent_call_id,
+            depth=depth,
+            max_depth=max_depth,
+        )
         try:
             for iteration_index in range(self.config.max_iterations):
                 current_prompt = message_history + [
@@ -610,8 +694,15 @@ class RecursiveRuntime:
                 self._append_segment(
                     payload=payload,
                     depth=depth,
+                    turn_index=iteration_index,
                     kind="recursive_turn",
+                    train_scope="recursive_turn",
+                    is_trainable_rlm_turn=True,
+                    response_source="recursive",
                     response_text=response_text,
+                    messages=current_prompt,
+                    call_id=call_id,
+                    parent_call_id=parent_call_id,
                 )
 
                 code_block_strs = find_code_blocks(response_text)
@@ -682,8 +773,15 @@ class RecursiveRuntime:
                 self._append_segment(
                     payload=payload,
                     depth=depth,
+                    turn_index=len(trace["steps"]),
                     kind="finalize_turn",
+                    train_scope="finalize_turn",
+                    is_trainable_rlm_turn=True,
+                    response_source="recursive",
                     response_text=response_text,
+                    messages=finalize_prompt,
+                    call_id=call_id,
+                    parent_call_id=parent_call_id,
                 )
                 final_answer = find_final_answer(response_text, environment=repl) or response_text.strip()
                 append_step_trace(
@@ -704,6 +802,8 @@ class RecursiveRuntime:
             self.state["rlm_trace"].append(trace)
         self._write_live_trace(event=f"recursive_complete:{depth}")
         return {
+            "call_id": call_id,
+            "parent_call_id": parent_call_id,
             "response_text": response_text,
             "final_answer": final_answer,
             "trace": trace,

@@ -72,9 +72,11 @@ class _FakeSyncInferenceSession:
 def _runtime_state(**overrides):
     state = {
         "current_call_depth": 0,
+        "current_call_id": 0,
+        "current_parent_call_id": None,
         "current_branch_max_depth": 2,
         "rlm_segment_counter": 0,
-        "rlm_call_counter": 0,
+        "rlm_call_counter": 1,
         "rlm_segments": [],
         "rlm_trace": [],
         "total_model_tokens": 0.0,
@@ -227,6 +229,52 @@ def test_env_response_records_root_repl_feedback(tmp_path) -> None:
     assert live_trace["event"] == "root_feedback"
     assert live_trace["traces"][0]["steps"][0]["code_blocks"] == ["print('hello from root')"]
     assert any("hello from root" in feedback for feedback in live_trace["traces"][0]["steps"][0]["feedback"])
+
+
+def test_add_trajectory_step_marks_root_turn_trainable_with_prompt_provenance(monkeypatch) -> None:
+    import rlm_rlvr.env as env_module
+
+    async def _fake_add_trajectory_step(self, state, trajectory_step):
+        del self
+        state.setdefault("trajectory", []).append(trajectory_step)
+
+    monkeypatch.setattr(env_module.vf.MultiTurnEnv, "add_trajectory_step", _fake_add_trajectory_step)
+    environment = object.__new__(RLMRLVREnv)
+    environment.runtime_config = RuntimeConfig(temperature=0.7, live_trace_dir=None)
+    state = {
+        "trajectory": [],
+        "rlm_segment_counter": 0,
+        "rlm_segments": [],
+        "total_model_tokens": 0.0,
+        "sampling_args": {"temperature": 0.7},
+    }
+    trajectory_step = {
+        "prompt": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "question"},
+        ],
+        "completion": [{"role": "assistant", "content": "answer"}],
+        "tokens": {
+            "prompt_ids": [1, 2, 3],
+            "completion_ids": [4, 5],
+            "completion_logprobs": [-0.1, -0.2],
+            "completion_mask": [True, True],
+        },
+        "extras": {},
+    }
+
+    asyncio.run(environment.add_trajectory_step(state, trajectory_step))
+
+    segment = state["rlm_segments"][0]
+    assert trajectory_step["extras"]["rlm_segment_order"] == 0
+    assert segment["call_id"] == 0
+    assert segment["parent_call_id"] is None
+    assert segment["turn_index"] == 0
+    assert segment["train_scope"] == "root_turn"
+    assert segment["is_trainable_rlm_turn"] is True
+    assert segment["response_source"] == "root"
+    assert segment["prompt_message_count"] == 2
+    assert segment["prompt_char_count"] == len("system") + len("sys") + len("user") + len("question")
 
 
 def test_generate_preserves_messages_without_prompt_fitting() -> None:
@@ -548,6 +596,60 @@ def test_recursive_query_updates_depth_and_trace() -> None:
     assert len(state["rlm_trace"]) == 1
 
 
+def test_recursive_query_segments_capture_exact_prompt_context() -> None:
+    class _CapturingSession:
+        model_name = "fake-model"
+
+        def __init__(self) -> None:
+            self.calls: list[list[dict[str, str]]] = []
+
+        def generate(self, *, messages, max_tokens: int, temperature: float, top_p: float):
+            del max_tokens, temperature, top_p
+            captured = [{"role": str(item["role"]), "content": str(item["content"])} for item in messages]
+            self.calls.append(captured)
+            return (
+                "FINAL(42)",
+                TokenPayload(
+                    prompt_ids=[11, 12],
+                    completion_ids=[21, 22],
+                    completion_logprobs=[0.0, 0.0],
+                    completion_mask=[True, True],
+                ),
+            )
+
+    session = _CapturingSession()
+    state = _runtime_state(_sync_session=session)
+    runtime = RecursiveRuntime(
+        state,
+        RuntimeConfig(
+            max_depth=2,
+            max_iterations=1,
+            turn_max_tokens=8,
+            subcall_max_tokens=4,
+            temperature=0.0,
+            top_p=1.0,
+            repl_backend="local",
+            live_trace_dir=None,
+        ),
+    )
+
+    result = runtime._recursive_query("solve it")
+
+    assert result["call_id"] == 1
+    segment = state["rlm_segments"][0]
+    expected_messages = session.calls[0]
+    expected_chars = sum(len(message["role"]) + len(message["content"]) for message in expected_messages)
+    assert segment["call_id"] == 1
+    assert segment["parent_call_id"] == 0
+    assert segment["turn_index"] == 0
+    assert segment["train_scope"] == "recursive_turn"
+    assert segment["is_trainable_rlm_turn"] is True
+    assert segment["prompt_message_count"] == len(expected_messages)
+    assert segment["prompt_char_count"] == expected_chars
+    assert isinstance(segment["prompt_fingerprint"], str)
+    assert len(segment["prompt_fingerprint"]) == 40
+
+
 def test_plain_query_counts_as_depth_one_llm_subcall() -> None:
     class _StubSession:
         model_name = "fake-model"
@@ -589,6 +691,44 @@ def test_plain_query_counts_as_depth_one_llm_subcall() -> None:
     assert len(state["rlm_segments"]) == 1
 
 
+def test_plain_query_segments_are_non_trainable_llm_subcalls() -> None:
+    class _StubSession:
+        model_name = "fake-model"
+
+        def generate(self, *, messages, max_tokens: int, temperature: float, top_p: float):
+            del messages, max_tokens, temperature, top_p
+            return (
+                "plain answer",
+                TokenPayload(
+                    prompt_ids=[11, 12],
+                    completion_ids=[21, 22],
+                    completion_logprobs=[0.0, 0.0],
+                    completion_mask=[True, True],
+                ),
+            )
+
+    state = _runtime_state(_sync_session=_StubSession())
+    runtime = RecursiveRuntime(
+        state,
+        RuntimeConfig(
+            subcall_max_tokens=4,
+            temperature=0.0,
+            top_p=1.0,
+            live_trace_dir=None,
+        ),
+    )
+
+    runtime._plain_query("solve directly")
+
+    segment = state["rlm_segments"][0]
+    assert segment["call_id"] == 0
+    assert segment["parent_call_id"] is None
+    assert segment["train_scope"] == "llm_subcall"
+    assert segment["is_trainable_rlm_turn"] is False
+    assert segment["response_source"] == "llm_subcall"
+    assert segment["turn_index"] == -1
+
+
 def test_live_trace_compacts_segments_without_token_arrays(tmp_path) -> None:
     from rlm_rlvr.live_trace import write_live_trace
 
@@ -601,8 +741,17 @@ def test_live_trace_compacts_segments_without_token_arrays(tmp_path) -> None:
         "rlm_segments": [
             {
                 "order": 0,
+                "call_id": 0,
+                "parent_call_id": None,
                 "depth": 0,
+                "turn_index": 0,
                 "kind": "root_turn",
+                "train_scope": "root_turn",
+                "is_trainable_rlm_turn": True,
+                "response_source": "root",
+                "prompt_fingerprint": "abc123",
+                "prompt_message_count": 3,
+                "prompt_char_count": 42,
                 "prompt_ids": [1, 2, 3],
                 "completion_ids": [4, 5],
                 "completion_logprobs": [-0.1, -0.2],
@@ -631,6 +780,11 @@ def test_live_trace_compacts_segments_without_token_arrays(tmp_path) -> None:
     segment = live_trace["segments"][0]
     assert live_trace["status"]["used_llm_subcalls"] is True
     assert live_trace["status"]["num_llm_subcalls"] == 1
+    assert segment["call_id"] == 0
+    assert segment["parent_call_id"] is None
+    assert segment["turn_index"] == 0
+    assert segment["train_scope"] == "root_turn"
+    assert segment["is_trainable_rlm_turn"] is True
     assert segment["prompt_tokens"] == 3
     assert segment["completion_tokens"] == 2
     assert segment["response_text"] == "```repl\nprint(1)\n```"

@@ -26,15 +26,25 @@ def _json_safe(value: Any) -> Any:
 
 def _segment_summary(segment: dict[str, Any]) -> dict[str, Any]:
     completion_mask = [bool(value) for value in segment.get("completion_mask", [])]
+    is_trainable = bool(segment.get("is_trainable_rlm_turn", False))
     return {
         "order": int(segment.get("order", 0)),
+        "call_id": segment.get("call_id"),
+        "parent_call_id": segment.get("parent_call_id"),
         "depth": int(segment.get("depth", 0)),
+        "turn_index": segment.get("turn_index"),
         "kind": segment.get("kind"),
+        "train_scope": segment.get("train_scope"),
+        "is_trainable_rlm_turn": bool(segment.get("is_trainable_rlm_turn", False)),
+        "response_source": segment.get("response_source"),
+        "prompt_fingerprint": segment.get("prompt_fingerprint"),
+        "prompt_message_count": segment.get("prompt_message_count"),
+        "prompt_char_count": segment.get("prompt_char_count"),
         "temperature": segment.get("temperature"),
         "response_text": segment.get("response_text"),
         "prompt_token_count": len(segment.get("prompt_ids", [])),
         "completion_token_count": len(segment.get("completion_ids", [])),
-        "trainable_token_count": sum(completion_mask),
+        "trainable_token_count": sum(completion_mask) if is_trainable else 0,
     }
 
 
