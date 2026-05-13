@@ -45,20 +45,25 @@ class _BudgetTokenizer:
 
 
 class _FakeClient:
-    def __init__(self) -> None:
+    def __init__(self, *, expect_logprobs: bool = True, usage=None) -> None:
         self.bodies: list[dict] = []
+        self.expect_logprobs = expect_logprobs
+        self.usage = usage
 
     def post(self, path: str, *, body, cast_to):
         del cast_to
         self.bodies.append(body)
         assert path == "chat/completions"
-        assert body["logprobs"] is True
+        if self.expect_logprobs:
+            assert body["logprobs"] is True
+        else:
+            assert "logprobs" not in body
         choice = SimpleNamespace(
             message=SimpleNamespace(content="ok"),
             token_ids=None,
             logprobs=None,
         )
-        return SimpleNamespace(choices=[choice], prompt_token_ids=None)
+        return SimpleNamespace(choices=[choice], prompt_token_ids=None, usage=self.usage)
 
 
 class _FakeSyncInferenceSession:
@@ -147,6 +152,51 @@ def test_generate_does_not_send_vllm_extras_for_hosted_mode() -> None:
     assert "extra_body" not in session.client.bodies[0]
 
 
+def test_generate_uses_api_usage_token_counts_for_plain_subcalls() -> None:
+    session = object.__new__(SyncInferenceSession)
+    session.model_name = "openai/gpt-5.4-mini"
+    session.client = _FakeClient(expect_logprobs=False, usage=SimpleNamespace(prompt_tokens=17, completion_tokens=9))
+    session.tokenizer = _FakeTokenizer()
+    session.max_prompt_tokens = None
+    session.enable_vllm_extra_body = False
+    session.request_logprobs = False
+
+    text, payload = SyncInferenceSession.generate(
+        session,
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    assert text == "ok"
+    assert payload.prompt_ids == [101, 102, 103]
+    assert payload.completion_ids == [2, 3]
+    assert payload.prompt_token_count == 17
+    assert payload.completion_token_count == 9
+
+
+def test_generate_falls_back_to_tokenizer_counts_when_usage_is_missing() -> None:
+    session = object.__new__(SyncInferenceSession)
+    session.model_name = "openai/gpt-5.4-mini"
+    session.client = _FakeClient(expect_logprobs=False, usage=None)
+    session.tokenizer = _FakeTokenizer()
+    session.max_prompt_tokens = None
+    session.enable_vllm_extra_body = False
+    session.request_logprobs = False
+
+    _, payload = SyncInferenceSession.generate(
+        session,
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    assert payload.prompt_token_count == 3
+    assert payload.completion_token_count == 2
+
+
 def test_setup_state_rebuilds_root_prompt_with_real_context_metadata(monkeypatch) -> None:
     import rlm_rlvr.env as env_module
 
@@ -175,6 +225,44 @@ def test_setup_state_rebuilds_root_prompt_with_real_context_metadata(monkeypatch
     assert updated["rlm_trace"][0]["prompt"] == "What is in the context?"
     assert updated["used_llm_subcalls"] is False
     assert updated["used_rlm_subcalls"] is False
+
+
+def test_setup_state_creates_separate_plain_llm_session(monkeypatch) -> None:
+    import rlm_rlvr.env as env_module
+
+    monkeypatch.setattr(env_module, "SyncInferenceSession", _FakeSyncInferenceSession)
+    environment = object.__new__(RLMRLVREnv)
+    environment.runtime_config = RuntimeConfig(
+        prompt_variant=DEFAULT_PROMPT_VARIANT,
+        llm_subcall_model="openai/gpt-5.4-mini",
+        llm_subcall_base_url="https://openrouter.ai/api/v1",
+        llm_subcall_api_key="openrouter-key",
+        llm_subcall_default_headers={"HTTP-Referer": "https://example.test"},
+    )
+    environment.efficiency_penalty_coef = 0.02
+    state = {
+        "client": AsyncOpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY"),
+        "model": "local-training-model",
+        "info": {
+            "context": "alpha beta gamma",
+            "question": "What is in the context?",
+        },
+        "sampling_args": {},
+    }
+
+    updated = asyncio.run(environment.setup_state(state))
+
+    local_session = updated["_sync_session"]
+    plain_session = updated["_plain_llm_session"]
+    assert plain_session is not local_session
+    assert local_session.kwargs["model_name"] == "local-training-model"
+    assert local_session.kwargs["enable_vllm_extra_body"] is False
+    assert plain_session.kwargs["model_name"] == "openai/gpt-5.4-mini"
+    assert plain_session.kwargs["base_url"] == "https://openrouter.ai/api/v1"
+    assert plain_session.kwargs["api_key"] == "openrouter-key"
+    assert plain_session.kwargs["default_headers"] == {"HTTP-Referer": "https://example.test"}
+    assert plain_session.kwargs["enable_vllm_extra_body"] is False
+    assert plain_session.kwargs["request_logprobs"] is False
 
 
 def test_env_response_records_root_repl_feedback(tmp_path) -> None:
@@ -930,6 +1018,63 @@ def test_plain_query_counts_as_depth_one_llm_subcall() -> None:
     assert len(state["rlm_segments"]) == 1
 
 
+def test_plain_query_uses_openrouter_session_and_recursive_query_uses_local_session() -> None:
+    class _LabeledSession:
+        def __init__(self, model_name: str, response: str) -> None:
+            self.model_name = model_name
+            self.response = response
+            self.calls = 0
+
+        def generate(self, *, messages, max_tokens: int, temperature: float, top_p: float):
+            del messages, max_tokens, temperature, top_p
+            self.calls += 1
+            return (
+                self.response,
+                TokenPayload(
+                    prompt_ids=[11, 12],
+                    completion_ids=[21, 22],
+                    completion_logprobs=[0.0, 0.0],
+                    completion_mask=[True, True],
+                    prompt_token_count=7,
+                    completion_token_count=5,
+                ),
+            )
+
+    local_session = _LabeledSession("local-training-model", "FINAL(local)")
+    openrouter_session = _LabeledSession("openai/gpt-5.4-mini", "plain answer")
+    state = _runtime_state(
+        _sync_session=local_session,
+        _plain_llm_session=openrouter_session,
+    )
+    runtime = RecursiveRuntime(
+        state,
+        RuntimeConfig(
+            max_depth=2,
+            max_iterations=1,
+            turn_max_tokens=8,
+            subcall_max_tokens=4,
+            temperature=0.0,
+            top_p=1.0,
+            live_trace_dir=None,
+        ),
+    )
+
+    plain_result = runtime._plain_query("solve directly")
+    recursive_result = runtime._recursive_query("solve recursively")
+
+    assert plain_result["model"] == "openai/gpt-5.4-mini"
+    assert recursive_result["model"] == "local-training-model"
+    assert openrouter_session.calls == 1
+    assert local_session.calls == 1
+    plain_segment, recursive_segment = state["rlm_segments"]
+    assert plain_segment["train_scope"] == "llm_subcall"
+    assert plain_segment["is_trainable_rlm_turn"] is False
+    assert plain_segment["prompt_token_count"] == 7
+    assert plain_segment["completion_token_count"] == 5
+    assert recursive_segment["train_scope"] == "recursive_turn"
+    assert recursive_segment["is_trainable_rlm_turn"] is True
+
+
 def test_plain_query_segments_are_non_trainable_llm_subcalls() -> None:
     class _StubSession:
         model_name = "fake-model"
@@ -993,6 +1138,8 @@ def test_live_trace_compacts_segments_without_token_arrays(tmp_path) -> None:
                 "prompt_char_count": 42,
                 "prompt_ids": [1, 2, 3],
                 "completion_ids": [4, 5],
+                "prompt_token_count": 17,
+                "completion_token_count": 9,
                 "completion_logprobs": [-0.1, -0.2],
                 "completion_mask": [True, True],
                 "temperature": 0.7,
@@ -1024,8 +1171,8 @@ def test_live_trace_compacts_segments_without_token_arrays(tmp_path) -> None:
     assert segment["turn_index"] == 0
     assert segment["train_scope"] == "root_turn"
     assert segment["is_trainable_rlm_turn"] is True
-    assert segment["prompt_tokens"] == 3
-    assert segment["completion_tokens"] == 2
+    assert segment["prompt_tokens"] == 17
+    assert segment["completion_tokens"] == 9
     assert segment["response_text"] == "```repl\nprint(1)\n```"
     assert "prompt_ids" not in segment
     assert "completion_ids" not in segment

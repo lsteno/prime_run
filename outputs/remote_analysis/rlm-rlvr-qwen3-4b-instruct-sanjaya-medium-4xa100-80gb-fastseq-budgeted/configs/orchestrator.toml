@@ -1,0 +1,202 @@
+filters = [
+    { type = "gibberish", enforce = false, token_id_threshold = 100000, logprob_offset = 2.0 },
+    { type = "repetition", enforce = false, window = 3000, prob_threshold = 0.99 },
+]
+output_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-4xa100-80gb-fastseq-budgeted/run_default"
+max_concurrent = 32
+rollout_timeout_seconds = 1000.0
+batch_size = 64
+oversampling_factor = 1.0
+max_inflight_rollouts = 64
+rollouts_per_example = 4
+seq_len = 65536
+num_train_workers = 2
+max_steps = 100
+max_off_policy_steps = 8
+max_async_level = 4
+strict_async_level = false
+bench = false
+seed = 42
+use_token_client = false
+
+[client]
+timeout = 1200
+connect_timeout = 30.0
+base_url = [
+    "http://localhost:8000/v1",
+]
+api_key_var = "VLLM_API_KEY"
+skip_model_check = false
+dp_rank_count = 2
+
+[client.headers]
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+trust_remote_code = false
+
+[model.lora]
+name = "r64-a128.0"
+rank = 64
+alpha = 128.0
+
+[optim]
+lr = 0.0001
+
+[sampling]
+temperature = 0.7
+repetition_penalty = 1.0
+max_tokens = 2048
+min_tokens = 0
+
+[sampling.extra_body]
+return_token_ids = true
+top_k = -1
+min_p = 0.0
+
+[[env]]
+id = "rlm_rlvr"
+max_retries = 0
+
+[env.args]
+dataset_id = "lsteno/BEEG-agents"
+dataset_train_split = "train"
+dataset_eval_split = "eval"
+seed = 42
+max_examples = 4096
+max_eval_examples = 256
+prompt_variant = "sanjaya_text_v1"
+max_iterations = 8
+max_depth = 2
+turn_max_tokens = 2048
+subcall_max_tokens = 2048
+max_prompt_tokens = 61440
+subcall_prompt_limit_ratio = 0.85
+subcall_budget_enabled = true
+max_total_subcalls = 40
+max_batched_subcalls = 40
+tokenizer_name = "Qwen/Qwen3-4B-Instruct-2507"
+inference_mode = "local"
+inference_base_url = "http://localhost:8000/v1"
+inference_api_key = "local-vllm"
+repl_backend = "local"
+repl_timeout_seconds = 300
+repl_fast_timeout_seconds = 60
+judge_model = "z-ai/glm-5"
+efficiency_penalty_coef = 0.0001
+live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-4xa100-80gb-fastseq-budgeted/live_traces"
+
+[env.extra_env_kwargs]
+max_seq_len = 65536
+score_rollouts = true
+
+[eval]
+num_examples = 64
+rollouts_per_example = 1
+interval = 25
+eval_base_model = false
+skip_eval_on_resume = true
+cancel_inflight_rollouts_on_eval = true
+
+[[eval.env]]
+id = "rlm_rlvr"
+name = "rlm_rlvr_eval"
+max_retries = 0
+num_examples = 64
+rollouts_per_example = 1
+skip_first = 0
+
+[eval.env.args]
+dataset_id = "lsteno/BEEG-agents"
+dataset_train_split = "train"
+dataset_eval_split = "eval"
+seed = 42
+max_examples = 4096
+max_eval_examples = 256
+prompt_variant = "sanjaya_text_v1"
+max_iterations = 8
+max_depth = 2
+turn_max_tokens = 2048
+subcall_max_tokens = 2048
+max_prompt_tokens = 61440
+subcall_prompt_limit_ratio = 0.85
+subcall_budget_enabled = true
+max_total_subcalls = 40
+max_batched_subcalls = 40
+tokenizer_name = "Qwen/Qwen3-4B-Instruct-2507"
+inference_mode = "local"
+inference_base_url = "http://localhost:8000/v1"
+inference_api_key = "local-vllm"
+repl_backend = "local"
+repl_timeout_seconds = 300
+repl_fast_timeout_seconds = 60
+judge_model = "z-ai/glm-5"
+efficiency_penalty_coef = 0.0001
+live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-4xa100-80gb-fastseq-budgeted/live_traces_eval"
+
+[eval.env.extra_env_kwargs]
+
+[eval.sampling]
+temperature = 0.7
+top_p = 1.0
+max_tokens = 2048
+
+[eval.sampling.extra_body]
+return_token_ids = true
+top_k = -1
+min_p = 0.0
+
+[buffer]
+seed = 42
+easy_threshold = 1.0
+hard_threshold = 0.0
+easy_fraction = 0.0
+hard_fraction = 0.0
+online_difficulty_filtering = true
+hash_keys = [
+    "task",
+    "prompt",
+]
+
+[verification]
+enabled = true
+
+[advantage]
+type = "default"
+length_weighted_mean = false
+
+[log]
+level = "info"
+vf_level = "info"
+file = true
+env_worker_logs = false
+log_data = false
+json_logging = false
+
+[trace_export]
+enabled = true
+include_segments = true
+include_metrics = true
+
+[wandb]
+project = "rlm-rlvr"
+name = "qwen3-4b-instruct-sanjaya-medium-4xa100-80gb-fastseq-budgeted-orchestrator"
+offline = false
+
+[wandb.log_extras]
+samples = true
+distributions = true
+interval = 1
+
+[ckpt]
+interval = 25
+keep_last = 2
+keep_interval = 100
+skip_progress = false
+skip_buffer = false
+
+[weight_broadcast]
+type = "filesystem"
+
+[rollout_transport]
+type = "filesystem"

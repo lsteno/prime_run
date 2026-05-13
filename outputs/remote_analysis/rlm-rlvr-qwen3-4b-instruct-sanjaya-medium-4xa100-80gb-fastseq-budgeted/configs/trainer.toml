@@ -1,0 +1,105 @@
+output_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-4xa100-80gb-fastseq-budgeted"
+max_steps = 100
+max_async_level = 4
+enable_router_replay = false
+dist_timeout_seconds = 600
+max_concurrent_runs = 1
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+trust_remote_code = false
+seq_len = 65536
+attn = "flash_attention_2"
+fsdp_cpu_offload = false
+optim_cpu_offload = false
+reshard_after_forward = true
+dp_replicate = 1
+ep = 1
+tp = 1
+cp = 1
+impl = "auto"
+optimization_dtype = "float32"
+reduce_dtype = "float32"
+moe_use_grouped_mm = true
+freeze_moe_router = false
+fused_lm_head_token_chunk_size = 8192
+
+[model.ac]
+freq = 1
+
+[model.lora]
+rank = 64
+alpha = 128.0
+dropout = 0.0
+target_modules = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+modules_to_save = []
+
+[model.debug]
+random_init = false
+
+[tokenizer]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+trust_remote_code = true
+
+[data]
+
+[loss]
+type = "default"
+ipo_mask_low = 0.2
+ipo_mask_high = 0.2
+adv_tau = 1.0
+teacher_tau = 0.0
+kl_tau = 0.001
+
+[optim]
+lr = 1e-06
+weight_decay = 0.0
+max_norm = 1.0
+type = "adamw"
+betas1 = 0.9
+betas2 = 0.999
+
+[scheduler]
+type = "constant"
+
+[ckpt]
+interval = 25
+keep_last = 2
+keep_interval = 100
+skip_progress = false
+skip_scheduler = false
+skip_dataloader = false
+
+[ckpt.weights]
+save_sharded = true
+save_format = "safetensors"
+save_adapter_separately = false
+
+[weight_broadcast]
+type = "filesystem"
+save_sharded = true
+save_format = "safetensors"
+
+[rollout_transport]
+type = "filesystem"
+
+[log]
+level = "info"
+vf_level = "info"
+file = true
+env_worker_logs = false
+log_data = false
+json_logging = false
+
+[wandb]
+project = "rlm-rlvr"
+name = "qwen3-4b-instruct-sanjaya-medium-4xa100-80gb-fastseq-budgeted-trainer"
+offline = false

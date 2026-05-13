@@ -1,18 +1,18 @@
-# Medium local RLVR run for Qwen3 4B Instruct on a single 8x A100 40GB node,
+# Medium local RLVR run for Qwen3 4B Instruct on a single 8x RTX 6000 Ada 48GB node,
 # with lower rollout pressure and an enabled subcall budget.
 #
 # Layout:
 # - GPUs 0-3: vLLM inference, four data-parallel replicas for rollout throughput.
-# - GPUs 4-7: LoRA trainer, context-parallel over a reduced 262k flattened RLM trajectory.
+# - GPUs 4-7: LoRA trainer, context-parallel over a reduced 128k flattened RLM trajectory.
 #
 # Run from prime-rl:
 #   cd prime-rl
-#   uv run rl @ ../configs/rlm_rlvr/qwen3_4b_instruct_sanjaya_medium_8xa100_40gb_budgeted.toml
+#   uv run rl @ ../configs/rlm_rlvr/qwen3_4b_instruct_sanjaya_medium_8xrtx6000ada_48gb_budgeted.toml
 
-output_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-8xa100-40gb-budgeted"
+output_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-8xrtx6000ada-48gb-budgeted"
 max_steps = 100
 max_async_level = 4
-seq_len = 262144
+seq_len = 131072
 
 [deployment]
 type = "single_node"
@@ -25,7 +25,7 @@ name = "Qwen/Qwen3-4B-Instruct-2507"
 
 [wandb]
 project = "rlm-rlvr"
-name = "qwen3-4b-instruct-sanjaya-medium-8xa100-40gb-budgeted"
+name = "qwen3-4b-instruct-sanjaya-medium-8xrtx6000ada-48gb-budgeted"
 
 [ckpt]
 interval = 25
@@ -42,7 +42,7 @@ max_norm = 1.0
 type = "constant"
 
 [trainer.model]
-seq_len = 262144
+seq_len = 131072
 attn = "flash_attention_2"
 cp = 4
 tp = 1
@@ -82,7 +82,7 @@ batch_size = 64
 rollouts_per_example = 4
 oversampling_factor = 1.0
 max_concurrent = 32
-seq_len = 262144
+seq_len = 131072
 use_token_client = false
 max_off_policy_steps = 8
 
@@ -138,7 +138,7 @@ repl_backend = "local"
 repl_timeout_seconds = 900
 repl_fast_timeout_seconds = 30
 judge_model = "z-ai/glm-5"
-live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-8xa100-40gb-budgeted/live_traces"
+live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-8xrtx6000ada-48gb-budgeted/live_traces"
 
 [orchestrator.eval]
 interval = 25
@@ -187,7 +187,7 @@ repl_backend = "local"
 repl_timeout_seconds = 900
 repl_fast_timeout_seconds = 30
 judge_model = "z-ai/glm-5"
-live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-8xa100-40gb-budgeted/live_traces_eval"
+live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-8xrtx6000ada-48gb-budgeted/live_traces_eval"
 
 [inference]
 gpu_memory_utilization = 0.90

@@ -126,6 +126,19 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             max_prompt_tokens=self.runtime_config.max_prompt_tokens,
             enable_vllm_extra_body=self.runtime_config.inference_mode == "local",
         )
+        if self.runtime_config.llm_subcall_model is not None:
+            state["_plain_llm_session"] = SyncInferenceSession(
+                base_url=self.runtime_config.llm_subcall_base_url or base_url,
+                api_key=self.runtime_config.llm_subcall_api_key or api_key,
+                default_headers=self.runtime_config.llm_subcall_default_headers,
+                model_name=self.runtime_config.llm_subcall_model,
+                tokenizer_name=self.runtime_config.tokenizer_name,
+                max_prompt_tokens=self.runtime_config.max_prompt_tokens,
+                enable_vllm_extra_body=False,
+                request_logprobs=False,
+            )
+        else:
+            state["_plain_llm_session"] = state["_sync_session"]
         state["_runtime"] = RecursiveRuntime(state, self.runtime_config)
         info = state.get("info") or {}
         state["_root_context"] = info.get("context", "")
@@ -292,7 +305,7 @@ def load_environment(
     seed: int = 42,
     max_examples: int = -1,
     max_eval_examples: int = -1,
-    max_iterations: int = 4,
+    max_iterations: int = 15,
     max_depth: int = 2,
     turn_max_tokens: int = 192,
     subcall_max_tokens: int = 128,
@@ -304,12 +317,17 @@ def load_environment(
     live_trace_dir: str | None = "outputs/rlm_rlvr/live_traces",
     subcall_prompt_limit_ratio: float = 0.85,
     subcall_budget_enabled: bool = False,
-    max_total_subcalls: int = 40,
-    max_batched_subcalls: int = 40,
+    max_total_subcalls: int = 80,
+    max_batched_subcalls: int = 80,
     efficiency_penalty_coef: float = 0.02,
     inference_mode: str = "hosted",
     inference_base_url: str | None = None,
     inference_api_key: str | None = None,
+    llm_subcall_model: str | None = None,
+    llm_subcall_base_url: str | None = None,
+    llm_subcall_api_key_var: str = "OPENROUTER_API_KEY",
+    llm_subcall_http_referer: str | None = None,
+    llm_subcall_app_title: str | None = None,
     judge_model: str = "z-ai/glm-5",
     judge_base_url: str = "https://openrouter.ai/api/v1",
     judge_api_key_var: str = "OPENROUTER_API_KEY",
@@ -365,12 +383,23 @@ def load_environment(
         elif inference_mode == "hosted":
             inference_api_key = os.environ.get("RLM_HOSTED_INFERENCE_API_KEY")
 
-    vf.ensure_keys([judge_api_key_var])
+    required_keys = [judge_api_key_var]
+    if llm_subcall_model is not None:
+        required_keys.append(llm_subcall_api_key_var)
+    vf.ensure_keys(sorted(set(required_keys)))
     judge_default_headers = {
         key: value
         for key, value in {
             "HTTP-Referer": judge_http_referer,
             "X-Title": judge_app_title,
+        }.items()
+        if value
+    }
+    llm_subcall_default_headers = {
+        key: value
+        for key, value in {
+            "HTTP-Referer": llm_subcall_http_referer,
+            "X-Title": llm_subcall_app_title,
         }.items()
         if value
     }
@@ -399,6 +428,10 @@ def load_environment(
         inference_mode=inference_mode,
         inference_base_url=inference_base_url,
         inference_api_key=inference_api_key,
+        llm_subcall_model=llm_subcall_model,
+        llm_subcall_base_url=llm_subcall_base_url,
+        llm_subcall_api_key=os.environ.get(llm_subcall_api_key_var) if llm_subcall_model is not None else None,
+        llm_subcall_default_headers=llm_subcall_default_headers or None,
         repl_backend=repl_backend,
         repl_backend_kwargs=repl_backend_kwargs,
         repl_timeout_seconds=repl_timeout_seconds,

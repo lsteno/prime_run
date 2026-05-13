@@ -67,6 +67,15 @@ def test_prompt_removes_mandatory_recursive_call_pressure() -> None:
     assert "When recursion budget remains" not in prompt
 
 
+def test_prompt_frames_every_depth_rlms_as_orchestrators() -> None:
+    prompt = get_system_prompt_template(DEFAULT_PROMPT_VARIANT)
+
+    assert "At every depth" in prompt
+    assert "Every RLM at every depth should act as an orchestrator" in prompt
+    assert "Use `llm_query_batched` for independent lightweight analyses" in prompt
+    assert "Make many small, evidence-carrying subcalls" in prompt
+
+
 @pytest.mark.parametrize("prompt_variant", sorted(PROMPT_VARIANTS))
 def test_all_built_system_prompt_variants_include_budget_reminder(prompt_variant: str) -> None:
     prompt = build_system_prompt(
@@ -114,6 +123,31 @@ def test_safer_8xa100_config_reduces_rollout_pressure_and_enables_budget() -> No
     assert config["orchestrator"]["oversampling_factor"] == 1.0
     assert config["orchestrator"]["max_concurrent"] == 32
     assert config["orchestrator"]["env"][0]["args"]["subcall_budget_enabled"] is True
-    assert config["orchestrator"]["env"][0]["args"]["max_total_subcalls"] == 40
-    assert config["orchestrator"]["env"][0]["args"]["max_batched_subcalls"] == 40
+    assert config["orchestrator"]["env"][0]["args"]["max_total_subcalls"] == 80
+    assert config["orchestrator"]["env"][0]["args"]["max_batched_subcalls"] == 80
+    assert config["orchestrator"]["env"][0]["args"]["llm_subcall_model"] == "openai/gpt-5.4-mini"
+    assert config["orchestrator"]["env"][0]["args"]["llm_subcall_base_url"] == "https://openrouter.ai/api/v1"
+    assert config["orchestrator"]["env"][0]["args"]["llm_subcall_api_key_var"] == "OPENROUTER_API_KEY"
     assert config["orchestrator"]["eval"]["env"][0]["args"]["subcall_budget_enabled"] is True
+    assert config["orchestrator"]["eval"]["env"][0]["args"]["llm_subcall_model"] == "openai/gpt-5.4-mini"
+
+
+def test_4xa100_config_routes_plain_llm_subcalls_to_openrouter() -> None:
+    config_path = (
+        Path(__file__).resolve().parents[3]
+        / "configs"
+        / "rlm_rlvr"
+        / "qwen3_4b_instruct_sanjaya_medium_4xa100_80gb_budgeted.toml"
+    )
+
+    config = tomllib.loads(config_path.read_text())
+    train_args = config["orchestrator"]["env"][0]["args"]
+    eval_args = config["orchestrator"]["eval"]["env"][0]["args"]
+
+    for args in (train_args, eval_args):
+        assert args["inference_mode"] == "local"
+        assert args["inference_base_url"] == "http://localhost:8000/v1"
+        assert args["inference_api_key"] == "local-vllm"
+        assert args["llm_subcall_model"] == "openai/gpt-5.4-mini"
+        assert args["llm_subcall_base_url"] == "https://openrouter.ai/api/v1"
+        assert args["llm_subcall_api_key_var"] == "OPENROUTER_API_KEY"

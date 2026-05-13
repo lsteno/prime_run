@@ -59,7 +59,7 @@ Notes:
 | `seed` | `int` | `42` | Dataset shuffle seed |
 | `max_examples` | `int` | `-1` | Limit training examples after splitting |
 | `max_eval_examples` | `int` | `-1` | Limit eval examples |
-| `max_iterations` | `int` | `4` | Recursive reasoning turns per call before forcing a final answer |
+| `max_iterations` | `int` | `15` | Recursive reasoning turns per call before forcing a final answer |
 | `max_depth` | `int` | `2` | Maximum recursion depth |
 | `turn_max_tokens` | `int` | `192` | Max assistant tokens for each recursive reasoning turn |
 | `subcall_max_tokens` | `int` | `128` | Max assistant tokens for leaf/plain subcalls |

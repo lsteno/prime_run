@@ -63,6 +63,8 @@ def _compact_segment(segment: dict[str, Any]) -> dict[str, Any]:
     completion_mask = segment.get("completion_mask") or []
     prompt_ids = segment.get("prompt_ids") or []
     completion_ids = segment.get("completion_ids") or []
+    prompt_token_count = segment.get("prompt_token_count")
+    completion_token_count = segment.get("completion_token_count")
     is_trainable = bool(segment.get("is_trainable_rlm_turn", False))
     return {
         "order": segment.get("order"),
@@ -77,8 +79,12 @@ def _compact_segment(segment: dict[str, Any]) -> dict[str, Any]:
         "prompt_fingerprint": segment.get("prompt_fingerprint"),
         "prompt_message_count": segment.get("prompt_message_count"),
         "prompt_char_count": segment.get("prompt_char_count"),
-        "prompt_tokens": len(prompt_ids) if isinstance(prompt_ids, list) else None,
-        "completion_tokens": len(completion_ids) if isinstance(completion_ids, list) else None,
+        "prompt_tokens": int(prompt_token_count)
+        if prompt_token_count not in (None, "")
+        else (len(prompt_ids) if isinstance(prompt_ids, list) else None),
+        "completion_tokens": int(completion_token_count)
+        if completion_token_count not in (None, "")
+        else (len(completion_ids) if isinstance(completion_ids, list) else None),
         "trainable_completion_tokens": (
             sum(1 for item in completion_mask if item) if is_trainable and isinstance(completion_mask, list) else 0
         )

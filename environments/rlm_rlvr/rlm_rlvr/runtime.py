@@ -25,7 +25,7 @@ class SubcallPromptTooLargeError(ValueError):
 @dataclass
 class RuntimeConfig:
     max_depth: int = 2
-    max_iterations: int = 4
+    max_iterations: int = 15
     turn_max_tokens: int = 192
     subcall_max_tokens: int = 128
     max_prompt_tokens: int | None = None
@@ -36,6 +36,10 @@ class RuntimeConfig:
     inference_mode: str = "hosted"
     inference_base_url: str | None = None
     inference_api_key: str | None = None
+    llm_subcall_model: str | None = None
+    llm_subcall_base_url: str | None = None
+    llm_subcall_api_key: str | None = None
+    llm_subcall_default_headers: dict[str, str] | None = None
     repl_backend: str = "local"
     repl_backend_kwargs: dict[str, Any] | None = None
     repl_timeout_seconds: float | None = None
@@ -44,8 +48,8 @@ class RuntimeConfig:
     live_trace_dir: str | None = "outputs/rlm_rlvr/live_traces"
     subcall_prompt_limit_ratio: float = 0.85
     subcall_budget_enabled: bool = False
-    max_total_subcalls: int = 40
-    max_batched_subcalls: int = 40
+    max_total_subcalls: int = 80
+    max_batched_subcalls: int = 80
 
 
 @dataclass
@@ -54,6 +58,8 @@ class TokenPayload:
     completion_ids: list[int]
     completion_logprobs: list[float]
     completion_mask: list[bool]
+    prompt_token_count: int | None = None
+    completion_token_count: int | None = None
 
 
 class SyncInferenceSession:
@@ -69,10 +75,12 @@ class SyncInferenceSession:
         tokenizer_name: str | None,
         max_prompt_tokens: int | None,
         enable_vllm_extra_body: bool = False,
+        request_logprobs: bool = True,
     ):
         self.model_name = model_name
         self.max_prompt_tokens = max_prompt_tokens
         self.enable_vllm_extra_body = enable_vllm_extra_body
+        self.request_logprobs = request_logprobs
         self.client = OpenAI(
             base_url=base_url,
             api_key=api_key or "EMPTY",
@@ -114,6 +122,18 @@ class SyncInferenceSession:
             values.extend([0.0] * (completion_len - len(values)))
         return values[:completion_len]
 
+    @staticmethod
+    def _usage_token_count(usage: Any, key: str) -> int | None:
+        if usage is None:
+            return None
+        if isinstance(usage, dict):
+            value = usage.get(key)
+        else:
+            value = getattr(usage, key, None)
+        if value is None:
+            return None
+        return int(value)
+
     def generate(
         self,
         *,
@@ -128,8 +148,9 @@ class SyncInferenceSession:
             "max_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
-            "logprobs": True,
         }
+        if getattr(self, "request_logprobs", True):
+            request_body["logprobs"] = True
         if self.enable_vllm_extra_body:
             request_body.update({
                 "return_token_ids": True,
@@ -152,11 +173,16 @@ class SyncInferenceSession:
         prompt_ids = self.render_prompt_ids(messages, add_generation_prompt=True)
         prompt_token_ids = self._coerce_token_ids(getattr(response, "prompt_token_ids", None), fallback=prompt_ids)
         completion_logprobs = self._coerce_logprobs(getattr(choice, "logprobs", None), completion_len=len(completion_ids))
+        usage = getattr(response, "usage", None)
+        prompt_token_count = self._usage_token_count(usage, "prompt_tokens")
+        completion_token_count = self._usage_token_count(usage, "completion_tokens")
         payload = TokenPayload(
             prompt_ids=prompt_token_ids,
             completion_ids=completion_ids,
             completion_logprobs=completion_logprobs,
             completion_mask=[True] * len(completion_ids),
+            prompt_token_count=prompt_token_count if prompt_token_count is not None else len(prompt_token_ids),
+            completion_token_count=completion_token_count if completion_token_count is not None else len(completion_ids),
         )
         return text, payload
 
@@ -176,6 +202,10 @@ class RecursiveRuntime:
     @property
     def session(self) -> SyncInferenceSession:
         return self.state["_sync_session"]
+
+    @property
+    def plain_llm_session(self) -> SyncInferenceSession:
+        return self.state.get("_plain_llm_session") or self.session
 
     def _context_window_tokens(self) -> int | None:
         if self.config.max_prompt_tokens is not None:
@@ -446,6 +476,8 @@ class RecursiveRuntime:
             completion_ids=payload.completion_ids,
             completion_logprobs=payload.completion_logprobs,
             completion_mask=payload.completion_mask,
+            prompt_token_count=payload.prompt_token_count,
+            completion_token_count=payload.completion_token_count,
             temperature=float(self.state.get("sampling_temperature", self.config.temperature)),
             response_text=response_text,
             prompt_fingerprint=provenance["prompt_fingerprint"],
@@ -454,8 +486,10 @@ class RecursiveRuntime:
         )
         with self._state_lock:
             self.state["rlm_segments"].append(segment)
-            prompt_token_count = float(len(payload.prompt_ids))
-            completion_token_count = float(len(payload.completion_ids))
+            prompt_token_count = float(payload.prompt_token_count if payload.prompt_token_count is not None else len(payload.prompt_ids))
+            completion_token_count = float(
+                payload.completion_token_count if payload.completion_token_count is not None else len(payload.completion_ids)
+            )
             self.state["total_model_tokens"] += completion_token_count
             self.state["total_prompt_tokens"] = float(self.state.get("total_prompt_tokens", 0.0)) + prompt_token_count
             self.state["total_completion_tokens"] = float(self.state.get("total_completion_tokens", 0.0)) + completion_token_count
@@ -490,7 +524,7 @@ class RecursiveRuntime:
             message = f"Error: subcall budget exhausted ({remaining}/{total} calls remaining)."
         return {
             "prompt": prompt,
-            "model": model or self.session.model_name,
+            "model": model or (self.plain_llm_session.model_name if kind == "plain_query" else self.session.model_name),
             "response": message,
             "final_answer": None,
             "depth": self._current_call_depth(),
@@ -631,7 +665,8 @@ class RecursiveRuntime:
             return self._budget_error_payload(prompt=prompt, model=model, kind="plain_query")
         depth = max(1, self._current_call_depth())
         self._record_subcall(kind="plain_query", depth=depth)
-        text, payload = self.session.generate(
+        session = self.plain_llm_session
+        text, payload = session.generate(
             messages=messages,
             max_tokens=self.config.subcall_max_tokens,
             temperature=self.config.temperature,
@@ -650,7 +685,7 @@ class RecursiveRuntime:
         )
         return {
             "prompt": prompt,
-            "model": model or self.session.model_name,
+            "model": model or session.model_name,
             "response": text,
             "final_answer": extract_final_answer(text) or text,
             "depth": depth,
