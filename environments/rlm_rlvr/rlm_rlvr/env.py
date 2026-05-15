@@ -13,7 +13,7 @@ from .parsing import extract_final_answer
 from .prompt_variants import DEFAULT_PROMPT_VARIANT, PROMPT_VARIANTS
 from .repl import create_repl
 from .reward import add_metrics, build_rubric
-from .runtime import RecursiveRuntime, RuntimeConfig, SyncInferenceSession
+from .runtime import RecursiveRuntime, RuntimeConfig, SyncInferenceSession, VertexGeminiSession
 from .trace import append_step_trace, make_call_trace, make_segment, prompt_provenance
 
 
@@ -127,16 +127,32 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             enable_vllm_extra_body=self.runtime_config.inference_mode == "local",
         )
         if self.runtime_config.llm_subcall_model is not None:
-            state["_plain_llm_session"] = SyncInferenceSession(
-                base_url=self.runtime_config.llm_subcall_base_url or base_url,
-                api_key=self.runtime_config.llm_subcall_api_key or api_key,
-                default_headers=self.runtime_config.llm_subcall_default_headers,
-                model_name=self.runtime_config.llm_subcall_model,
-                tokenizer_name=self.runtime_config.tokenizer_name,
-                max_prompt_tokens=self.runtime_config.max_prompt_tokens,
-                enable_vllm_extra_body=False,
-                request_logprobs=False,
-            )
+            if self.runtime_config.llm_subcall_provider == "vertex":
+                if not self.runtime_config.llm_subcall_vertex_project:
+                    raise ValueError("llm_subcall_vertex_project is required when llm_subcall_provider='vertex'")
+                state["_plain_llm_session"] = VertexGeminiSession(
+                    model_name=self.runtime_config.llm_subcall_model,
+                    project=self.runtime_config.llm_subcall_vertex_project,
+                    location=self.runtime_config.llm_subcall_vertex_location,
+                    tokenizer_name=self.runtime_config.tokenizer_name or model_name,
+                    max_prompt_tokens=self.runtime_config.max_prompt_tokens,
+                    thinking_level=self.runtime_config.llm_subcall_thinking_level,
+                    empty_response_max_attempts=self.runtime_config.llm_subcall_empty_response_max_attempts,
+                    empty_response_base_retry_seconds=self.runtime_config.llm_subcall_empty_response_base_retry_seconds,
+                    empty_response_max_retry_seconds=self.runtime_config.llm_subcall_empty_response_max_retry_seconds,
+                )
+            else:
+                state["_plain_llm_session"] = SyncInferenceSession(
+                    base_url=self.runtime_config.llm_subcall_base_url or base_url,
+                    api_key=self.runtime_config.llm_subcall_api_key or api_key,
+                    default_headers=self.runtime_config.llm_subcall_default_headers,
+                    model_name=self.runtime_config.llm_subcall_model,
+                    tokenizer_name=self.runtime_config.tokenizer_name,
+                    max_prompt_tokens=self.runtime_config.max_prompt_tokens,
+                    enable_vllm_extra_body=False,
+                    request_logprobs=False,
+                    retry_transient_errors=True,
+                )
         else:
             state["_plain_llm_session"] = state["_sync_session"]
         state["_runtime"] = RecursiveRuntime(state, self.runtime_config)
@@ -319,20 +335,32 @@ def load_environment(
     subcall_budget_enabled: bool = False,
     max_total_subcalls: int = 80,
     max_batched_subcalls: int = 80,
+    include_budget_reminder: bool = True,
     efficiency_penalty_coef: float = 0.02,
     inference_mode: str = "hosted",
     inference_base_url: str | None = None,
     inference_api_key: str | None = None,
+    llm_subcall_provider: str = "openai_compatible",
     llm_subcall_model: str | None = None,
     llm_subcall_base_url: str | None = None,
     llm_subcall_api_key_var: str = "OPENROUTER_API_KEY",
     llm_subcall_http_referer: str | None = None,
     llm_subcall_app_title: str | None = None,
+    llm_subcall_vertex_project_env: str = "GOOGLE_CLOUD_PROJECT",
+    llm_subcall_vertex_location: str | None = "global",
+    llm_subcall_thinking_level: str | None = "medium",
+    llm_subcall_empty_response_max_attempts: int = 1,
+    llm_subcall_empty_response_base_retry_seconds: float = 1.0,
+    llm_subcall_empty_response_max_retry_seconds: float = 30.0,
+    judge_provider: str = "openai_compatible",
     judge_model: str = "z-ai/glm-5",
     judge_base_url: str = "https://openrouter.ai/api/v1",
     judge_api_key_var: str = "OPENROUTER_API_KEY",
     judge_http_referer: str | None = None,
     judge_app_title: str | None = None,
+    judge_vertex_project_env: str = "GOOGLE_CLOUD_PROJECT",
+    judge_vertex_location: str | None = "global",
+    judge_thinking_level: str | None = "medium",
     repl_backend: str = "local",
     repl_backend_kwargs: dict[str, Any] | None = None,
     repl_timeout_seconds: float | None = None,
@@ -352,6 +380,12 @@ def load_environment(
         raise ValueError("max_total_subcalls must be >= 1")
     if max_batched_subcalls < 1:
         raise ValueError("max_batched_subcalls must be >= 1")
+    if llm_subcall_empty_response_max_attempts < 1:
+        raise ValueError("llm_subcall_empty_response_max_attempts must be >= 1")
+    if llm_subcall_empty_response_base_retry_seconds < 0:
+        raise ValueError("llm_subcall_empty_response_base_retry_seconds must be >= 0")
+    if llm_subcall_empty_response_max_retry_seconds < 0:
+        raise ValueError("llm_subcall_empty_response_max_retry_seconds must be >= 0")
     if repl_timeout_seconds is not None and repl_timeout_seconds <= 0:
         raise ValueError("repl_timeout_seconds must be > 0")
     if repl_fast_timeout_seconds is not None and repl_fast_timeout_seconds <= 0:
@@ -362,6 +396,12 @@ def load_environment(
         raise ValueError("temperature must be >= 0.0")
     if prompt_variant not in PROMPT_VARIANTS:
         raise ValueError(f"prompt_variant must be one of {sorted(PROMPT_VARIANTS)}")
+
+    valid_api_providers = {"openai_compatible", "vertex"}
+    if llm_subcall_provider not in valid_api_providers:
+        raise ValueError(f"llm_subcall_provider must be one of {sorted(valid_api_providers)}")
+    if judge_provider not in valid_api_providers:
+        raise ValueError(f"judge_provider must be one of {sorted(valid_api_providers)}")
 
     valid_inference_modes = {"hosted", "local"}
     if inference_mode not in valid_inference_modes:
@@ -383,9 +423,15 @@ def load_environment(
         elif inference_mode == "hosted":
             inference_api_key = os.environ.get("RLM_HOSTED_INFERENCE_API_KEY")
 
-    required_keys = [judge_api_key_var]
-    if llm_subcall_model is not None:
+    required_keys: list[str] = []
+    if judge_provider == "openai_compatible":
+        required_keys.append(judge_api_key_var)
+    else:
+        required_keys.append(judge_vertex_project_env)
+    if llm_subcall_model is not None and llm_subcall_provider == "openai_compatible":
         required_keys.append(llm_subcall_api_key_var)
+    elif llm_subcall_model is not None and llm_subcall_provider == "vertex":
+        required_keys.append(llm_subcall_vertex_project_env)
     vf.ensure_keys(sorted(set(required_keys)))
     judge_default_headers = {
         key: value
@@ -428,10 +474,25 @@ def load_environment(
         inference_mode=inference_mode,
         inference_base_url=inference_base_url,
         inference_api_key=inference_api_key,
+        llm_subcall_provider=llm_subcall_provider,
         llm_subcall_model=llm_subcall_model,
         llm_subcall_base_url=llm_subcall_base_url,
-        llm_subcall_api_key=os.environ.get(llm_subcall_api_key_var) if llm_subcall_model is not None else None,
+        llm_subcall_api_key=(
+            os.environ.get(llm_subcall_api_key_var)
+            if llm_subcall_model is not None and llm_subcall_provider == "openai_compatible"
+            else None
+        ),
         llm_subcall_default_headers=llm_subcall_default_headers or None,
+        llm_subcall_vertex_project=(
+            os.environ.get(llm_subcall_vertex_project_env)
+            if llm_subcall_model is not None and llm_subcall_provider == "vertex"
+            else None
+        ),
+        llm_subcall_vertex_location=llm_subcall_vertex_location or os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
+        llm_subcall_thinking_level=llm_subcall_thinking_level,
+        llm_subcall_empty_response_max_attempts=llm_subcall_empty_response_max_attempts,
+        llm_subcall_empty_response_base_retry_seconds=llm_subcall_empty_response_base_retry_seconds,
+        llm_subcall_empty_response_max_retry_seconds=llm_subcall_empty_response_max_retry_seconds,
         repl_backend=repl_backend,
         repl_backend_kwargs=repl_backend_kwargs,
         repl_timeout_seconds=repl_timeout_seconds,
@@ -442,6 +503,7 @@ def load_environment(
         subcall_budget_enabled=subcall_budget_enabled,
         max_total_subcalls=max_total_subcalls,
         max_batched_subcalls=max_batched_subcalls,
+        include_budget_reminder=include_budget_reminder,
     )
     system_prompt = build_system_prompt(
         depth=0,
@@ -453,12 +515,17 @@ def load_environment(
         subcall_budget_enabled=subcall_budget_enabled,
         max_total_subcalls=max_total_subcalls,
         max_batched_subcalls=max_batched_subcalls,
+        include_budget_reminder=include_budget_reminder,
     )
     reward_rubric = build_rubric(
+        judge_provider=judge_provider,
         judge_model=judge_model,
         judge_base_url=judge_base_url,
-        judge_api_key=os.environ[judge_api_key_var],
+        judge_api_key=os.environ[judge_api_key_var] if judge_provider == "openai_compatible" else None,
         judge_default_headers=judge_default_headers or None,
+        judge_vertex_project=os.environ.get(judge_vertex_project_env) if judge_provider == "vertex" else None,
+        judge_vertex_location=judge_vertex_location or os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
+        judge_thinking_level=judge_thinking_level,
     )
     add_metrics(reward_rubric)
     return RLMRLVREnv(

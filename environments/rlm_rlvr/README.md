@@ -38,7 +38,7 @@ Notes:
 - Use `-a` / `--env-args` to pass environment-specific configuration as a JSON object.
 - This environment reuses the published `rlms` package for prompt construction, parsing, and local REPL execution.
 - Install with Prime CLI (`prime env install rlm_rlvr -p /home/coder/prime_run/environments`) to ensure dependencies are available.
-- Set `OPENROUTER_API_KEY` so the semantic judge can score outputs. For managed hosted training, add it via `env_file`. For self-managed `prime-rl` runs on Prime Intellect on-demand GPUs, export it directly in the pod shell.
+- For Vertex-backed semantic judging and plain subcalls, set `GOOGLE_CLOUD_PROJECT`, use Application Default Credentials, and keep Gemini 3 configs on the `global` location. OpenAI-compatible providers still use `OPENROUTER_API_KEY` or the configured API-key variable.
 - `repl_backend` currently supports only `"local"`; remote REPL backends are future work.
 - The default prompt is `sanjaya_text_v1`. `prompt_variant="default"` is kept as a compatibility alias for the same prompt.
 - Local parquet mode is opt-in: pass `data_paths` explicitly. If `eval_data_paths` is omitted, eval defaults to a deterministic 10% holdout from `data_paths`.
@@ -73,11 +73,22 @@ Notes:
 | `inference_mode` | `str` | `"hosted"` | Inference routing mode. Use `hosted` for managed hosted training and `local` for self-managed `prime-rl` on local or on-demand GPUs |
 | `inference_base_url` | `str \| null` | `null` | Override the OpenAI-compatible inference endpoint. Usually unset for self-managed `prime-rl`, which wires the local inference server automatically |
 | `inference_api_key` | `str \| null` | `null` | Override API key for the inference endpoint. Usually unset for self-managed `prime-rl` local inference |
-| `judge_model` | `str` | `"z-ai/glm-5"` | OpenRouter model used for binary semantic judging |
-| `judge_base_url` | `str` | `"https://openrouter.ai/api/v1"` | Judge provider base URL |
-| `judge_api_key_var` | `str` | `"OPENROUTER_API_KEY"` | Environment variable that stores the judge API key |
-| `judge_http_referer` | `str \| null` | `null` | Optional OpenRouter `HTTP-Referer` header |
-| `judge_app_title` | `str \| null` | `null` | Optional OpenRouter `X-Title` header |
+| `llm_subcall_provider` | `str` | `"openai_compatible"` | Provider for plain non-trainable `llm_query*` calls. Use `"vertex"` for Vertex AI Gemini |
+| `llm_subcall_model` | `str \| null` | `null` | Optional separate model for plain `llm_query*` calls; `null` reuses the rollout endpoint |
+| `llm_subcall_vertex_project_env` | `str` | `"GOOGLE_CLOUD_PROJECT"` | Environment variable that stores the Vertex project for plain subcalls |
+| `llm_subcall_vertex_location` | `str \| null` | `"global"` | Vertex location for plain subcalls. Active Gemini 3 configs use `global` |
+| `llm_subcall_thinking_level` | `str \| null` | `"medium"` | Gemini thinking level for plain Vertex subcalls |
+| `llm_subcall_base_url` | `str \| null` | `null` | OpenAI-compatible plain subcall provider base URL |
+| `llm_subcall_api_key_var` | `str` | `"OPENROUTER_API_KEY"` | Environment variable for OpenAI-compatible plain subcalls |
+| `judge_provider` | `str` | `"openai_compatible"` | Provider for binary semantic judging. Use `"vertex"` for Vertex AI Gemini |
+| `judge_model` | `str` | `"z-ai/glm-5"` | Model used for binary semantic judging. Active Vertex configs use `gemini-3-flash-preview` |
+| `judge_vertex_project_env` | `str` | `"GOOGLE_CLOUD_PROJECT"` | Environment variable that stores the Vertex project for judging |
+| `judge_vertex_location` | `str \| null` | `"global"` | Vertex location for judging. Gemini 3 Flash requires `global` |
+| `judge_thinking_level` | `str \| null` | `"medium"` | Gemini thinking level for Vertex judging |
+| `judge_base_url` | `str` | `"https://openrouter.ai/api/v1"` | OpenAI-compatible judge provider base URL |
+| `judge_api_key_var` | `str` | `"OPENROUTER_API_KEY"` | Environment variable that stores the OpenAI-compatible judge API key |
+| `judge_http_referer` | `str \| null` | `null` | Optional OpenAI-compatible `HTTP-Referer` header |
+| `judge_app_title` | `str \| null` | `null` | Optional OpenAI-compatible `X-Title` header |
 | `repl_backend` | `str` | `"local"` | RLM REPL backend. Only `local` is currently supported |
 | `repl_backend_kwargs` | `dict \| null` | `null` | Reserved for future backend-specific kwargs |
 | `repl_timeout_seconds` | `float \| null` | `null` | Optional wall-clock timeout for generated REPL code blocks that call `llm_query*` or `rlm_query*` helpers |

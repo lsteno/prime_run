@@ -216,3 +216,179 @@ def test_build_rubric_incorrect_judge_reward_is_zero_with_cost_penalty(monkeypat
     assert state["reward_correctness"] == 0.0
     assert state["reward_efficiency_penalty"] == 0.02
     assert state["reward_total"] == 0.0
+
+
+def test_vertex_judge_calls_generate_content_and_parses_binary(monkeypatch) -> None:
+    class _FakeThinkingConfig:
+        def __init__(self, *, thinking_level: str) -> None:
+            self.thinking_level = thinking_level
+
+    class _FakeGenerateContentConfig:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class _FakeAioModels:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def generate_content(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(text="1")
+
+    class _FakeClient:
+        last_client = None
+
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.aio = SimpleNamespace(models=_FakeAioModels())
+            _FakeClient.last_client = self
+
+    fake_types = SimpleNamespace(ThinkingConfig=_FakeThinkingConfig, GenerateContentConfig=_FakeGenerateContentConfig)
+    monkeypatch.setattr(reward_module, "_load_google_genai", lambda: (SimpleNamespace(Client=_FakeClient), fake_types))
+
+    rubric = build_rubric(
+        judge_provider="vertex",
+        judge_model="gemini-3-flash-preview",
+        judge_base_url="",
+        judge_api_key=None,
+        judge_vertex_project="test-project",
+        judge_vertex_location="global",
+        judge_thinking_level="medium",
+    )
+    reward_fn = rubric.funcs[0]
+    state = {
+        "final_answer": "forty two",
+        "efficiency_penalty_coef": 0.0,
+        "rlm_segments": [],
+        "trajectory": [],
+    }
+
+    score = asyncio.run(reward_fn(state, [], "42", {"question": "What is the answer?"}))
+
+    assert score == 1.0
+    client = _FakeClient.last_client
+    assert client.kwargs == {"vertexai": True, "project": "test-project", "location": "global"}
+    call = client.aio.models.calls[0]
+    assert call["model"] == "gemini-3-flash-preview"
+    assert call["config"].kwargs["thinking_config"].thinking_level == "medium"
+    assert call["config"].kwargs["max_output_tokens"] == 1024
+    assert state["judge_raw_response"] == "1"
+
+
+def test_openai_compatible_judge_retries_rate_limits(monkeypatch) -> None:
+    async def _no_sleep(attempt: int) -> None:
+        del attempt
+
+    class _FakeRateLimitError(Exception):
+        status_code = 429
+
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def create(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            if self.calls < 3:
+                raise _FakeRateLimitError("rate limited")
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="1"))])
+
+    completions = _FakeCompletions()
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    monkeypatch.setattr(reward_module, "_sleep_before_judge_retry", _no_sleep)
+
+    score, raw_response, parse_error = asyncio.run(
+        reward_module._call_binary_judge(
+            fake_client,
+            judge_model="judge-model",
+            judge_prompt="prompt",
+        )
+    )
+
+    assert score == 1.0
+    assert raw_response == "1"
+    assert parse_error is None
+    assert completions.calls == 3
+
+
+def test_vertex_judge_retries_resource_exhausted(monkeypatch) -> None:
+    async def _no_sleep(attempt: int) -> None:
+        del attempt
+
+    class _FakeThinkingConfig:
+        def __init__(self, *, thinking_level: str) -> None:
+            self.thinking_level = thinking_level
+
+    class _FakeGenerateContentConfig:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class _FakeAioModels:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def generate_content(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            if self.calls < 3:
+                raise RuntimeError("429 RESOURCE_EXHAUSTED")
+            return SimpleNamespace(text="1")
+
+    models = _FakeAioModels()
+    fake_client = SimpleNamespace(aio=SimpleNamespace(models=models))
+    fake_types = SimpleNamespace(ThinkingConfig=_FakeThinkingConfig, GenerateContentConfig=_FakeGenerateContentConfig)
+    monkeypatch.setattr(reward_module, "_load_google_genai", lambda: (SimpleNamespace(), fake_types))
+    monkeypatch.setattr(reward_module, "_sleep_before_judge_retry", _no_sleep)
+
+    score, raw_response, parse_error = asyncio.run(
+        reward_module._call_vertex_binary_judge(
+            fake_client,
+            judge_model="gemini-3-flash-preview",
+            judge_prompt="prompt",
+            thinking_level="medium",
+        )
+    )
+
+    assert score == 1.0
+    assert raw_response == "1"
+    assert parse_error is None
+    assert models.calls == 3
+
+
+def test_vertex_judge_retries_access_token_type_unsupported(monkeypatch) -> None:
+    async def _no_sleep(attempt: int) -> None:
+        del attempt
+
+    class _FakeGenerateContentConfig:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class _FakeVertexJudgeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def generate_content(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("401 UNAUTHENTICATED ACCESS_TOKEN_TYPE_UNSUPPORTED")
+            return SimpleNamespace(text="1")
+
+    fake_client = _FakeVertexJudgeClient()
+    fake_types = SimpleNamespace(GenerateContentConfig=_FakeGenerateContentConfig)
+    monkeypatch.setattr(reward_module, "_load_google_genai", lambda: (SimpleNamespace(), fake_types))
+    monkeypatch.setattr(reward_module, "_sleep_before_judge_retry", _no_sleep)
+
+    score, raw_response, parse_error = asyncio.run(
+        reward_module._call_vertex_binary_judge(
+            fake_client,
+            judge_model="gemini-3-flash-preview",
+            judge_prompt="prompt",
+            thinking_level=None,
+        )
+    )
+
+    assert score == 1.0
+    assert raw_response == "1"
+    assert parse_error is None
+    assert fake_client.calls == 2

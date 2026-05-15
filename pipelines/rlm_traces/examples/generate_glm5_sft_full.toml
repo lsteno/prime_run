@@ -1,0 +1,42 @@
+run_name = "glm5-sft-full"
+output_dir = "outputs/rlm_traces"
+endpoints_path = "configs/endpoints.toml"
+resume = true
+max_workers = 4
+
+[model]
+endpoint_id = "glm-5"
+
+[model.extra_body.reasoning]
+enabled = false
+
+[dataset]
+dataset_id = "lsteno/BEEG-agents"
+split = "sft_traces"
+max_examples = 302
+seed = 42
+
+[rollout]
+prompt_variants = ["sanjaya_text_depth1_llm_only_v1"]
+max_iterations = 12
+max_depth = 1
+disable_recursive_subcalls = true
+turn_max_tokens = 1024
+subcall_max_tokens = 1024
+max_prompt_tokens = 200000
+temperature = 0.7
+top_p = 1.0
+repl_backend = "local"
+subcall_budget_enabled = true
+max_total_subcalls = 60
+max_batched_subcalls = 60
+include_budget_reminder = false
+tokenizer_name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[judge]
+enabled = true
+provider = "vertex"
+model = "gemini-3-flash-preview"
+vertex_project_env = "GOOGLE_CLOUD_PROJECT"
+vertex_location = "global"
+thinking_level = "medium"

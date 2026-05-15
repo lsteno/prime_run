@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import random
 import re
 import unicodedata
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from openai import AsyncOpenAI
 import verifiers as vf
@@ -44,6 +46,10 @@ JUDGE_SYSTEM_PROMPT = (
 )
 
 _EFFICIENCY_PENALTY_PER_1K_TOKENS = 1000.0
+_JUDGE_RETRY_MAX_ATTEMPTS = 6
+_JUDGE_RETRY_BASE_SECONDS = 1.0
+_JUDGE_RETRY_MAX_SECONDS = 30.0
+_VERTEX_JUDGE_MAX_OUTPUT_TOKENS = 1024
 
 
 def _get_predicted_answer(state: vf.State, completion) -> str:
@@ -170,6 +176,135 @@ def _extract_message_text(message: Any) -> str:
     return ""
 
 
+def _load_google_genai():
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        raise RuntimeError(
+            "Vertex Gemini judging requires the google-genai package. "
+            "Install environments/rlm_rlvr with google-genai[aiohttp]>=1.51.0."
+        ) from exc
+    return genai, types
+
+
+def _normalise_vertex_model_name(model_name: str) -> str:
+    if model_name.startswith("google/"):
+        model_name = model_name.removeprefix("google/")
+    if model_name == "gemini-3-flash":
+        return "gemini-3-flash-preview"
+    return model_name
+
+
+def _exception_status_code(exc: BaseException) -> int | None:
+    for attr_name in ("status_code", "status", "code"):
+        value = getattr(exc, attr_name, None)
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        for attr_name in ("status_code", "status"):
+            value = getattr(response, attr_name, None)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+    return None
+
+
+def _is_retryable_judge_exception(exc: BaseException) -> bool:
+    status_code = _exception_status_code(exc)
+    if status_code == 429 or status_code in {500, 502, 503, 504}:
+        return True
+
+    error_text = f"{type(exc).__name__}: {exc}".upper()
+    return any(
+        marker in error_text
+        for marker in (
+            "429",
+            "RATE_LIMIT",
+            "RESOURCE_EXHAUSTED",
+            "TOO MANY REQUESTS",
+            "UNAVAILABLE",
+            "SERVICE UNAVAILABLE",
+            "DEADLINE_EXCEEDED",
+            "INTERNAL",
+            "ACCESS_TOKEN_TYPE_UNSUPPORTED",
+        )
+    )
+
+
+async def _sleep_before_judge_retry(attempt: int) -> None:
+    delay = min(_JUDGE_RETRY_MAX_SECONDS, _JUDGE_RETRY_BASE_SECONDS * (2**attempt))
+    jitter = random.uniform(0.0, min(1.0, delay * 0.25))
+    await asyncio.sleep(delay + jitter)
+
+
+async def _call_judge_with_retries(request: Callable[[], Awaitable[Any]]) -> Any:
+    for attempt in range(_JUDGE_RETRY_MAX_ATTEMPTS):
+        try:
+            return await request()
+        except Exception as exc:
+            if attempt == _JUDGE_RETRY_MAX_ATTEMPTS - 1 or not _is_retryable_judge_exception(exc):
+                raise
+            await _sleep_before_judge_retry(attempt)
+
+    raise RuntimeError("unreachable judge retry state")
+
+
+def _vertex_client_kwargs(*, project: str, location: str, types: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "vertexai": True,
+        "project": project,
+        "location": location,
+    }
+    http_options_type = getattr(types, "HttpOptions", None)
+    if http_options_type is not None:
+        kwargs["http_options"] = http_options_type(api_version="v1")
+    return kwargs
+
+
+async def _close_vertex_client(client: Any) -> None:
+    aio_client = getattr(client, "aio", None)
+    aclose = getattr(aio_client, "aclose", None)
+    if callable(aclose):
+        await aclose()
+        return
+
+    close = getattr(client, "close", None)
+    if callable(close):
+        close()
+
+
+class _VertexJudgeClientFactory:
+    def __init__(self, *, project: str, location: str) -> None:
+        self.project = project
+        self.location = location
+
+    async def generate_content(self, **kwargs: Any) -> Any:
+        genai, types = _load_google_genai()
+        client = genai.Client(**_vertex_client_kwargs(project=self.project, location=self.location, types=types))
+        try:
+            return await client.aio.models.generate_content(**kwargs)
+        finally:
+            await _close_vertex_client(client)
+
+
+async def _call_vertex_generate_content(judge_client: Any, **kwargs: Any) -> Any:
+    generate_content = getattr(judge_client, "generate_content", None)
+    if callable(generate_content):
+        return await generate_content(**kwargs)
+    return await judge_client.aio.models.generate_content(**kwargs)
+
+
 def _record_judge_payload(
     state: vf.State,
     *,
@@ -292,12 +427,14 @@ async def _call_binary_judge(
 
     last_raw_response = ""
     for attempt in range(2):
-        judge_response = await judge_client.chat.completions.create(
-            model=judge_model,
-            messages=messages,
-            temperature=0,
-            max_tokens=8,
-            extra_body={"reasoning": {"enabled": False}},
+        judge_response = await _call_judge_with_retries(
+            lambda: judge_client.chat.completions.create(
+                model=judge_model,
+                messages=messages,
+                temperature=0,
+                max_tokens=8,
+                extra_body={"reasoning": {"enabled": False}},
+            )
         )
         raw_response = _extract_message_text(judge_response.choices[0].message)
         last_raw_response = raw_response
@@ -321,18 +458,73 @@ async def _call_binary_judge(
     return 0.0, last_raw_response, "invalid_binary_score"
 
 
+async def _call_vertex_binary_judge(
+    judge_client: Any,
+    *,
+    judge_model: str,
+    judge_prompt: str,
+    thinking_level: str | None,
+) -> tuple[float, str, str | None]:
+    _, types = _load_google_genai()
+    last_raw_response = ""
+    for attempt in range(2):
+        user_prompt = judge_prompt
+        if attempt == 1:
+            user_prompt = (
+                f"{judge_prompt}\n\n"
+                f"Your previous response was invalid: {last_raw_response!r}\n"
+                "Return only 0 or 1."
+            )
+        config_kwargs: dict[str, Any] = {
+            "system_instruction": JUDGE_SYSTEM_PROMPT,
+            "temperature": 0,
+            "max_output_tokens": _VERTEX_JUDGE_MAX_OUTPUT_TOKENS,
+        }
+        if thinking_level:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+        response = await _call_judge_with_retries(
+            lambda: _call_vertex_generate_content(
+                judge_client,
+                model=_normalise_vertex_model_name(judge_model),
+                contents=user_prompt,
+                config=types.GenerateContentConfig(**config_kwargs),
+            )
+        )
+        raw_response = str(getattr(response, "text", "") or "").strip()
+        last_raw_response = raw_response
+        try:
+            return _parse_binary_judge_score(raw_response), raw_response, None
+        except ValueError:
+            if attempt == 1:
+                break
+
+    return 0.0, last_raw_response, "invalid_binary_score"
+
+
 def build_rubric(
     *,
     judge_model: str,
     judge_base_url: str,
-    judge_api_key: str,
+    judge_api_key: str | None,
+    judge_provider: str = "openai_compatible",
     judge_default_headers: dict[str, str] | None = None,
+    judge_vertex_project: str | None = None,
+    judge_vertex_location: str = "global",
+    judge_thinking_level: str | None = "medium",
 ) -> vf.Rubric:
-    judge_client = AsyncOpenAI(
-        base_url=judge_base_url,
-        api_key=judge_api_key,
-        default_headers=judge_default_headers,
-    )
+    if judge_provider == "vertex":
+        if not judge_vertex_project:
+            raise ValueError("judge_vertex_project is required when judge_provider='vertex'")
+        _load_google_genai()
+        judge_client: Any = _VertexJudgeClientFactory(project=judge_vertex_project, location=judge_vertex_location)
+    elif judge_provider == "openai_compatible":
+        judge_client = AsyncOpenAI(
+            base_url=judge_base_url,
+            api_key=judge_api_key or "EMPTY",
+            default_headers=judge_default_headers,
+        )
+    else:
+        raise ValueError("judge_provider must be one of ['openai_compatible', 'vertex']")
 
     async def reward_fn(state: vf.State, completion, answer: str, info: dict[str, Any] | None) -> float:
         predicted_answer = _get_predicted_answer(state, completion).strip()
@@ -387,11 +579,19 @@ def build_rubric(
             expected_answers=_format_expected_answers(expected_answers),
             predicted_answer=predicted_answer,
         )
-        score, raw_response, parse_error = await _call_binary_judge(
-            judge_client,
-            judge_model=judge_model,
-            judge_prompt=judge_prompt,
-        )
+        if judge_provider == "vertex":
+            score, raw_response, parse_error = await _call_vertex_binary_judge(
+                judge_client,
+                judge_model=judge_model,
+                judge_prompt=judge_prompt,
+                thinking_level=judge_thinking_level,
+            )
+        else:
+            score, raw_response, parse_error = await _call_binary_judge(
+                judge_client,
+                judge_model=judge_model,
+                judge_prompt=judge_prompt,
+            )
 
         total_reward = max(0.0, score - efficiency_penalty) if score > 0.0 else 0.0
         _record_reward_breakdown(

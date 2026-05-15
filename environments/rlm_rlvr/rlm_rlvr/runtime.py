@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import random
 import threading
 import time
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from openai import OpenAI
 from openai.types.chat.chat_completion import ChatCompletion
@@ -36,10 +37,17 @@ class RuntimeConfig:
     inference_mode: str = "hosted"
     inference_base_url: str | None = None
     inference_api_key: str | None = None
+    llm_subcall_provider: str = "openai_compatible"
     llm_subcall_model: str | None = None
     llm_subcall_base_url: str | None = None
     llm_subcall_api_key: str | None = None
     llm_subcall_default_headers: dict[str, str] | None = None
+    llm_subcall_vertex_project: str | None = None
+    llm_subcall_vertex_location: str = "global"
+    llm_subcall_thinking_level: str | None = "medium"
+    llm_subcall_empty_response_max_attempts: int = 1
+    llm_subcall_empty_response_base_retry_seconds: float = 1.0
+    llm_subcall_empty_response_max_retry_seconds: float = 30.0
     repl_backend: str = "local"
     repl_backend_kwargs: dict[str, Any] | None = None
     repl_timeout_seconds: float | None = None
@@ -50,6 +58,8 @@ class RuntimeConfig:
     subcall_budget_enabled: bool = False
     max_total_subcalls: int = 80
     max_batched_subcalls: int = 80
+    capture_prompt_messages: bool = False
+    include_budget_reminder: bool = True
 
 
 @dataclass
@@ -60,6 +70,72 @@ class TokenPayload:
     completion_mask: list[bool]
     prompt_token_count: int | None = None
     completion_token_count: int | None = None
+    metadata: dict[str, Any] | None = None
+
+
+_T = TypeVar("_T")
+
+_SUBCALL_RETRY_MAX_ATTEMPTS = 6
+_SUBCALL_RETRY_BASE_SECONDS = 1.0
+_SUBCALL_RETRY_MAX_SECONDS = 30.0
+
+
+def _exception_status_code(exc: BaseException) -> int | None:
+    for attr in ("status_code", "status", "code"):
+        value = getattr(exc, attr, None)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+    response = getattr(exc, "response", None)
+    if response is not None:
+        for attr in ("status_code", "status"):
+            value = getattr(response, attr, None)
+            if value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    pass
+    return None
+
+
+def _is_retryable_subcall_exception(exc: BaseException) -> bool:
+    status_code = _exception_status_code(exc)
+    if status_code == 429 or status_code in {500, 502, 503, 504}:
+        return True
+
+    marker = str(exc).upper()
+    return any(
+        token in marker
+        for token in (
+            "429",
+            "RATE_LIMIT",
+            "RESOURCE_EXHAUSTED",
+            "TOO MANY REQUESTS",
+            "UNAVAILABLE",
+            "SERVICE UNAVAILABLE",
+            "DEADLINE_EXCEEDED",
+            "INTERNAL",
+        )
+    )
+
+
+def _sleep_before_subcall_retry(attempt: int) -> None:
+    delay = min(_SUBCALL_RETRY_MAX_SECONDS, _SUBCALL_RETRY_BASE_SECONDS * (2**attempt))
+    jitter = random.uniform(0.0, min(1.0, delay * 0.25))
+    time.sleep(delay + jitter)
+
+
+def _call_subcall_with_retries(request: Callable[[], _T]) -> _T:
+    for attempt in range(_SUBCALL_RETRY_MAX_ATTEMPTS):
+        try:
+            return request()
+        except Exception as exc:
+            if attempt == _SUBCALL_RETRY_MAX_ATTEMPTS - 1 or not _is_retryable_subcall_exception(exc):
+                raise
+            _sleep_before_subcall_retry(attempt)
+    raise RuntimeError("unreachable subcall retry state")
 
 
 class SyncInferenceSession:
@@ -76,22 +152,32 @@ class SyncInferenceSession:
         max_prompt_tokens: int | None,
         enable_vllm_extra_body: bool = False,
         request_logprobs: bool = True,
+        retry_transient_errors: bool = False,
+        openai_extra_body: dict[str, Any] | None = None,
+        enable_token_accounting: bool = True,
     ):
         self.model_name = model_name
         self.max_prompt_tokens = max_prompt_tokens
         self.enable_vllm_extra_body = enable_vllm_extra_body
         self.request_logprobs = request_logprobs
+        self.retry_transient_errors = retry_transient_errors
+        self.openai_extra_body = openai_extra_body or {}
+        self.enable_token_accounting = enable_token_accounting
         self.client = OpenAI(
             base_url=base_url,
             api_key=api_key or "EMPTY",
             default_headers=default_headers,
         )
-        tokenizer_key = tokenizer_name or model_name
-        if tokenizer_key not in self._tokenizers:
-            self._tokenizers[tokenizer_key] = AutoTokenizer.from_pretrained(tokenizer_key, trust_remote_code=True)
-        self.tokenizer = self._tokenizers[tokenizer_key]
+        self.tokenizer = None
+        if self.enable_token_accounting:
+            tokenizer_key = tokenizer_name or model_name
+            if tokenizer_key not in self._tokenizers:
+                self._tokenizers[tokenizer_key] = AutoTokenizer.from_pretrained(tokenizer_key, trust_remote_code=True)
+            self.tokenizer = self._tokenizers[tokenizer_key]
 
     def render_prompt_ids(self, messages: list[dict[str, str]], *, add_generation_prompt: bool) -> list[int]:
+        if self.tokenizer is None:
+            return []
         rendered = self.tokenizer.apply_chat_template(
             messages,
             tokenize=True,
@@ -101,6 +187,8 @@ class SyncInferenceSession:
         return list(rendered["input_ids"])
 
     def count_text_tokens(self, text: str) -> int:
+        if self.tokenizer is None:
+            return 0
         return len(self.tokenizer.encode(text, add_special_tokens=False))
 
     @staticmethod
@@ -157,18 +245,21 @@ class SyncInferenceSession:
                 "top_k": -1,
                 "min_p": 0.0,
             })
-        response = self.client.post(
+        request_body.update(getattr(self, "openai_extra_body", {}))
+        request = lambda: self.client.post(
             "chat/completions",
             body=request_body,
             cast_to=ChatCompletion,
         )
+        response = _call_subcall_with_retries(request) if getattr(self, "retry_transient_errors", False) else request()
         assert response.choices is not None and len(response.choices) == 1
         choice = response.choices[0]
         assert choice.message is not None
         text = (choice.message.content or "").strip()
+        fallback_completion_ids = self.tokenizer.encode(text, add_special_tokens=False) if self.tokenizer is not None else []
         completion_ids = self._coerce_token_ids(
             getattr(choice, "token_ids", None),
-            fallback=self.tokenizer.encode(text, add_special_tokens=False),
+            fallback=fallback_completion_ids,
         )
         prompt_ids = self.render_prompt_ids(messages, add_generation_prompt=True)
         prompt_token_ids = self._coerce_token_ids(getattr(response, "prompt_token_ids", None), fallback=prompt_ids)
@@ -183,6 +274,228 @@ class SyncInferenceSession:
             completion_mask=[True] * len(completion_ids),
             prompt_token_count=prompt_token_count if prompt_token_count is not None else len(prompt_token_ids),
             completion_token_count=completion_token_count if completion_token_count is not None else len(completion_ids),
+        )
+        return text, payload
+
+
+def _load_google_genai():
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        raise RuntimeError(
+            "Vertex Gemini subcalls require the google-genai package. "
+            "Install environments/rlm_rlvr with google-genai[aiohttp]>=1.51.0."
+        ) from exc
+    return genai, types
+
+
+def _normalise_vertex_model_name(model_name: str) -> str:
+    if model_name.startswith("google/"):
+        model_name = model_name.removeprefix("google/")
+    if model_name == "gemini-3-flash":
+        return "gemini-3-flash-preview"
+    return model_name
+
+
+def _usage_field(usage: Any, key: str) -> int | None:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        value = usage.get(key)
+    else:
+        value = getattr(usage, key, None)
+    if value is None:
+        return None
+    return int(value)
+
+
+class VertexGeminiSession:
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        project: str,
+        location: str,
+        tokenizer_name: str | None,
+        max_prompt_tokens: int | None,
+        thinking_level: str | None = "medium",
+        empty_response_max_attempts: int = 1,
+        empty_response_base_retry_seconds: float = 1.0,
+        empty_response_max_retry_seconds: float = 30.0,
+    ):
+        genai, _ = _load_google_genai()
+        self.model_name = _normalise_vertex_model_name(model_name)
+        self.max_prompt_tokens = max_prompt_tokens
+        self.thinking_level = thinking_level
+        self.retry_transient_errors = True
+        self.empty_response_max_attempts = max(1, int(empty_response_max_attempts))
+        self.empty_response_base_retry_seconds = float(empty_response_base_retry_seconds)
+        self.empty_response_max_retry_seconds = float(empty_response_max_retry_seconds)
+        self.client = genai.Client(vertexai=True, project=project, location=location)
+        tokenizer_key = tokenizer_name or model_name
+        if tokenizer_key not in SyncInferenceSession._tokenizers:
+            SyncInferenceSession._tokenizers[tokenizer_key] = AutoTokenizer.from_pretrained(tokenizer_key, trust_remote_code=True)
+        self.tokenizer = SyncInferenceSession._tokenizers[tokenizer_key]
+
+    def render_prompt_ids(self, messages: list[dict[str, str]], *, add_generation_prompt: bool) -> list[int]:
+        rendered = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            return_dict=True,
+        )
+        return list(rendered["input_ids"])
+
+    def count_text_tokens(self, text: str) -> int:
+        return len(self.tokenizer.encode(text, add_special_tokens=False))
+
+    @staticmethod
+    def _message_text(message: dict[str, str]) -> str:
+        content = message.get("content", "")
+        return content if isinstance(content, str) else str(content)
+
+    def _convert_messages(self, messages: list[dict[str, str]]) -> tuple[str | None, list[Any]]:
+        _, types = _load_google_genai()
+        system_parts: list[str] = []
+        contents: list[Any] = []
+        for message in messages:
+            role = str(message.get("role", "user"))
+            text = self._message_text(message)
+            if role == "system":
+                system_parts.append(text)
+                continue
+            vertex_role = "model" if role == "assistant" else "user"
+            contents.append(types.Content(role=vertex_role, parts=[types.Part.from_text(text=text)]))
+        system_instruction = "\n\n".join(part for part in system_parts if part).strip() or None
+        if not contents:
+            contents.append(types.Content(role="user", parts=[types.Part.from_text(text="")]))
+        return system_instruction, contents
+
+    def _generate_config(
+        self,
+        *,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        system_instruction: str | None,
+    ) -> Any:
+        _, types = _load_google_genai()
+        kwargs: dict[str, Any] = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_output_tokens": max_tokens,
+        }
+        if system_instruction is not None:
+            kwargs["system_instruction"] = system_instruction
+        if self.thinking_level:
+            kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=self.thinking_level)
+        return types.GenerateContentConfig(**kwargs)
+
+    @staticmethod
+    def _usage_metadata(response: Any) -> Any:
+        usage = getattr(response, "usage_metadata", None)
+        if usage is not None:
+            return usage
+        model_dump = getattr(response, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump()
+            if isinstance(dumped, dict):
+                return dumped.get("usage_metadata")
+        return None
+
+    @staticmethod
+    def _completion_token_count(usage: Any, *, prompt_token_count: int | None, fallback: int) -> int:
+        total_token_count = _usage_field(usage, "total_token_count")
+        if total_token_count is not None and prompt_token_count is not None:
+            return max(0, total_token_count - prompt_token_count)
+        candidates_token_count = _usage_field(usage, "candidates_token_count")
+        thoughts_token_count = _usage_field(usage, "thoughts_token_count")
+        if candidates_token_count is not None or thoughts_token_count is not None:
+            return int(candidates_token_count or 0) + int(thoughts_token_count or 0)
+        return fallback
+
+    @staticmethod
+    def _completion_token_count_from_usage(usage: Any) -> int | None:
+        prompt_token_count = _usage_field(usage, "prompt_token_count")
+        total_token_count = _usage_field(usage, "total_token_count")
+        if total_token_count is not None and prompt_token_count is not None:
+            return max(0, total_token_count - prompt_token_count)
+        candidates_token_count = _usage_field(usage, "candidates_token_count")
+        thoughts_token_count = _usage_field(usage, "thoughts_token_count")
+        if candidates_token_count is not None or thoughts_token_count is not None:
+            return int(candidates_token_count or 0) + int(thoughts_token_count or 0)
+        return None
+
+    @staticmethod
+    def _sum_optional_counts(values: list[int | None]) -> int | None:
+        present = [value for value in values if value is not None]
+        if not present:
+            return None
+        return sum(present)
+
+    def _empty_response_retry_attempts(self) -> int:
+        return max(1, int(getattr(self, "empty_response_max_attempts", 1)))
+
+    def _sleep_before_empty_response_retry(self, attempt: int) -> None:
+        base_seconds = float(getattr(self, "empty_response_base_retry_seconds", 1.0))
+        max_seconds = float(getattr(self, "empty_response_max_retry_seconds", 30.0))
+        delay = min(max_seconds, base_seconds * (2**attempt))
+        jitter = random.uniform(0.0, min(1.0, delay * 0.25))
+        time.sleep(delay + jitter)
+
+    def generate(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> tuple[str, TokenPayload]:
+        system_instruction, contents = self._convert_messages(messages)
+        config = self._generate_config(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            system_instruction=system_instruction,
+        )
+        responses: list[Any] = []
+        text = ""
+        max_attempts = self._empty_response_retry_attempts()
+        for attempt in range(max_attempts):
+            response = _call_subcall_with_retries(
+                lambda: self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=config,
+                )
+            )
+            responses.append(response)
+            text = str(getattr(response, "text", "") or "").strip()
+            if text or attempt == max_attempts - 1:
+                break
+            self._sleep_before_empty_response_retry(attempt)
+        prompt_ids = self.render_prompt_ids(messages, add_generation_prompt=True)
+        completion_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        usages = [self._usage_metadata(response) for response in responses]
+        prompt_token_count = self._sum_optional_counts([_usage_field(usage, "prompt_token_count") for usage in usages])
+        completion_token_count = self._sum_optional_counts(
+            [self._completion_token_count_from_usage(usage) for usage in usages if usage is not None]
+        )
+        if completion_token_count is None:
+            completion_token_count = len(completion_ids)
+        payload = TokenPayload(
+            prompt_ids=prompt_ids,
+            completion_ids=completion_ids,
+            completion_logprobs=[0.0] * len(completion_ids),
+            completion_mask=[True] * len(completion_ids),
+            prompt_token_count=prompt_token_count if prompt_token_count is not None else len(prompt_ids),
+            completion_token_count=completion_token_count,
+            metadata={
+                "generation_attempt_count": len(responses),
+                "empty_response_retry_count": max(0, len(responses) - 1),
+                "empty_response_exhausted": not text and len(responses) >= max_attempts,
+            },
         )
         return text, payload
 
@@ -388,6 +701,7 @@ class RecursiveRuntime:
                     subcall_budget_enabled=self.config.subcall_budget_enabled,
                     max_total_subcalls=self.config.max_total_subcalls,
                     max_batched_subcalls=self.config.max_batched_subcalls,
+                    include_budget_reminder=self.config.include_budget_reminder,
                 ),
             },
             {
@@ -424,7 +738,12 @@ class RecursiveRuntime:
         ]
 
     def build_finalize_message(self) -> str:
-        return "Provide only the final answer now. No explanation. Use FINAL(...) or FINAL_VAR(...)."
+        return (
+            "Provide only the final answer now. No explanation. Use FINAL(...) or FINAL_VAR(...). "
+            "FINAL(...) is not a Python function; if you put it inside a ```repl code block, the REPL will try "
+            "to execute it and fail. Put FINAL(...) outside code blocks with the actual final answer inside it, "
+            "not an expression like json.dumps(...)."
+        )
 
     def budget_feedback_message(self) -> dict[str, str] | None:
         if not self.config.subcall_budget_enabled:
@@ -484,6 +803,21 @@ class RecursiveRuntime:
             prompt_message_count=provenance["prompt_message_count"],
             prompt_char_count=provenance["prompt_char_count"],
         )
+        if self.config.capture_prompt_messages:
+            segment["prompt_messages"] = [
+                {"role": str(message.get("role", "")), "content": str(message.get("content", ""))}
+                for message in messages
+            ]
+            request_model = self.plain_llm_session.model_name if kind == "plain_query" else self.session.model_name
+            request_max_tokens = self.config.subcall_max_tokens if kind == "plain_query" else self.config.turn_max_tokens
+            segment["request"] = {
+                "model": request_model,
+                "max_tokens": int(request_max_tokens),
+                "temperature": float(self.state.get("sampling_temperature", self.config.temperature)),
+                "top_p": float(self.config.top_p),
+            }
+        if payload.metadata:
+            segment.update(payload.metadata)
         with self._state_lock:
             self.state["rlm_segments"].append(segment)
             prompt_token_count = float(payload.prompt_token_count if payload.prompt_token_count is not None else len(payload.prompt_ids))

@@ -19,21 +19,28 @@ def append_budget_reminder(
     subcall_budget_enabled: bool = False,
     max_total_subcalls: int | None = None,
     max_batched_subcalls: int | None = None,
+    llm_only_subcalls: bool = False,
+    include_budget_reminder: bool = True,
 ) -> str:
+    if not include_budget_reminder:
+        return system_prompt_template
+
     context_window = f"{max_prompt_tokens} prompt tokens" if max_prompt_tokens is not None else "the configured model context window"
     turn_budget = f"{turn_max_tokens} output tokens" if turn_max_tokens is not None else "the configured turn output budget"
     subcall_budget = f"{subcall_max_tokens} output tokens" if subcall_max_tokens is not None else "the configured subcall output budget"
+    turn_label = "RLM turns" if llm_only_subcalls else "root and recursive RLM turns"
     reminder = (
         "Budget reminder: your prompt context window is "
-        f"{context_window}; root and recursive RLM turns may output up to {turn_budget}; "
+        f"{context_window}; {turn_label} may output up to {turn_budget}; "
         f"one-shot LLM subcalls may output up to {subcall_budget}; make every subcall context-aware "
         "with only the relevant excerpts to avoid context rot."
     )
     if subcall_budget_enabled:
         total_calls = max_total_subcalls if max_total_subcalls is not None else "the configured number of"
         batched_calls = max_batched_subcalls if max_batched_subcalls is not None else "the configured number of"
+        budget_scope = "LLM subcalls" if llm_only_subcalls else "calls across llm_query and rlm_query"
         reminder = (
-            f"{reminder} The subcall budget is {total_calls} total calls across llm_query and rlm_query; "
+            f"{reminder} The subcall budget is {total_calls} total {budget_scope}; "
             f"batched calls may schedule at most {batched_calls} prompts."
         )
     return f"{system_prompt_template.rstrip()}\n\n{reminder}\n"
@@ -50,7 +57,9 @@ def build_system_prompt(
     subcall_budget_enabled: bool = False,
     max_total_subcalls: int | None = None,
     max_batched_subcalls: int | None = None,
+    include_budget_reminder: bool = True,
 ) -> str:
+    llm_only_subcalls = prompt_variant == "sanjaya_text_depth1_llm_only_v1"
     system_prompt_template = append_budget_reminder(
         get_system_prompt_template(prompt_variant),
         max_prompt_tokens=max_prompt_tokens,
@@ -59,6 +68,8 @@ def build_system_prompt(
         subcall_budget_enabled=subcall_budget_enabled,
         max_total_subcalls=max_total_subcalls,
         max_batched_subcalls=max_batched_subcalls,
+        llm_only_subcalls=llm_only_subcalls,
+        include_budget_reminder=include_budget_reminder,
     )
     base_kwargs = {
         "system_prompt": system_prompt_template,
@@ -103,7 +114,9 @@ def build_initial_messages(
     subcall_budget_enabled: bool = False,
     max_total_subcalls: int | None = None,
     max_batched_subcalls: int | None = None,
+    include_budget_reminder: bool = True,
 ) -> list[dict[str, str]]:
+    llm_only_subcalls = prompt_variant == "sanjaya_text_depth1_llm_only_v1"
     system_prompt_template = append_budget_reminder(
         get_system_prompt_template(prompt_variant),
         max_prompt_tokens=max_prompt_tokens,
@@ -112,6 +125,8 @@ def build_initial_messages(
         subcall_budget_enabled=subcall_budget_enabled,
         max_total_subcalls=max_total_subcalls,
         max_batched_subcalls=max_batched_subcalls,
+        llm_only_subcalls=llm_only_subcalls,
+        include_budget_reminder=include_budget_reminder,
     )
     try:
         system_and_metadata = build_rlm_system_prompt(

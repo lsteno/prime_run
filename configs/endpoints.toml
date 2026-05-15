@@ -284,3 +284,10 @@ model = "z-ai/glm-4.7"
 url = "https://api.pinference.ai/api/v1"
 key = "PRIME_API_KEY"
 type = "openai_chat_completions"
+
+[[endpoint]]
+endpoint_id = "glm-5"
+model = "z-ai/glm-5"
+url = "https://api.pinference.ai/api/v1"
+key = "PRIME_API_KEY"
+type = "openai_chat_completions"

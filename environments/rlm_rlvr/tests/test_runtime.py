@@ -8,10 +8,11 @@ from types import SimpleNamespace
 import pytest
 from openai import AsyncOpenAI
 
+import rlm_rlvr.runtime as runtime_module
 from rlm_rlvr.env import RLMRLVREnv, load_environment
 from rlm_rlvr.prompt_variants import DEFAULT_PROMPT_VARIANT
 from rlm_rlvr.repl import RecursiveLocalRepl, code_uses_subcalls
-from rlm_rlvr.runtime import RecursiveRuntime, RuntimeConfig, SubcallPromptTooLargeError, SyncInferenceSession, TokenPayload
+from rlm_rlvr.runtime import RecursiveRuntime, RuntimeConfig, SubcallPromptTooLargeError, SyncInferenceSession, TokenPayload, VertexGeminiSession
 from rlm_rlvr.trace import make_call_trace
 
 
@@ -67,6 +68,14 @@ class _FakeClient:
 
 
 class _FakeSyncInferenceSession:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+
+    def count_text_tokens(self, text: str) -> int:
+        return len(text.split())
+
+
+class _FakeVertexGeminiSession:
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
 
@@ -176,6 +185,81 @@ def test_generate_uses_api_usage_token_counts_for_plain_subcalls() -> None:
     assert payload.completion_token_count == 9
 
 
+def test_openai_compatible_plain_subcall_retries_transient_errors(monkeypatch) -> None:
+    class _FakeRateLimitError(RuntimeError):
+        status_code = 429
+
+    class _FlakyClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def post(self, path: str, *, body, cast_to):
+            del path, body, cast_to
+            self.calls += 1
+            if self.calls < 3:
+                raise _FakeRateLimitError("rate limited")
+            choice = SimpleNamespace(message=SimpleNamespace(content="ok"), token_ids=None, logprobs=None)
+            usage = SimpleNamespace(prompt_tokens=17, completion_tokens=9)
+            return SimpleNamespace(choices=[choice], prompt_token_ids=None, usage=usage)
+
+    monkeypatch.setattr(runtime_module, "_sleep_before_subcall_retry", lambda attempt: None)
+    session = object.__new__(SyncInferenceSession)
+    session.model_name = "openai/gpt-5.4-mini"
+    session.client = _FlakyClient()
+    session.tokenizer = _FakeTokenizer()
+    session.max_prompt_tokens = None
+    session.enable_vllm_extra_body = False
+    session.request_logprobs = False
+    session.retry_transient_errors = True
+
+    text, payload = SyncInferenceSession.generate(
+        session,
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    assert text == "ok"
+    assert session.client.calls == 3
+    assert payload.prompt_token_count == 17
+    assert payload.completion_token_count == 9
+
+
+def test_local_sync_generation_does_not_retry_by_default(monkeypatch) -> None:
+    class _FakeUnavailableError(RuntimeError):
+        status_code = 503
+
+    class _FlakyClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def post(self, path: str, *, body, cast_to):
+            del path, body, cast_to
+            self.calls += 1
+            raise _FakeUnavailableError("unavailable")
+
+    monkeypatch.setattr(runtime_module, "_sleep_before_subcall_retry", lambda attempt: None)
+    session = object.__new__(SyncInferenceSession)
+    session.model_name = "local-training-model"
+    session.client = _FlakyClient()
+    session.tokenizer = _FakeTokenizer()
+    session.max_prompt_tokens = None
+    session.enable_vllm_extra_body = True
+    session.request_logprobs = True
+
+    with pytest.raises(_FakeUnavailableError):
+        SyncInferenceSession.generate(
+            session,
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+        )
+
+    assert session.client.calls == 1
+
+
 def test_generate_falls_back_to_tokenizer_counts_when_usage_is_missing() -> None:
     session = object.__new__(SyncInferenceSession)
     session.model_name = "openai/gpt-5.4-mini"
@@ -195,6 +279,326 @@ def test_generate_falls_back_to_tokenizer_counts_when_usage_is_missing() -> None
 
     assert payload.prompt_token_count == 3
     assert payload.completion_token_count == 2
+
+
+def test_generate_can_skip_token_accounting_for_external_traces() -> None:
+    session = object.__new__(SyncInferenceSession)
+    session.model_name = "z-ai/glm-5"
+    session.client = _FakeClient(expect_logprobs=False, usage=None)
+    session.tokenizer = None
+    session.max_prompt_tokens = None
+    session.enable_vllm_extra_body = False
+    session.request_logprobs = False
+    session.retry_transient_errors = False
+    session.openai_extra_body = {}
+    session.enable_token_accounting = False
+
+    text, payload = SyncInferenceSession.generate(
+        session,
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    assert text == "ok"
+    assert payload.prompt_ids == []
+    assert payload.completion_ids == []
+    assert payload.prompt_token_count == 0
+    assert payload.completion_token_count == 0
+
+
+def test_vertex_generate_uses_usage_metadata_and_includes_thinking_tokens(monkeypatch) -> None:
+    class _FakePart:
+        @staticmethod
+        def from_text(*, text: str):
+            return {"text": text}
+
+    class _FakeContent:
+        def __init__(self, *, role: str, parts: list[dict[str, str]]) -> None:
+            self.role = role
+            self.parts = parts
+
+    class _FakeThinkingConfig:
+        def __init__(self, *, thinking_level: str) -> None:
+            self.thinking_level = thinking_level
+
+    class _FakeGenerateContentConfig:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    fake_types = SimpleNamespace(
+        Part=_FakePart,
+        Content=_FakeContent,
+        ThinkingConfig=_FakeThinkingConfig,
+        GenerateContentConfig=_FakeGenerateContentConfig,
+    )
+    monkeypatch.setattr(runtime_module, "_load_google_genai", lambda: (SimpleNamespace(), fake_types))
+
+    class _FakeModels:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def generate_content(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                text="ok",
+                usage_metadata=SimpleNamespace(prompt_token_count=17, total_token_count=31, candidates_token_count=3),
+            )
+
+    session = object.__new__(VertexGeminiSession)
+    session.model_name = "gemini-3.1-flash-lite"
+    session.client = SimpleNamespace(models=_FakeModels())
+    session.tokenizer = _FakeTokenizer()
+    session.thinking_level = "medium"
+
+    text, payload = VertexGeminiSession.generate(
+        session,
+        messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}],
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    assert text == "ok"
+    assert payload.prompt_ids == [101, 102, 103]
+    assert payload.completion_ids == [2, 3]
+    assert payload.prompt_token_count == 17
+    assert payload.completion_token_count == 14
+    call = session.client.models.calls[0]
+    assert call["model"] == "gemini-3.1-flash-lite"
+    assert call["config"].kwargs["thinking_config"].thinking_level == "medium"
+
+
+def test_vertex_plain_subcall_retries_transient_errors(monkeypatch) -> None:
+    class _FakePart:
+        @staticmethod
+        def from_text(*, text: str):
+            return {"text": text}
+
+    class _FakeContent:
+        def __init__(self, *, role: str, parts: list[dict[str, str]]) -> None:
+            self.role = role
+            self.parts = parts
+
+    class _FakeThinkingConfig:
+        def __init__(self, *, thinking_level: str) -> None:
+            self.thinking_level = thinking_level
+
+    class _FakeGenerateContentConfig:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    fake_types = SimpleNamespace(
+        Part=_FakePart,
+        Content=_FakeContent,
+        ThinkingConfig=_FakeThinkingConfig,
+        GenerateContentConfig=_FakeGenerateContentConfig,
+    )
+    monkeypatch.setattr(runtime_module, "_load_google_genai", lambda: (SimpleNamespace(), fake_types))
+    monkeypatch.setattr(runtime_module, "_sleep_before_subcall_retry", lambda attempt: None)
+
+    class _FakeModels:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_content(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            if self.calls < 3:
+                raise RuntimeError("429 RESOURCE_EXHAUSTED")
+            return SimpleNamespace(
+                text="ok",
+                usage_metadata=SimpleNamespace(prompt_token_count=17, total_token_count=31),
+            )
+
+    session = object.__new__(VertexGeminiSession)
+    session.model_name = "gemini-3.1-flash-lite"
+    session.client = SimpleNamespace(models=_FakeModels())
+    session.tokenizer = _FakeTokenizer()
+    session.thinking_level = "medium"
+
+    text, payload = VertexGeminiSession.generate(
+        session,
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    assert text == "ok"
+    assert session.client.models.calls == 3
+    assert payload.prompt_token_count == 17
+    assert payload.completion_token_count == 14
+
+
+def test_vertex_generate_falls_back_to_tokenizer_counts_when_usage_is_missing(monkeypatch) -> None:
+    class _FakePart:
+        @staticmethod
+        def from_text(*, text: str):
+            return {"text": text}
+
+    class _FakeContent:
+        def __init__(self, *, role: str, parts: list[dict[str, str]]) -> None:
+            self.role = role
+            self.parts = parts
+
+    class _FakeGenerateContentConfig:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    fake_types = SimpleNamespace(
+        Part=_FakePart,
+        Content=_FakeContent,
+        ThinkingConfig=lambda **kwargs: kwargs,
+        GenerateContentConfig=_FakeGenerateContentConfig,
+    )
+    monkeypatch.setattr(runtime_module, "_load_google_genai", lambda: (SimpleNamespace(), fake_types))
+
+    class _FakeModels:
+        def generate_content(self, **kwargs):
+            del kwargs
+            return SimpleNamespace(text="ok")
+
+    session = object.__new__(VertexGeminiSession)
+    session.model_name = "gemini-3.1-flash-lite"
+    session.client = SimpleNamespace(models=_FakeModels())
+    session.tokenizer = _FakeTokenizer()
+    session.thinking_level = "medium"
+
+    _, payload = VertexGeminiSession.generate(
+        session,
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    assert payload.prompt_token_count == 3
+    assert payload.completion_token_count == 2
+
+
+def test_vertex_generate_retries_empty_responses(monkeypatch) -> None:
+    class _FakePart:
+        @staticmethod
+        def from_text(*, text: str):
+            return {"text": text}
+
+    class _FakeContent:
+        def __init__(self, *, role: str, parts: list[dict[str, str]]) -> None:
+            self.role = role
+            self.parts = parts
+
+    class _FakeGenerateContentConfig:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    fake_types = SimpleNamespace(
+        Part=_FakePart,
+        Content=_FakeContent,
+        ThinkingConfig=lambda **kwargs: kwargs,
+        GenerateContentConfig=_FakeGenerateContentConfig,
+    )
+    monkeypatch.setattr(runtime_module, "_load_google_genai", lambda: (SimpleNamespace(), fake_types))
+    monkeypatch.setattr(VertexGeminiSession, "_sleep_before_empty_response_retry", lambda self, attempt: None)
+
+    class _FakeModels:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_content(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(text="", usage_metadata=SimpleNamespace(prompt_token_count=5, total_token_count=7))
+            return SimpleNamespace(text="ok", usage_metadata=SimpleNamespace(prompt_token_count=6, total_token_count=10))
+
+    session = object.__new__(VertexGeminiSession)
+    session.model_name = "gemini-3.1-flash-lite"
+    session.client = SimpleNamespace(models=_FakeModels())
+    session.tokenizer = _FakeTokenizer()
+    session.thinking_level = "medium"
+    session.empty_response_max_attempts = 3
+    session.empty_response_base_retry_seconds = 1.0
+    session.empty_response_max_retry_seconds = 30.0
+
+    text, payload = VertexGeminiSession.generate(
+        session,
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    assert text == "ok"
+    assert session.client.models.calls == 2
+    assert payload.prompt_token_count == 11
+    assert payload.completion_token_count == 6
+    assert payload.metadata == {
+        "generation_attempt_count": 2,
+        "empty_response_retry_count": 1,
+        "empty_response_exhausted": False,
+    }
+
+
+def test_vertex_generate_marks_empty_response_exhaustion(monkeypatch) -> None:
+    class _FakePart:
+        @staticmethod
+        def from_text(*, text: str):
+            return {"text": text}
+
+    class _FakeContent:
+        def __init__(self, *, role: str, parts: list[dict[str, str]]) -> None:
+            self.role = role
+            self.parts = parts
+
+    class _FakeGenerateContentConfig:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    fake_types = SimpleNamespace(
+        Part=_FakePart,
+        Content=_FakeContent,
+        ThinkingConfig=lambda **kwargs: kwargs,
+        GenerateContentConfig=_FakeGenerateContentConfig,
+    )
+    monkeypatch.setattr(runtime_module, "_load_google_genai", lambda: (SimpleNamespace(), fake_types))
+    monkeypatch.setattr(VertexGeminiSession, "_sleep_before_empty_response_retry", lambda self, attempt: None)
+
+    class _FakeModels:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_content(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            return SimpleNamespace(text="")
+
+    session = object.__new__(VertexGeminiSession)
+    session.model_name = "gemini-3.1-flash-lite"
+    session.client = SimpleNamespace(models=_FakeModels())
+    session.tokenizer = _FakeTokenizer()
+    session.thinking_level = "medium"
+    session.empty_response_max_attempts = 2
+    session.empty_response_base_retry_seconds = 1.0
+    session.empty_response_max_retry_seconds = 30.0
+
+    text, payload = VertexGeminiSession.generate(
+        session,
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+    )
+
+    assert text == ""
+    assert session.client.models.calls == 2
+    assert payload.completion_ids == []
+    assert payload.metadata == {
+        "generation_attempt_count": 2,
+        "empty_response_retry_count": 1,
+        "empty_response_exhausted": True,
+    }
 
 
 def test_setup_state_rebuilds_root_prompt_with_real_context_metadata(monkeypatch) -> None:
@@ -227,17 +631,20 @@ def test_setup_state_rebuilds_root_prompt_with_real_context_metadata(monkeypatch
     assert updated["used_rlm_subcalls"] is False
 
 
-def test_setup_state_creates_separate_plain_llm_session(monkeypatch) -> None:
+def test_setup_state_creates_separate_vertex_plain_llm_session(monkeypatch) -> None:
     import rlm_rlvr.env as env_module
 
     monkeypatch.setattr(env_module, "SyncInferenceSession", _FakeSyncInferenceSession)
+    monkeypatch.setattr(env_module, "VertexGeminiSession", _FakeVertexGeminiSession)
     environment = object.__new__(RLMRLVREnv)
     environment.runtime_config = RuntimeConfig(
         prompt_variant=DEFAULT_PROMPT_VARIANT,
-        llm_subcall_model="openai/gpt-5.4-mini",
-        llm_subcall_base_url="https://openrouter.ai/api/v1",
-        llm_subcall_api_key="openrouter-key",
-        llm_subcall_default_headers={"HTTP-Referer": "https://example.test"},
+        llm_subcall_provider="vertex",
+        llm_subcall_model="gemini-3.1-flash-lite",
+        llm_subcall_vertex_project="test-project",
+        llm_subcall_vertex_location="global",
+        llm_subcall_thinking_level="medium",
+        llm_subcall_empty_response_max_attempts=3,
     )
     environment.efficiency_penalty_coef = 0.02
     state = {
@@ -257,12 +664,45 @@ def test_setup_state_creates_separate_plain_llm_session(monkeypatch) -> None:
     assert plain_session is not local_session
     assert local_session.kwargs["model_name"] == "local-training-model"
     assert local_session.kwargs["enable_vllm_extra_body"] is False
+    assert plain_session.kwargs["model_name"] == "gemini-3.1-flash-lite"
+    assert plain_session.kwargs["project"] == "test-project"
+    assert plain_session.kwargs["location"] == "global"
+    assert plain_session.kwargs["thinking_level"] == "medium"
+    assert plain_session.kwargs["empty_response_max_attempts"] == 3
+
+
+def test_setup_state_enables_retries_for_openai_compatible_plain_llm_session(monkeypatch) -> None:
+    import rlm_rlvr.env as env_module
+
+    monkeypatch.setattr(env_module, "SyncInferenceSession", _FakeSyncInferenceSession)
+    environment = object.__new__(RLMRLVREnv)
+    environment.runtime_config = RuntimeConfig(
+        prompt_variant=DEFAULT_PROMPT_VARIANT,
+        llm_subcall_provider="openai_compatible",
+        llm_subcall_model="openai/gpt-5.4-mini",
+        llm_subcall_base_url="https://openrouter.ai/api/v1",
+        llm_subcall_api_key="test-key",
+    )
+    environment.efficiency_penalty_coef = 0.02
+    state = {
+        "client": AsyncOpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY"),
+        "model": "local-training-model",
+        "info": {
+            "context": "alpha beta gamma",
+            "question": "What is in the context?",
+        },
+        "sampling_args": {},
+    }
+
+    updated = asyncio.run(environment.setup_state(state))
+
+    local_session = updated["_sync_session"]
+    plain_session = updated["_plain_llm_session"]
+    assert plain_session is not local_session
+    assert "retry_transient_errors" not in local_session.kwargs
     assert plain_session.kwargs["model_name"] == "openai/gpt-5.4-mini"
-    assert plain_session.kwargs["base_url"] == "https://openrouter.ai/api/v1"
-    assert plain_session.kwargs["api_key"] == "openrouter-key"
-    assert plain_session.kwargs["default_headers"] == {"HTTP-Referer": "https://example.test"}
-    assert plain_session.kwargs["enable_vllm_extra_body"] is False
     assert plain_session.kwargs["request_logprobs"] is False
+    assert plain_session.kwargs["retry_transient_errors"] is True
 
 
 def test_env_response_records_root_repl_feedback(tmp_path) -> None:
@@ -1000,6 +1440,7 @@ def test_plain_query_counts_as_depth_one_llm_subcall() -> None:
             subcall_max_tokens=4,
             temperature=0.0,
             top_p=1.0,
+            capture_prompt_messages=True,
             live_trace_dir=None,
         ),
     )
@@ -1018,7 +1459,7 @@ def test_plain_query_counts_as_depth_one_llm_subcall() -> None:
     assert len(state["rlm_segments"]) == 1
 
 
-def test_plain_query_uses_openrouter_session_and_recursive_query_uses_local_session() -> None:
+def test_plain_query_uses_vertex_session_and_recursive_query_uses_local_session() -> None:
     class _LabeledSession:
         def __init__(self, model_name: str, response: str) -> None:
             self.model_name = model_name
@@ -1041,10 +1482,10 @@ def test_plain_query_uses_openrouter_session_and_recursive_query_uses_local_sess
             )
 
     local_session = _LabeledSession("local-training-model", "FINAL(local)")
-    openrouter_session = _LabeledSession("openai/gpt-5.4-mini", "plain answer")
+    vertex_session = _LabeledSession("gemini-3.1-flash-lite", "plain answer")
     state = _runtime_state(
         _sync_session=local_session,
-        _plain_llm_session=openrouter_session,
+        _plain_llm_session=vertex_session,
     )
     runtime = RecursiveRuntime(
         state,
@@ -1062,9 +1503,9 @@ def test_plain_query_uses_openrouter_session_and_recursive_query_uses_local_sess
     plain_result = runtime._plain_query("solve directly")
     recursive_result = runtime._recursive_query("solve recursively")
 
-    assert plain_result["model"] == "openai/gpt-5.4-mini"
+    assert plain_result["model"] == "gemini-3.1-flash-lite"
     assert recursive_result["model"] == "local-training-model"
-    assert openrouter_session.calls == 1
+    assert vertex_session.calls == 1
     assert local_session.calls == 1
     plain_segment, recursive_segment = state["rlm_segments"]
     assert plain_segment["train_scope"] == "llm_subcall"
@@ -1098,6 +1539,7 @@ def test_plain_query_segments_are_non_trainable_llm_subcalls() -> None:
             subcall_max_tokens=4,
             temperature=0.0,
             top_p=1.0,
+            capture_prompt_messages=True,
             live_trace_dir=None,
         ),
     )
@@ -1111,6 +1553,13 @@ def test_plain_query_segments_are_non_trainable_llm_subcalls() -> None:
     assert segment["is_trainable_rlm_turn"] is False
     assert segment["response_source"] == "llm_subcall"
     assert segment["turn_index"] == -1
+    assert segment["prompt_messages"] == [{"role": "user", "content": "solve directly"}]
+    assert segment["request"] == {
+        "model": "fake-model",
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "top_p": 1.0,
+    }
 
 
 def test_live_trace_compacts_segments_without_token_arrays(tmp_path) -> None:
