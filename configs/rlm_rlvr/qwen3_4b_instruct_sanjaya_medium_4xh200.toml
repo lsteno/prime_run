@@ -15,7 +15,7 @@
 
 output_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-4xh200"
 max_steps = 100
-max_async_level = 3
+max_async_level = 1
 seq_len = 458752
 
 [deployment]
@@ -99,6 +99,7 @@ extra_body = { return_token_ids = true, top_k = -1, min_p = 0.0 }
 online_difficulty_filtering = true
 easy_threshold = 1.0
 hard_threshold = 0.0
+hard_cooldown_steps = 5
 seed = 42
 
 [orchestrator.trace_export]

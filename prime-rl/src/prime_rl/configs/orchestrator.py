@@ -294,6 +294,16 @@ class EnvConfig(BaseConfig):
             description="Maximum number of times the environment will retry a rollout before returning an error.",
         ),
     ] = 0
+    worker_count: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Number of environment server worker processes to spawn for this logical environment. "
+                "The dataset/task remains a single logical env; rollout requests are routed across workers."
+            ),
+        ),
+    ] = 1
 
     @property
     def resolved_name(self) -> str:
@@ -304,6 +314,11 @@ class EnvConfig(BaseConfig):
         if self.resolved_name == "all":
             raise ValueError(
                 'Environment name "all" is reserved for global metric aggregation. Use a different name or id.'
+            )
+        if self.address is not None and self.worker_count > 1:
+            raise ValueError(
+                "worker_count > 1 requires Prime-RL to spawn local environment servers; "
+                "use worker_count = 1 when connecting to an explicit env address."
             )
         return self
 
@@ -503,6 +518,18 @@ class BufferConfig(BaseConfig):
         ),
     ] = 0.0
 
+    hard_cooldown_steps: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "If set, hard examples are held out for this many orchestrator steps before returning to "
+                "the normal sampling pool. If None, hard examples stay in the hard pool until converted by "
+                "hard_fraction on checkpoint load, preserving upstream behavior."
+            ),
+        ),
+    ] = None
+
     online_difficulty_filtering: Annotated[
         bool,
         Field(
@@ -687,6 +714,61 @@ class TraceExportConfig(BaseConfig):
     ] = True
 
 
+class EnvWorkerRecoveryConfig(BaseConfig):
+    """Configures recovery for locally spawned environment worker processes."""
+
+    enabled: Annotated[
+        bool,
+        Field(description="Whether to restart locally spawned env workers after stuck rollout attempts."),
+    ] = False
+
+    cancel_grace_seconds: Annotated[
+        float,
+        Field(
+            ge=0,
+            description="Seconds to wait after cancelling a timed-out rollout before restarting the worker.",
+        ),
+    ] = 5.0
+
+    max_rollout_attempts_per_slot: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Maximum rollout attempts for one group slot before dropping the entire group.",
+        ),
+    ] = 4
+
+    max_attempts_cooldown_steps: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "When a group is dropped after exhausting attempts, hold its prompt out of normal sampling "
+                "for this many orchestrator steps."
+            ),
+        ),
+    ] = 5
+
+    restart_on_rollout_timeout: Annotated[
+        bool,
+        Field(description="Whether a rollout timeout should trigger a worker restart for local worker pools."),
+    ] = True
+
+    restart_on_worker_health_failure: Annotated[
+        bool,
+        Field(description="Whether failed worker health checks should trigger worker restart."),
+    ] = True
+
+
+class AttemptLoggingConfig(BaseConfig):
+    """Configures append-only rollout attempt logging."""
+
+    enabled: Annotated[
+        bool,
+        Field(description="Whether to write per-rollout attempt JSONL logs."),
+    ] = False
+
+
 class OrchestratorConfig(BaseConfig):
     """Configures the orchestrator for RL training."""
 
@@ -735,6 +817,12 @@ class OrchestratorConfig(BaseConfig):
 
     # Human-readable trace export configuration
     trace_export: TraceExportConfig | None = None
+
+    # Worker recovery for spawned env workers
+    env_worker_recovery: EnvWorkerRecoveryConfig = EnvWorkerRecoveryConfig()
+
+    # Per-rollout attempt logs
+    attempt_logging: AttemptLoggingConfig = AttemptLoggingConfig()
 
     # The wandb configuration
     wandb: WandbWithExtrasConfig | None = None

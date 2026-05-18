@@ -227,6 +227,7 @@ class SFTDataset(StatefulIterableDataset):
             messages = prompt + completion
             loss_mask: list[bool] = []
             prev_ids, prev_len = [], 0
+            prompt_len = len(prompt)
             for i, message in enumerate(messages):
                 assert "role" in message, "Message must have a role"
                 # Support parallel tool call outputs (treat them as one message for loss mask)
@@ -249,7 +250,10 @@ class SFTDataset(StatefulIterableDataset):
                 assert prev_ids == cur_ids[:prev_len], (
                     f"Got mismatch in incremental tokenization with chat template at message {i}. Previous ids: {prev_ids} != {cur_ids[:prev_len]=}.\nDecoded prev_ids:\n{tokenizer.decode(prev_ids)}\nDecoded cur_ids:\n{tokenizer.decode(cur_ids[:prev_len])}"
                 )
-                loss_mask.extend([should_mask(message, loss_mask_config)] * (len(cur_ids) - prev_len))
+                message_mask = should_mask(message, loss_mask_config)
+                if i < prompt_len and not loss_mask_config.train_on_prompt:
+                    message_mask = False
+                loss_mask.extend([message_mask] * (len(cur_ids) - prev_len))
                 prev_ids, prev_len = cur_ids, len(cur_ids)
 
             return loss_mask

@@ -15,7 +15,7 @@ At every depth, you should act as an orchestrator: explore the context, decompos
 3. The code executes in a sandbox. You see stdout, stderr, and return values.
 4. You OBSERVE the results, then write more code based on what you learned.
 5. You iterate until you have a well-grounded answer.
-6. Use `FINAL(value)` or `FINAL_VAR(variable_name)` with your final answer ONLY after observing your analysis results.
+6. Use `FINAL(value)` outside code for literal final answers, or call `FINAL_VAR("variable_name")` inside a ```repl block for final answers stored in REPL variables, ONLY after observing your analysis results.
 
 ## Critical rules
 
@@ -32,8 +32,8 @@ At every depth, you should act as an orchestrator: explore the context, decompos
 - `llm_query(prompt, model=None)` is a single LLM completion, no REPL. Fast and lightweight for simple extraction, summarization, factual Q&A, or classification.
 - `llm_query_batched(prompts, model=None)` runs parallel single-shot LLM queries. Use it for independent text analyses.
 - `rlm_query(prompt, model=None, max_depth=None)` spawns a recursive RLM sub-call. The child agent gets a fresh REPL sandbox, can write code, query LLMs, and iterate until it solves the sub-problem. Use this to delegate complex sub-tasks.
-- `rlm_query_batched(prompts, model=None, max_depth=None)` runs parallel recursive RLM sub-calls. Each child gets a fresh REPL sandbox.
-- `SHOW_VARS()` lists REPL variables you have created. Use it before `FINAL_VAR(...)` if needed.
+- `rlm_query_batched(prompts, model=None, max_depth=None)` runs batched recursive RLM sub-calls. Each child gets a fresh REPL sandbox.
+- `SHOW_VARS()` lists REPL variables you have created. Use it before calling `FINAL_VAR("variable_name")` inside a final ```repl block if needed.
 - `print()` exposes intermediate results for the next iteration.
 
 ## Sandbox constraints
@@ -78,7 +78,7 @@ Child agents may hallucinate. You MUST verify their claims before including them
 
 ### Decomposition patterns
 
-**Parallel analysis by chunk** -- for long context, split into chunks and analyze each independently:
+**Batched child analysis by chunk** -- for long context, split into chunks and analyze each independently:
 ```repl
 chunks = [context[i:i+50000] for i in range(0, len(context), 50000)]
 selected_chunks = chunks[:4]  # inspect/search first, then keep only the most relevant chunks
@@ -117,11 +117,11 @@ print(detail)
 Aim for 4-6 orchestrator iterations total. Make many small, evidence-carrying subcalls when they reduce uncertainty or let independent analyses run in parallel. Let child agents do the searching, but you own the final truth.
 
 ## Answer format
-Finish only with `FINAL(your final answer here)` or `FINAL_VAR(variable_name)`.
+Finish only with either literal `FINAL(your final answer here)` outside code, or a final ```repl block containing `FINAL_VAR("variable_name")`.
 `FINAL(...)` is not a Python function. If you put it inside a ```repl code block, the REPL will try to execute it and fail. Put `FINAL(...)` outside code blocks with the actual final answer inside it; do not write `FINAL(json.dumps(...))` or any other expression that would need to be computed.
 `FINAL(...)` does not look up Python variables. `FINAL(answer)` returns the literal text "answer", not the value of the REPL variable `answer`.
-If your final answer is stored in a REPL variable, create that variable inside a ```repl code block, observe/verify it, then finish with `FINAL_VAR(variable_name)`, not `FINAL(variable_name)`.
-`FINAL_VAR` only works for an already-created REPL variable. Use `SHOW_VARS()` if you are unsure what variables exist.
+If your final answer is stored in a REPL variable, create that variable inside a ```repl code block, observe/verify it, then finish with a final ```repl block containing `FINAL_VAR("variable_name")`, not `FINAL(variable_name)`.
+`FINAL_VAR` only works for an already-created REPL variable and expects the variable name as a string. Use `SHOW_VARS()` if you are unsure what variables exist.
 Ground the answer in evidence you actually observed. Do not include follow-up offers, suggestions for further analysis, or filler.
 """
 )
@@ -138,7 +138,7 @@ Never solve the question entirely yourself. As the orchestrator, your job is to 
 3. The code executes in a sandbox. You see stdout, stderr, and return values.
 4. You OBSERVE the results, then write more code based on what you learned.
 5. You iterate until you have a well-grounded answer.
-6. Use `FINAL(value)` or `FINAL_VAR(variable_name)` with your final answer ONLY after observing your analysis results.
+6. Use `FINAL(value)` outside code for literal final answers, or call `FINAL_VAR("variable_name")` inside a ```repl block for final answers stored in REPL variables, ONLY after observing your analysis results.
 
 ## Critical rules
 
@@ -154,7 +154,7 @@ Never solve the question entirely yourself. As the orchestrator, your job is to 
 - `context` contains the source data provided for the task. Inspect it directly before committing to an approach.
 - `llm_query(prompt, model=None)` is a single LLM completion, no REPL. Fast and lightweight for simple extraction, summarization, factual Q&A, or classification.
 - `llm_query_batched(prompts, model=None)` runs parallel single-shot LLM queries. Use it for independent text analyses.
-- `SHOW_VARS()` lists REPL variables you have created. Use it before `FINAL_VAR(...)` if needed.
+- `SHOW_VARS()` lists REPL variables you have created. Use it before calling `FINAL_VAR("variable_name")` inside a final ```repl block if needed.
 - `print()` exposes intermediate results for the next iteration.
 
 ## Sandbox constraints
@@ -237,11 +237,11 @@ print(detail)
 Aim for 4-6 orchestrator iterations total. Make many small, evidence-carrying subcalls when they reduce uncertainty or let independent analyses run in parallel. Let subcalls do targeted analysis, but you own the final truth.
 
 ## Answer format
-Finish only with `FINAL(your final answer here)` or `FINAL_VAR(variable_name)`.
+Finish only with either literal `FINAL(your final answer here)` outside code, or a final ```repl block containing `FINAL_VAR("variable_name")`.
 `FINAL(...)` is not a Python function. If you put it inside a ```repl code block, the REPL will try to execute it and fail. Put `FINAL(...)` outside code blocks with the actual final answer inside it; do not write `FINAL(json.dumps(...))` or any other expression that would need to be computed.
 `FINAL(...)` does not look up Python variables. `FINAL(answer)` returns the literal text "answer", not the value of the REPL variable `answer`.
-If your final answer is stored in a REPL variable, create that variable inside a ```repl code block, observe/verify it, then finish with `FINAL_VAR(variable_name)`, not `FINAL(variable_name)`.
-`FINAL_VAR` only works for an already-created REPL variable. Use `SHOW_VARS()` if you are unsure what variables exist.
+If your final answer is stored in a REPL variable, create that variable inside a ```repl code block, observe/verify it, then finish with a final ```repl block containing `FINAL_VAR("variable_name")`, not `FINAL(variable_name)`.
+`FINAL_VAR` only works for an already-created REPL variable and expects the variable name as a string. Use `SHOW_VARS()` if you are unsure what variables exist.
 Ground the answer in evidence you actually observed. Do not include follow-up offers, suggestions for further analysis, or filler.
 """
 )

@@ -5,6 +5,7 @@ from datasets import Dataset, interleave_datasets
 from transformers import AutoTokenizer
 
 from prime_rl.trainer.sft.data import SFTDataset
+from prime_rl.configs.sft import LossMaskConfig
 from prime_rl.trainer.utils import print_sample
 
 
@@ -197,6 +198,63 @@ def test_multiturn_loss_mask():
     dataset = SFTDataset(dataset, tokenizer=tokenizer, max_examples=1)
     sample = next(iter(dataset))
     print_sample(sample["input_ids"], sample["loss_mask"], tokenizer)
+
+
+def test_rlm_conversation_masks_repl_feedback_from_loss():
+    dataset = Dataset.from_list(
+        [
+            {
+                "prompt": [{"role": "system", "content": "System"}, {"role": "user", "content": "Question"}],
+                "completion": [
+                    {"role": "assistant", "content": "```repl\nprint('inspect')\n```"},
+                    {"role": "user", "content": "TOOL_OUTPUT_SHOULD_BE_MASKED"},
+                    {"role": "user", "content": "Continue using the REPL."},
+                    {"role": "assistant", "content": "FINAL(42)"},
+                ],
+            }
+        ]
+    )
+    tokenizer = AutoTokenizer.from_pretrained("PrimeIntellect/Qwen3-0.6B")
+    sft_dataset = SFTDataset(dataset, tokenizer=tokenizer, max_examples=1)
+
+    sample = next(iter(sft_dataset))
+    trainable_target_ids = [token for token, mask in zip(sample["target_ids"], sample["loss_mask"]) if mask]
+    trainable_text = tokenizer.decode(trainable_target_ids)
+
+    assert "print" in trainable_text
+    assert "FINAL" in trainable_text
+    assert "TOOL_OUTPUT_SHOULD_BE_MASKED" not in trainable_text
+
+
+def test_prompt_boundary_masking_masks_prior_assistant_turns():
+    dataset = Dataset.from_list(
+        [
+            {
+                "prompt": [
+                    {"role": "system", "content": "System"},
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": "PRIOR_ASSISTANT_ACTION"},
+                    {"role": "user", "content": "REPL_FEEDBACK"},
+                ],
+                "completion": [{"role": "assistant", "content": "NEXT_ASSISTANT_ACTION"}],
+            }
+        ]
+    )
+    tokenizer = AutoTokenizer.from_pretrained("PrimeIntellect/Qwen3-0.6B")
+    sft_dataset = SFTDataset(
+        dataset,
+        tokenizer=tokenizer,
+        max_examples=1,
+        loss_mask_config=LossMaskConfig(assistant=True, train_on_prompt=False),
+    )
+
+    sample = next(iter(sft_dataset))
+    trainable_target_ids = [token for token, mask in zip(sample["target_ids"], sample["loss_mask"]) if mask]
+    trainable_text = tokenizer.decode(trainable_target_ids)
+
+    assert "NEXT_ASSISTANT_ACTION" in trainable_text
+    assert "PRIOR_ASSISTANT_ACTION" not in trainable_text
+    assert "REPL_FEEDBACK" not in trainable_text
 
 
 def test_multiturn_loss_mask_with_tools():

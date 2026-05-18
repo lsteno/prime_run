@@ -13,7 +13,7 @@
 ### Task
 - **Type**: multi-turn
 - **Output format expectations (optional)**: assistant text with optional ```repl``` blocks and a final `FINAL(...)` or `FINAL_VAR(...)` answer.
-- **Rubric overview**: semantic correctness from an LLM judge, with optional token-cost shaping and monitor metrics for recursion usage and depth.
+- **Rubric overview**: exact match plus semantic correctness from an LLM judge, with either backward-compatible static token-cost shaping or adaptive GRPO-group cost shaping. Monitor metrics track recursion, subcalls, depth, token cost, and adaptive penalty state.
 
 ### Quickstart
 Run an evaluation with default settings:
@@ -43,6 +43,8 @@ Notes:
 - The default prompt is `sanjaya_text_v1`. `prompt_variant="default"` is kept as a compatibility alias for the same prompt.
 - Local parquet mode is opt-in: pass `data_paths` explicitly. If `eval_data_paths` is omitted, eval defaults to a deterministic 10% holdout from `data_paths`.
 - `inference_mode = "hosted"` is for managed hosted training. `inference_mode = "local"` is the standard setting for self-managed `prime-rl` runs on on-demand GPUs.
+- Active self-managed configs keep root and recursive RLM generations on local vLLM/Prime GPUs, while routing only non-trainable plain `llm_query*` subcalls to Vertex Gemini Flash-Lite.
+- `llm_query_batched` remains concurrent for external API fanout. `rlm_query_batched` executes recursive child RLM calls serially by default because child calls can run local REPL code and the local REPL mutates process-global cwd/stdout/stderr.
 - In the standard self-managed `prime-rl` path, the launcher handles the local inference base URL and API wiring. You do not need to set `RLM_LOCAL_INFERENCE_BASE_URL` or `RLM_LOCAL_INFERENCE_API_KEY` unless you are overriding the default local server.
 
 ### Environment Arguments
@@ -69,7 +71,12 @@ Notes:
 | `prompt_variant` | `str` | `"sanjaya_text_v1"` | System prompt variant. Supported values: `sanjaya_text_v1`, `default` where `default` is a compatibility alias |
 | `live_trace_dir` | `str \| null` | `"outputs/rlm_rlvr/live_traces"` | Directory for compact per-sample live traces updated after root and recursive steps. Set to `null` to disable |
 | `subcall_prompt_limit_ratio` | `float` | `0.85` | Blocks `llm_query*` and `rlm_query*` prompts whose estimated character size exceeds this fraction of the configured subcall context window, returning a REPL-visible error instead of truncating context |
-| `efficiency_penalty_coef` | `float` | `0.02` | Cost-aware shaping coefficient applied only to correct answers. Incorrect/no-answer rollouts receive `0`; correct rollouts receive `max(0, 1 - efficiency_penalty_coef * (rollout_prompt_tokens + rollout_completion_tokens) / 1000)` |
+| `efficiency_penalty_mode` | `str` | `"static_per_1k"` | Reward shaping mode. Use `"static_per_1k"` for backward-compatible per-1k-token penalty or `"adaptive_group"` for solve-rate-aware group scoring |
+| `efficiency_penalty_coef` | `float` | `0.02` | Static-mode cost-aware shaping coefficient applied only to correct answers. Incorrect/no-answer rollouts receive `0`; correct rollouts receive `max(0, 1 - efficiency_penalty_coef * total_tokens / 1000)` |
+| `adaptive_efficiency_beta_max` | `float` | `0.05` | Maximum adaptive cost coefficient in group mode |
+| `adaptive_efficiency_gamma` | `float` | `2.0` | Exponent for the solve-rate ramp in group mode |
+| `adaptive_efficiency_solve_rate_floor` | `float` | `0.25` | No adaptive cost pressure is applied when group solve rate is at or below this floor |
+| `adaptive_efficiency_cost_basis` | `str` | `"total_tokens"` | Token-cost basis for adaptive group penalty. Currently supports total rollout tokens |
 | `inference_mode` | `str` | `"hosted"` | Inference routing mode. Use `hosted` for managed hosted training and `local` for self-managed `prime-rl` on local or on-demand GPUs |
 | `inference_base_url` | `str \| null` | `null` | Override the OpenAI-compatible inference endpoint. Usually unset for self-managed `prime-rl`, which wires the local inference server automatically |
 | `inference_api_key` | `str \| null` | `null` | Override API key for the inference endpoint. Usually unset for self-managed `prime-rl` local inference |
@@ -78,6 +85,9 @@ Notes:
 | `llm_subcall_vertex_project_env` | `str` | `"GOOGLE_CLOUD_PROJECT"` | Environment variable that stores the Vertex project for plain subcalls |
 | `llm_subcall_vertex_location` | `str \| null` | `"global"` | Vertex location for plain subcalls. Active Gemini 3 configs use `global` |
 | `llm_subcall_thinking_level` | `str \| null` | `"medium"` | Gemini thinking level for plain Vertex subcalls |
+| `llm_subcall_empty_response_max_attempts` | `int` | `1` | Number of attempts for retrying empty Vertex plain-subcall responses |
+| `llm_subcall_empty_response_base_retry_seconds` | `float` | `1.0` | Base exponential-backoff delay for empty plain-subcall retries |
+| `llm_subcall_empty_response_max_retry_seconds` | `float` | `30.0` | Maximum backoff delay for empty plain-subcall retries |
 | `llm_subcall_base_url` | `str \| null` | `null` | OpenAI-compatible plain subcall provider base URL |
 | `llm_subcall_api_key_var` | `str` | `"OPENROUTER_API_KEY"` | Environment variable for OpenAI-compatible plain subcalls |
 | `judge_provider` | `str` | `"openai_compatible"` | Provider for binary semantic judging. Use `"vertex"` for Vertex AI Gemini |
@@ -93,19 +103,26 @@ Notes:
 | `repl_backend_kwargs` | `dict \| null` | `null` | Reserved for future backend-specific kwargs |
 | `repl_timeout_seconds` | `float \| null` | `null` | Optional wall-clock timeout for generated REPL code blocks that call `llm_query*` or `rlm_query*` helpers |
 | `repl_fast_timeout_seconds` | `float \| null` | `null` | Optional shorter wall-clock timeout for generated REPL code blocks with no LLM/RLM subcalls |
+| `recursive_rlm_batch_mode` | `str` | `"serial"` | Execution mode for `rlm_query_batched`. Default `"serial"` avoids local REPL thread-safety hazards; `"thread"` is an explicit advanced override |
 
 ### Metrics
 Summarize key metrics your rubric emits and how they’re interpreted.
 
 | Metric | Meaning |
 | ------ | ------- |
-| `reward` | Zero for incorrect/no-answer rollouts; correct rollouts minus optional token-cost penalty clipped at zero |
+| `reward` | Zero for incorrect/no-answer rollouts; correct rollouts minus optional static or adaptive token-cost penalty clipped at zero |
 | `correctness` | Raw binary judge score before cost shaping |
 | `judge_score` | Binary judge score for observability |
-| `efficiency_penalty` | Token-cost penalty subtracted from reward |
+| `efficiency_penalty` | Static or adaptive token-cost penalty subtracted from reward |
 | `cost_prompt_tokens` | Total prompt tokens consumed across all root turns, recursive turns, and subcalls |
 | `cost_completion_tokens` | Total completion tokens consumed across all root turns, recursive turns, and subcalls |
 | `cost_total_tokens` | Sum of prompt and completion tokens used for cost shaping |
+| `cost_trainable_tokens` | Token count from trainable root/recursive/finalize RLM turns |
+| `cost_plain_subcall_tokens` | Token count from non-trainable plain `llm_query*` subcalls |
+| `adaptive_group_solve_rate` | Within-prompt group correctness rate used by adaptive group mode |
+| `adaptive_beta` | Solve-rate-dependent adaptive cost coefficient |
+| `adaptive_normalized_cost` | Min-max normalized cost among correct rollouts in the group |
+| `adaptive_cost_penalty` | Adaptive cost penalty applied to this rollout |
 | `used_repl` | Fraction of rollouts that executed at least one REPL block |
 | `used_recursion` | Fraction of rollouts that invoked any `llm_query(...)` or `rlm_query(...)` subcall |
 | `used_llm_subcalls` | Fraction of rollouts that used at least one plain `llm_query(...)` subcall |

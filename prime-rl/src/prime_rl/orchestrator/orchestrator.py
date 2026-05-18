@@ -44,6 +44,9 @@ from prime_rl.orchestrator.utils import (
     set_semaphore,
 )
 from prime_rl.orchestrator.vf_utils import (
+    EnvWorkerHandle,
+    EnvWorkerSpec,
+    ManagedEnvClientPool,
     generate,
     get_completion_len,
     get_seq_len,
@@ -194,32 +197,80 @@ async def orchestrate(config: OrchestratorConfig):
             "Rollouts run individually and are scored once each group completes."
         )
 
-    train_env_addresses = []
+    train_env_clients = []
     env_processes: list[mp.Process] = []
     for env_id, env, env_name in zip(env_ids, config.env, train_env_names):
+        worker_clients = []
+        worker_handles = []
+        worker_count = env.worker_count
         if env.address is None:
-            address, process = spawn_env_server(
-                env_id=env_id,
-                env_args=env.args,
-                extra_env_kwargs=env.extra_env_kwargs,
-                log_level="CRITICAL",
-                log_file=(get_log_dir(config.output_dir) / "train" / f"{env_name}.log").as_posix(),
-                log_file_level=config.log.vf_level,
-                json_logging=config.log.json_logging,
-            )
-            env_processes.append(process)
+            worker_addresses = []
+            for worker_idx in range(worker_count):
+                worker_name = env_name if worker_count == 1 else f"{env_name}_w{worker_idx}"
+                log_name = f"{env_name}.log" if worker_count == 1 else f"{env_name}_w{worker_idx}.log"
+                log_file = (get_log_dir(config.output_dir) / "train" / log_name).as_posix()
+                address, process = spawn_env_server(
+                    env_id=env_id,
+                    env_args=env.args,
+                    extra_env_kwargs=env.extra_env_kwargs,
+                    log_level="CRITICAL",
+                    log_file=log_file,
+                    log_file_level=config.log.vf_level,
+                    json_logging=config.log.json_logging,
+                )
+                env_processes.append(process)
+                worker_addresses.append(address)
+                worker_client = setup_env_client(address=address, name=worker_name)
+                worker_clients.append(worker_client)
+                worker_handles.append(
+                    EnvWorkerHandle(
+                        worker_id=worker_idx,
+                        worker_name=worker_name,
+                        address=address,
+                        process=process,
+                        client=worker_client,
+                        spec=EnvWorkerSpec(
+                            env_id=env_id,
+                            env_args=env.args,
+                            extra_env_kwargs=env.extra_env_kwargs,
+                            log_level="CRITICAL",
+                            log_file=log_file,
+                            log_file_level=config.log.vf_level,
+                            json_logging=config.log.json_logging,
+                        ),
+                    )
+                )
         else:
             if env_name in train_env_deferred_group_scoring_tasks:
                 logger.warning(
                     f"Training env {env_name} uses external server at {env.address}. "
                     "Ensure that server was started with score_rollouts=False."
                 )
-            address = env.address
-        logger.info(f"Connecting train environment {env_name} to server at {address}")
-        train_env_addresses.append(address)
-    train_env_clients = [
-        setup_env_client(address=address, name=name) for name, address in zip(train_env_names, train_env_addresses)
-    ]
+            worker_addresses = [env.address]
+            worker_clients.append(setup_env_client(address=env.address, name=env_name))
+        if worker_handles:
+            env_client = ManagedEnvClientPool(worker_handles, name=env_name)
+        elif len(worker_clients) == 1:
+            env_client = worker_clients[0]
+        else:
+            env_client = ManagedEnvClientPool(
+                [
+                    EnvWorkerHandle(
+                        worker_id=worker_idx,
+                        worker_name=f"{env_name}_w{worker_idx}",
+                        address=client.address,
+                        process=None,
+                        client=client,
+                    )
+                    for worker_idx, client in enumerate(worker_clients)
+                ],
+                name=env_name,
+            )
+        logger.info(
+            f"Connecting train environment {env_name} to {len(worker_clients)} worker(s): "
+            f"{', '.join(worker_addresses)}"
+        )
+        train_env_clients.append(env_client)
 
     logger.info("Waiting for train environment servers to be ready")
     await wait_for_env_servers(train_env_clients)
@@ -230,33 +281,82 @@ async def orchestrate(config: OrchestratorConfig):
     for env, env_client in zip(train_env_group.envs, train_env_clients):
         env.env_client = env_client
 
+    eval_env_clients = []
     if config.eval:
         env_ids = [strip_env_version(env.id) for env in config.eval.env]
         eval_envs = [vf.load_environment(env_id, **env.args) for env_id, env in zip(env_ids, config.eval.env)]
         eval_env_names = [env.name or env_id for env_id, env in zip(env_ids, config.eval.env)]
         eval_sampling_args = get_eval_sampling_args(config.eval.sampling)
-        eval_env_addresses = []
 
         for env_id, env, eval_env_name in zip(env_ids, config.eval.env, eval_env_names):
+            worker_clients = []
+            worker_handles = []
+            worker_count = env.worker_count
             if env.address is None:
-                address, process = spawn_env_server(
-                    env_id=env_id,
-                    env_args=env.args,
-                    extra_env_kwargs=env.extra_env_kwargs,
-                    log_level="CRITICAL",
-                    log_file=(get_log_dir(config.output_dir) / "eval" / f"{eval_env_name}.log").as_posix(),
-                    log_file_level=config.log.vf_level,
-                    json_logging=config.log.json_logging,
-                )
-                env_processes.append(process)
+                worker_addresses = []
+                for worker_idx in range(worker_count):
+                    worker_name = eval_env_name if worker_count == 1 else f"{eval_env_name}_w{worker_idx}"
+                    log_name = (
+                        f"{eval_env_name}.log" if worker_count == 1 else f"{eval_env_name}_w{worker_idx}.log"
+                    )
+                    log_file = (get_log_dir(config.output_dir) / "eval" / log_name).as_posix()
+                    address, process = spawn_env_server(
+                        env_id=env_id,
+                        env_args=env.args,
+                        extra_env_kwargs=env.extra_env_kwargs,
+                        log_level="CRITICAL",
+                        log_file=log_file,
+                        log_file_level=config.log.vf_level,
+                        json_logging=config.log.json_logging,
+                    )
+                    env_processes.append(process)
+                    worker_addresses.append(address)
+                    worker_client = setup_env_client(address=address, name=worker_name)
+                    worker_clients.append(worker_client)
+                    worker_handles.append(
+                        EnvWorkerHandle(
+                            worker_id=worker_idx,
+                            worker_name=worker_name,
+                            address=address,
+                            process=process,
+                            client=worker_client,
+                            spec=EnvWorkerSpec(
+                                env_id=env_id,
+                                env_args=env.args,
+                                extra_env_kwargs=env.extra_env_kwargs,
+                                log_level="CRITICAL",
+                                log_file=log_file,
+                                log_file_level=config.log.vf_level,
+                                json_logging=config.log.json_logging,
+                            ),
+                        )
+                    )
             else:
-                address = env.address
-            logger.info(f"Connecting eval environment {eval_env_name} to server at {address}")
-            eval_env_addresses.append(address)
-
-        eval_env_clients = [
-            setup_env_client(address=address, name=name) for name, address in zip(eval_env_names, eval_env_addresses)
-        ]
+                worker_addresses = [env.address]
+                worker_clients.append(setup_env_client(address=env.address, name=eval_env_name))
+            if worker_handles:
+                eval_env_client = ManagedEnvClientPool(worker_handles, name=eval_env_name)
+            elif len(worker_clients) == 1:
+                eval_env_client = worker_clients[0]
+            else:
+                eval_env_client = ManagedEnvClientPool(
+                    [
+                        EnvWorkerHandle(
+                            worker_id=worker_idx,
+                            worker_name=f"{eval_env_name}_w{worker_idx}",
+                            address=client.address,
+                            process=None,
+                            client=client,
+                        )
+                        for worker_idx, client in enumerate(worker_clients)
+                    ],
+                    name=eval_env_name,
+                )
+            logger.info(
+                f"Connecting eval environment {eval_env_name} to {len(worker_clients)} worker(s): "
+                f"{', '.join(worker_addresses)}"
+            )
+            eval_env_clients.append(eval_env_client)
 
         logger.info("Waiting for eval environment servers to be ready")
         await wait_for_env_servers(eval_env_clients)
@@ -864,6 +964,12 @@ async def orchestrate(config: OrchestratorConfig):
 
     # Cancel event loop lag monitor task
     event_loop_lag_monitor_task.cancel()
+
+    # Close environment clients before terminating their worker processes.
+    await asyncio.gather(
+        *(env_client.close() for env_client in [*train_env_clients, *eval_env_clients]),
+        return_exceptions=True,
+    )
 
     # Shutdown env processes
     for process in env_processes:

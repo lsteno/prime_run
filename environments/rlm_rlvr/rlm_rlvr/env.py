@@ -8,7 +8,7 @@ import verifiers as vf
 
 from .dataset import build_datasets
 from .external_rlm import CodeBlock, RLMIteration, build_initial_messages, build_system_prompt, build_user_prompt, find_code_blocks, make_feedback_messages
-from .live_trace import write_live_trace
+from .live_trace import assign_live_trace_suffix, write_live_trace
 from .parsing import extract_final_answer
 from .prompt_variants import DEFAULT_PROMPT_VARIANT, PROMPT_VARIANTS
 from .repl import create_repl
@@ -66,13 +66,19 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             "subcall_budget_remaining": int(state.get("subcall_budget_remaining", 0)),
             "subcall_budget_exhausted": bool(state.get("subcall_budget_exhausted", False)),
             "final_answer": state.get("final_answer"),
+            "used_forced_finalize_prompt": bool(state.get("used_forced_finalize_prompt", False)),
+            "hit_max_turn_without_final": bool(state.get("hit_max_turn_without_final", False)),
+            "missing_final": bool(state.get("missing_final", False)),
+            "finalized_before_forced_prompt": bool(state.get("finalized_before_forced_prompt", False)),
+            "finalized_on_forced_prompt": bool(state.get("finalized_on_forced_prompt", False)),
             "sample_metadata": self._sample_metadata(state.get("info") or {}),
             "trace": state.get("rlm_trace") or [],
             "segments": state.get("rlm_segments") or [],
         }
 
     def __init__(self, *, runtime_config: RuntimeConfig, **kwargs):
-        super().__init__(max_turns=runtime_config.max_iterations + 1, interleaved_rollouts=True, **kwargs)
+        # max_iterations normal turns + one forced-finalize prompt/response pair.
+        super().__init__(max_turns=runtime_config.max_iterations + 2, interleaved_rollouts=True, **kwargs)
         self.runtime_config = runtime_config
 
     async def setup_state(self, state: vf.State) -> vf.State:
@@ -87,6 +93,11 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         model_name = str(state["model"])
 
         state["efficiency_penalty_coef"] = getattr(self, "efficiency_penalty_coef", 0.02)
+        state["efficiency_penalty_mode"] = getattr(self, "efficiency_penalty_mode", "static_per_1k")
+        state["adaptive_efficiency_beta_max"] = getattr(self, "adaptive_efficiency_beta_max", 0.05)
+        state["adaptive_efficiency_gamma"] = getattr(self, "adaptive_efficiency_gamma", 2.0)
+        state["adaptive_efficiency_solve_rate_floor"] = getattr(self, "adaptive_efficiency_solve_rate_floor", 0.25)
+        state["adaptive_efficiency_cost_basis"] = getattr(self, "adaptive_efficiency_cost_basis", "total_tokens")
         state["used_repl"] = False
         state["used_recursion"] = False
         state["used_llm_subcalls"] = False
@@ -113,8 +124,14 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         state["current_parent_call_id"] = None
         state["current_branch_max_depth"] = self.runtime_config.max_depth
         state["final_answer"] = None
+        state["used_forced_finalize_prompt"] = False
+        state["hit_max_turn_without_final"] = False
+        state["missing_final"] = False
+        state["finalized_before_forced_prompt"] = False
+        state["finalized_on_forced_prompt"] = False
         state["prompt_variant"] = self.runtime_config.prompt_variant
         state["live_trace_dir"] = self.runtime_config.live_trace_dir
+        assign_live_trace_suffix(state)
         state["sampling_temperature"] = float((state.get("sampling_args") or {}).get("temperature", self.runtime_config.temperature))
 
         state["_sync_session"] = SyncInferenceSession(
@@ -287,13 +304,26 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             write_live_trace(state, event="root_step")
 
         if state.get("final_answer") is not None:
+            if state.get("used_forced_finalize_prompt"):
+                state["finalized_on_forced_prompt"] = True
+            else:
+                state["finalized_before_forced_prompt"] = True
             self._attach_debug_payload(state)
             write_live_trace(state, event="root_complete")
             state["final_env_response"] = []
             return []
 
         next_iteration = len(state["trajectory"])
+        if state.get("used_forced_finalize_prompt"):
+            state["hit_max_turn_without_final"] = True
+            state["missing_final"] = True
+            self._attach_debug_payload(state)
+            write_live_trace(state, event="root_missing_final")
+            state["final_env_response"] = []
+            return []
+
         if next_iteration >= self.runtime_config.max_iterations:
+            state["used_forced_finalize_prompt"] = True
             next_message = {"role": "user", "content": runtime.build_finalize_message()}
         else:
             next_message = build_user_prompt(
@@ -361,10 +391,19 @@ def load_environment(
     judge_vertex_project_env: str = "GOOGLE_CLOUD_PROJECT",
     judge_vertex_location: str | None = "global",
     judge_thinking_level: str | None = "medium",
+    efficiency_penalty_mode: str = "static_per_1k",
+    adaptive_efficiency_beta_max: float = 0.05,
+    adaptive_efficiency_gamma: float = 2.0,
+    adaptive_efficiency_solve_rate_floor: float = 0.25,
+    adaptive_efficiency_cost_basis: str = "total_tokens",
+    max_turn_penalty_enabled: bool = False,
+    max_turn_penalty: float = 0.25,
+    missing_final_at_max_turn_zero_reward: bool = True,
     repl_backend: str = "local",
     repl_backend_kwargs: dict[str, Any] | None = None,
     repl_timeout_seconds: float | None = None,
     repl_fast_timeout_seconds: float | None = None,
+    recursive_rlm_batch_mode: str = "serial",
 ) -> vf.Environment:
     if max_iterations < 1:
         raise ValueError("max_iterations must be >= 1")
@@ -396,6 +435,20 @@ def load_environment(
         raise ValueError("temperature must be >= 0.0")
     if prompt_variant not in PROMPT_VARIANTS:
         raise ValueError(f"prompt_variant must be one of {sorted(PROMPT_VARIANTS)}")
+    valid_efficiency_penalty_modes = {"static_per_1k", "adaptive_group"}
+    if efficiency_penalty_mode not in valid_efficiency_penalty_modes:
+        raise ValueError(f"efficiency_penalty_mode must be one of {sorted(valid_efficiency_penalty_modes)}")
+    if adaptive_efficiency_beta_max < 0.0:
+        raise ValueError("adaptive_efficiency_beta_max must be >= 0.0")
+    if adaptive_efficiency_gamma <= 0.0:
+        raise ValueError("adaptive_efficiency_gamma must be > 0.0")
+    if not 0.0 <= adaptive_efficiency_solve_rate_floor < 1.0:
+        raise ValueError("adaptive_efficiency_solve_rate_floor must be >= 0.0 and < 1.0")
+    valid_adaptive_cost_bases = {"total_tokens"}
+    if adaptive_efficiency_cost_basis not in valid_adaptive_cost_bases:
+        raise ValueError(f"adaptive_efficiency_cost_basis must be one of {sorted(valid_adaptive_cost_bases)}")
+    if max_turn_penalty < 0.0:
+        raise ValueError("max_turn_penalty must be >= 0.0")
 
     valid_api_providers = {"openai_compatible", "vertex"}
     if llm_subcall_provider not in valid_api_providers:
@@ -410,6 +463,10 @@ def load_environment(
     valid_repl_backends = {"local"}
     if repl_backend not in valid_repl_backends:
         raise ValueError("rlm_rlvr currently supports only local REPL execution.")
+    recursive_rlm_batch_mode = recursive_rlm_batch_mode.lower()
+    valid_recursive_rlm_batch_modes = {"serial", "thread"}
+    if recursive_rlm_batch_mode not in valid_recursive_rlm_batch_modes:
+        raise ValueError(f"recursive_rlm_batch_mode must be one of {sorted(valid_recursive_rlm_batch_modes)}")
 
     if inference_base_url is None:
         if inference_mode == "local":
@@ -504,6 +561,7 @@ def load_environment(
         max_total_subcalls=max_total_subcalls,
         max_batched_subcalls=max_batched_subcalls,
         include_budget_reminder=include_budget_reminder,
+        recursive_rlm_batch_mode=recursive_rlm_batch_mode,
     )
     system_prompt = build_system_prompt(
         depth=0,
@@ -526,6 +584,14 @@ def load_environment(
         judge_vertex_project=os.environ.get(judge_vertex_project_env) if judge_provider == "vertex" else None,
         judge_vertex_location=judge_vertex_location or os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
         judge_thinking_level=judge_thinking_level,
+        efficiency_penalty_mode=efficiency_penalty_mode,
+        adaptive_efficiency_beta_max=adaptive_efficiency_beta_max,
+        adaptive_efficiency_gamma=adaptive_efficiency_gamma,
+        adaptive_efficiency_solve_rate_floor=adaptive_efficiency_solve_rate_floor,
+        adaptive_efficiency_cost_basis=adaptive_efficiency_cost_basis,
+        max_turn_penalty_enabled=max_turn_penalty_enabled,
+        max_turn_penalty=max_turn_penalty,
+        missing_final_at_max_turn_zero_reward=missing_final_at_max_turn_zero_reward,
     )
     add_metrics(reward_rubric)
     return RLMRLVREnv(
@@ -535,5 +601,13 @@ def load_environment(
         rubric=reward_rubric,
         runtime_config=runtime_config,
         efficiency_penalty_coef=efficiency_penalty_coef,
+        efficiency_penalty_mode=efficiency_penalty_mode,
+        adaptive_efficiency_beta_max=adaptive_efficiency_beta_max,
+        adaptive_efficiency_gamma=adaptive_efficiency_gamma,
+        adaptive_efficiency_solve_rate_floor=adaptive_efficiency_solve_rate_floor,
+        adaptive_efficiency_cost_basis=adaptive_efficiency_cost_basis,
+        max_turn_penalty_enabled=max_turn_penalty_enabled,
+        max_turn_penalty=max_turn_penalty,
+        missing_final_at_max_turn_zero_reward=missing_final_at_max_turn_zero_reward,
         env_id="rlm_rlvr",
     )

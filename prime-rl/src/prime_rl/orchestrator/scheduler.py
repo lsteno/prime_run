@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
-from typing import NamedTuple, cast
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from typing import Any, cast
+from uuid import uuid4
 
 import verifiers as vf
 from aiolimiter import AsyncLimiter
@@ -12,7 +15,12 @@ from aiolimiter import AsyncLimiter
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.buffer import Buffer
 from prime_rl.orchestrator.utils import get_sampling_args
-from prime_rl.orchestrator.vf_utils import get_seq_len, run_rollout
+from prime_rl.orchestrator.vf_utils import (
+    EnvWorkerReservation,
+    ManagedEnvClientPool,
+    get_seq_len,
+    run_rollout,
+)
 from prime_rl.utils.async_utils import safe_cancel, safe_cancel_all
 from prime_rl.utils.client import InferencePool
 from prime_rl.utils.logger import ProgressTracker, get_logger
@@ -25,13 +33,29 @@ from prime_rl.utils.utils import (
 )
 
 
-class InflightRolloutInfo(NamedTuple):
+@dataclass(frozen=True)
+class InflightRolloutInfo:
     """Metadata for an in-flight request."""
 
     off_policy_steps: int
     client_config: vf.ClientConfig
     task: str
     group_id: int | None = None
+    attempt_id: str | None = None
+    slot_index: int | None = None
+    attempt_number: int = 1
+    worker_id: int | None = None
+    worker_generation: int | None = None
+    env_worker_name: str | None = None
+    env_address: str | None = None
+    source_id: str | None = None
+    example_id: int | None = None
+    dataset_name: str | None = None
+    start_time_perf: float = 0.0
+    start_time_iso: str | None = None
+    reschedule_count: int = 0
+    policy_ckpt_step: int = 0
+    worker_reservation: EnvWorkerReservation | None = None
 
 
 @dataclass
@@ -39,8 +63,10 @@ class GroupState:
     """Tracks the state of a rollout group (one example × N rollouts)."""
 
     example: dict
-    rollouts_to_schedule: int
-    completed_rollouts: list[vf.RolloutOutput] = field(default_factory=list)
+    pending_slots: deque[int]
+    completed_rollouts: dict[int, vf.RolloutOutput] = field(default_factory=dict)
+    attempts_by_slot: dict[int, int] = field(default_factory=dict)
+    dropped: bool = False
     pinned_client: vf.ClientConfig | None = None
 
 
@@ -117,6 +143,16 @@ class Scheduler:
         self.timeout_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.total_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.last_batch_generation_time = 0.0
+        self.current_phase = "train"
+        self.attempt_duration_seconds: list[float] = []
+        self.attempt_timeouts = 0
+        self.attempt_reschedules = 0
+        self.attempt_group_drops = 0
+        self.attempts_by_task: dict[str, int] = defaultdict(int)
+        self.attempt_timeouts_by_task: dict[str, int] = defaultdict(int)
+        self.attempt_drops_by_task: dict[str, int] = defaultdict(int)
+        self.worker_restart_count = 0
+        self.worker_restart_count_by_name: dict[str, int] = defaultdict(int)
 
     @property
     def uses_token_batching(self) -> bool:
@@ -147,6 +183,8 @@ class Scheduler:
     async def cancel_inflight_rollouts(self):
         """Cancel all in-flight rollout requests."""
         count = len(self.inflight_requests)
+        for info in list(self.inflight_requests.values()):
+            await self._release_worker_reservation(info)
         await safe_cancel_all(list(self.inflight_requests))
         self.inflight_requests.clear()
         self.groups.clear()
@@ -169,15 +207,104 @@ class Scheduler:
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
         return min(clients, key=lambda c: inflight[self._client_identity(c)])
 
-    async def drop_group(self, group_id: int) -> int:
+    def _source_id(self, example: dict) -> str | None:
+        info = example.get("info") or {}
+        for key in ("source_id", "id", "row_id"):
+            if key in example:
+                return str(example[key])
+            if key in info:
+                return str(info[key])
+        return None
+
+    def _dataset_name(self, example: dict) -> str | None:
+        info = example.get("info") or {}
+        for key in ("dataset", "dataset_name", "source_dataset"):
+            if key in example:
+                return str(example[key])
+            if key in info:
+                return str(info[key])
+        return None
+
+    def _attempt_log_path(self, step: int) -> Any:
+        return self.config.output_dir / "attempts" / self.current_phase / f"step_{step:06d}.jsonl"
+
+    def _log_attempt_event(self, event: str, payload: dict[str, Any]) -> None:
+        if not self.config.attempt_logging.enabled:
+            return
+        record = {"event": event, **payload}
+        path = self._attempt_log_path(int(payload.get("step", self.step)))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as handle:
+            handle.write(json.dumps(record, default=str) + "\n")
+
+    @staticmethod
+    def _rollout_protocol_stats(rollout: vf.RolloutOutput) -> dict[str, Any]:
+        metrics = rollout.get("metrics") or {}
+        token_usage = rollout.get("token_usage") or {}
+        return {
+            "token_usage": token_usage,
+            "used_repl": rollout.get("used_repl", metrics.get("used_repl")),
+            "used_llm_subcalls": rollout.get("used_llm_subcalls", metrics.get("used_llm_subcalls")),
+            "num_llm_subcalls": rollout.get("num_llm_subcalls", metrics.get("num_llm_subcalls")),
+            "used_rlm_subcalls": rollout.get("used_rlm_subcalls", metrics.get("used_rlm_subcalls")),
+            "num_rlm_subcalls": rollout.get("num_rlm_subcalls", metrics.get("num_rlm_subcalls")),
+            "max_depth_reached": rollout.get("max_depth_reached", metrics.get("max_depth_reached")),
+        }
+
+    async def _release_worker_reservation(self, info: InflightRolloutInfo) -> None:
+        if info.worker_reservation is not None:
+            await info.worker_reservation.release()
+
+    def _get_env_worker_pool(self, task: str) -> ManagedEnvClientPool | None:
+        try:
+            env_for_task = self.env.get_env_for_task(task)
+        except Exception:
+            env_for_task = self.env
+        env_client = getattr(env_for_task, "env_client", None)
+        if isinstance(env_client, ManagedEnvClientPool):
+            return env_client
+        return None
+
+    @staticmethod
+    def _percentile(values: list[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        idx = min(len(ordered) - 1, max(0, int(round((percentile / 100.0) * (len(ordered) - 1)))))
+        return ordered[idx]
+
+    async def drop_group(self, group_id: int, *, step: int | None = None, reason: str | None = None) -> int:
         """Drop a group and cancel any remaining in-flight rollouts for it."""
         tasks_to_cancel = []
+        group = self.groups.pop(group_id, None)
+        if group is not None:
+            group.dropped = True
+            if step is not None and self.config.env_worker_recovery.enabled:
+                self.buffer.put_example_on_hard_cooldown(
+                    group.example,
+                    step=step,
+                    cooldown_steps=self.config.env_worker_recovery.max_attempts_cooldown_steps,
+                )
+                self._log_attempt_event(
+                    "group_dropped",
+                    {
+                        "phase": self.current_phase,
+                        "step": step,
+                        "group_id": group_id,
+                        "source_id": self._source_id(group.example),
+                        "example_id": group.example.get("example_id"),
+                        "dataset_name": self._dataset_name(group.example),
+                        "task": group.example.get("task"),
+                        "reason": reason or "group_dropped",
+                        "group_completed_count": len(group.completed_rollouts),
+                    },
+                )
         for task, info in list(self.inflight_requests.items()):
             if info.group_id != group_id:
                 continue
             self.inflight_requests.pop(task, None)
+            await self._release_worker_reservation(info)
             tasks_to_cancel.append(task)
-        self.groups.pop(group_id, None)
         await safe_cancel_all(tasks_to_cancel)
         return len(tasks_to_cancel)
 
@@ -186,9 +313,11 @@ class Scheduler:
         if self.rate_limiter:
             await self.rate_limiter.acquire()
         group = self.groups.get(group_id)
-        if group is None or group.rollouts_to_schedule <= 0:
+        if group is None or group.dropped or not group.pending_slots:
             return
-        group.rollouts_to_schedule -= 1
+        slot_index = group.pending_slots.popleft()
+        attempt_number = group.attempts_by_slot.get(slot_index, 0) + 1
+        group.attempts_by_slot[slot_index] = attempt_number
         if group.pinned_client is not None:
             client_config = group.pinned_client
         else:
@@ -196,6 +325,62 @@ class Scheduler:
             if group_id not in self.groups:
                 return
             group.pinned_client = client_config
+        worker_pool = self._get_env_worker_pool(group.example["task"])
+        worker_reservation = None
+        worker_token = None
+        if self.config.env_worker_recovery.enabled and worker_pool is not None:
+            worker_reservation = await worker_pool.reserve_worker()
+            worker_token = worker_pool.activate_reservation(worker_reservation)
+        attempt_id = uuid4().hex
+        start_time_perf = time.perf_counter()
+        start_time_iso = datetime.now(UTC).isoformat()
+        info = InflightRolloutInfo(
+            off_policy_steps=0,
+            client_config=client_config,
+            task=group.example["task"],
+            group_id=group_id,
+            attempt_id=attempt_id,
+            slot_index=slot_index,
+            attempt_number=attempt_number,
+            worker_id=worker_reservation.worker_id if worker_reservation else None,
+            worker_generation=worker_reservation.worker_generation if worker_reservation else None,
+            env_worker_name=worker_reservation.worker_name if worker_reservation else None,
+            env_address=worker_reservation.address if worker_reservation else None,
+            source_id=self._source_id(group.example),
+            example_id=group.example.get("example_id"),
+            dataset_name=self._dataset_name(group.example),
+            start_time_perf=start_time_perf,
+            start_time_iso=start_time_iso,
+            reschedule_count=max(0, attempt_number - 1),
+            policy_ckpt_step=self.ckpt_step,
+            worker_reservation=worker_reservation,
+        )
+        self._log_attempt_event(
+            "attempt_started",
+            {
+                "attempt_id": attempt_id,
+                "phase": self.current_phase,
+                "step": self.step,
+                "group_id": group_id,
+                "slot_index": slot_index,
+                "attempt_number": attempt_number,
+                "source_id": info.source_id,
+                "example_id": info.example_id,
+                "dataset_name": info.dataset_name,
+                "task": info.task,
+                "worker_id": info.worker_id,
+                "worker_name": info.env_worker_name,
+                "worker_generation": info.worker_generation,
+                "env_address": info.env_address,
+                "inference_client": self._client_identity(client_config),
+                "policy_ckpt_step": info.policy_ckpt_step,
+                "off_policy_steps_at_start": info.off_policy_steps,
+                "start_time_iso": start_time_iso,
+                "timeout_seconds": self.config.rollout_timeout_seconds,
+                "reschedule_count": info.reschedule_count,
+                "group_completed_count": len(group.completed_rollouts),
+            },
+        )
         run_rollout_task = asyncio.create_task(
             run_rollout(
                 env=self.env,
@@ -207,9 +392,9 @@ class Scheduler:
                 rollout_timeout_seconds=self.config.rollout_timeout_seconds,
             )
         )
-        self.inflight_requests[run_rollout_task] = InflightRolloutInfo(
-            off_policy_steps=0, client_config=client_config, task=group.example["task"], group_id=group_id
-        )
+        if worker_pool is not None and worker_token is not None:
+            worker_pool.reset_active_reservation(worker_token)
+        self.inflight_requests[run_rollout_task] = info
 
     @property
     def inflight_rollout_count(self) -> int:
@@ -217,7 +402,7 @@ class Scheduler:
 
     @property
     def inflight_sample_count(self) -> int:
-        return self.inflight_rollout_count + sum(g.rollouts_to_schedule for g in self.groups.values())
+        return self.inflight_rollout_count + sum(len(g.pending_slots) for g in self.groups.values())
 
     async def _schedule_next_request(self) -> bool:
         remaining_capacity = self.max_inflight_rollouts - self.inflight_rollout_count
@@ -226,14 +411,14 @@ class Scheduler:
             return False
 
         for group_id, group in self.groups.items():
-            if group.rollouts_to_schedule > 0:
+            if group.pending_slots and not group.dropped:
                 await self.schedule_rollout(group_id=group_id)
                 return True
 
         example = self.buffer.sample_examples(n=1)[0]
         group_id = self.next_group_id
         self.next_group_id += 1
-        self.groups[group_id] = GroupState(example=example, rollouts_to_schedule=self.rollouts_per_example)
+        self.groups[group_id] = GroupState(example=example, pending_slots=deque(range(self.rollouts_per_example)))
         await self.schedule_rollout(group_id=group_id)
         return True
 
@@ -307,7 +492,7 @@ class Scheduler:
             info = self.inflight_requests.get(task)
             if info is None:
                 continue
-            self.inflight_requests[task] = info._replace(off_policy_steps=info.off_policy_steps + 1)
+            self.inflight_requests[task] = replace(info, off_policy_steps=info.off_policy_steps + 1)
 
         self.cancelled_rollouts_count += removed
         if removed:
@@ -329,6 +514,185 @@ class Scheduler:
         await env_for_task.rubric.score_group(cast(list[vf.State], completed_rollouts))
         return completed_rollouts
 
+    async def _cancel_inflight_for_worker_generation(
+        self,
+        *,
+        worker_id: int,
+        worker_generation: int,
+        step: int,
+        reason: str,
+    ) -> int:
+        tasks_to_cancel = []
+        affected_infos: list[InflightRolloutInfo] = []
+        for task, info in list(self.inflight_requests.items()):
+            if info.worker_id != worker_id or info.worker_generation != worker_generation:
+                continue
+            self.inflight_requests.pop(task, None)
+            tasks_to_cancel.append(task)
+            affected_infos.append(info)
+            await self._release_worker_reservation(info)
+
+        for info in affected_infos:
+            self._log_attempt_finished(info, step=step, status="cancelled_for_worker_restart")
+            await self._reschedule_or_drop_slot(info, step=step, reason=reason, count_as_reschedule=True)
+
+        await safe_cancel_all(tasks_to_cancel)
+        return len(tasks_to_cancel)
+
+    async def _restart_worker_for_timeout(self, info: InflightRolloutInfo, step: int) -> None:
+        if (
+            not self.config.env_worker_recovery.enabled
+            or not self.config.env_worker_recovery.restart_on_rollout_timeout
+            or info.worker_id is None
+            or info.worker_generation is None
+        ):
+            return
+        worker_pool = self._get_env_worker_pool(info.task)
+        if worker_pool is None:
+            return
+
+        self.worker_restart_count += 1
+        if info.env_worker_name:
+            self.worker_restart_count_by_name[info.env_worker_name] += 1
+        self._log_attempt_event(
+            "worker_restart_started",
+            {
+                "phase": self.current_phase,
+                "step": step,
+                "worker_id": info.worker_id,
+                "worker_name": info.env_worker_name,
+                "worker_generation": info.worker_generation,
+                "env_address": info.env_address,
+                "reason": "rollout_timeout",
+            },
+        )
+        await self._cancel_inflight_for_worker_generation(
+            worker_id=info.worker_id,
+            worker_generation=info.worker_generation,
+            step=step,
+            reason="worker_restart",
+        )
+        try:
+            handle = await worker_pool.restart_worker(
+                worker_id=info.worker_id,
+                expected_generation=info.worker_generation,
+                reason="rollout_timeout",
+                cancel_grace_seconds=self.config.env_worker_recovery.cancel_grace_seconds,
+            )
+            self._log_attempt_event(
+                "worker_restart_finished",
+                {
+                    "phase": self.current_phase,
+                    "step": step,
+                    "worker_id": info.worker_id,
+                    "worker_name": info.env_worker_name,
+                    "old_worker_generation": info.worker_generation,
+                    "worker_generation": handle.generation if handle is not None else info.worker_generation,
+                    "env_address": handle.address if handle is not None else info.env_address,
+                    "status": "success" if handle is not None else "skipped",
+                    "reason": "rollout_timeout",
+                },
+            )
+        except Exception as exc:
+            self._log_attempt_event(
+                "worker_restart_finished",
+                {
+                    "phase": self.current_phase,
+                    "step": step,
+                    "worker_id": info.worker_id,
+                    "worker_name": info.env_worker_name,
+                    "old_worker_generation": info.worker_generation,
+                    "env_address": info.env_address,
+                    "status": "error",
+                    "error": repr(exc),
+                    "reason": "rollout_timeout",
+                },
+            )
+            self.logger.warning(f"Failed to restart env worker {info.env_worker_name}: {exc!r}")
+
+    async def _reschedule_or_drop_slot(
+        self,
+        info: InflightRolloutInfo,
+        *,
+        step: int,
+        reason: str,
+        count_as_reschedule: bool,
+    ) -> None:
+        if info.group_id is None or info.slot_index is None:
+            return
+        group = self.groups.get(info.group_id)
+        if group is None or group.dropped:
+            return
+        max_attempts = self.config.env_worker_recovery.max_rollout_attempts_per_slot
+        if info.attempt_number >= max_attempts:
+            self.attempt_group_drops += 1
+            self.attempt_drops_by_task[info.task] += 1
+            await self.drop_group(info.group_id, step=step, reason=f"{reason}:max_attempts_exceeded")
+            self.logger.warning(
+                f"Dropped group {info.group_id} ({info.task}) after slot {info.slot_index} reached "
+                f"{info.attempt_number}/{max_attempts} attempts; example is cooling down for "
+                f"{self.config.env_worker_recovery.max_attempts_cooldown_steps} step(s)."
+            )
+            return
+        if info.slot_index not in group.pending_slots and info.slot_index not in group.completed_rollouts:
+            group.pending_slots.appendleft(info.slot_index)
+        if count_as_reschedule:
+            self.attempt_reschedules += 1
+
+    def _log_attempt_finished(
+        self,
+        info: InflightRolloutInfo,
+        *,
+        step: int,
+        status: str,
+        rollout: vf.RolloutOutput | None = None,
+        error: str | None = None,
+    ) -> None:
+        end_time_perf = time.perf_counter()
+        duration_s = max(0.0, end_time_perf - info.start_time_perf)
+        if status == "success":
+            self.attempt_duration_seconds.append(duration_s)
+        if status == "timeout":
+            self.attempt_timeouts += 1
+            self.attempt_timeouts_by_task[info.task] += 1
+        self.attempts_by_task[info.task] += 1
+        payload = {
+            "attempt_id": info.attempt_id,
+            "phase": self.current_phase,
+            "step": step,
+            "group_id": info.group_id,
+            "slot_index": info.slot_index,
+            "attempt_number": info.attempt_number,
+            "source_id": info.source_id,
+            "example_id": info.example_id,
+            "dataset_name": info.dataset_name,
+            "task": info.task,
+            "worker_id": info.worker_id,
+            "worker_name": info.env_worker_name,
+            "worker_generation": info.worker_generation,
+            "env_address": info.env_address,
+            "inference_client": self._client_identity(info.client_config),
+            "policy_ckpt_step": info.policy_ckpt_step,
+            "off_policy_steps_at_start": 0,
+            "off_policy_steps_at_end": info.off_policy_steps,
+            "start_time_iso": info.start_time_iso,
+            "end_time_iso": datetime.now(UTC).isoformat(),
+            "duration_ms": duration_s * 1000.0,
+            "timeout_seconds": self.config.rollout_timeout_seconds,
+            "status": status,
+            "stop_condition": rollout.get("stop_condition") if rollout is not None else None,
+            "error": error,
+            "reschedule_count": info.reschedule_count,
+            "group_completed_count": (
+                len(self.groups[info.group_id].completed_rollouts)
+                if info.group_id is not None and info.group_id in self.groups
+                else None
+            ),
+        }
+        if rollout is not None:
+            payload.update(self._rollout_protocol_stats(rollout))
+        self._log_attempt_event("attempt_finished", payload)
+
     async def generate_batch(self, step: int) -> list[vf.RolloutOutput]:
         """Continuously generates a batch of rollouts."""
         self.step = step
@@ -345,6 +709,7 @@ class Scheduler:
         batch_start_time = time.perf_counter()
 
         self.logger.debug("Starting to generate batch rollouts")
+        self.buffer.release_due_hard_examples(step)
 
         batch_rollouts: list[vf.RolloutOutput] = []
         batch_progress = 0
@@ -369,6 +734,7 @@ class Scheduler:
                 rollout_info = self.inflight_requests.pop(finished_task, None)
                 if rollout_info is None:
                     continue
+                await self._release_worker_reservation(rollout_info)
 
                 group_id = rollout_info.group_id
 
@@ -385,11 +751,20 @@ class Scheduler:
                         self.timeout_rollouts_by_task[task] += 1
                         self.empty_rollouts_by_task[task] += int(len(rollout["trajectory"]) == 0)
                         self.errored_rollouts_by_task[task] += int(rollout["error"] is not None)
-                        group.rollouts_to_schedule += 1
+                        self._log_attempt_finished(rollout_info, step=step, status="timeout", rollout=rollout)
+                        await self._restart_worker_for_timeout(rollout_info, step=step)
+                        await self._reschedule_or_drop_slot(
+                            rollout_info,
+                            step=step,
+                            reason="rollout_timeout",
+                            count_as_reschedule=True,
+                        )
                         self.logger.warning(
                             f"Rollout timeout in group {group_id} ({task}) after "
                             f"{self.config.rollout_timeout_seconds}s, re-scheduling "
-                            f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete)"
+                            f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete, "
+                            f"attempt {rollout_info.attempt_number}/"
+                            f"{self.config.env_worker_recovery.max_rollout_attempts_per_slot})"
                         )
                         continue
                     if len(rollout["trajectory"]) == 0:
@@ -408,13 +783,22 @@ class Scheduler:
                             f"{rollout['error']['error_chain_repr']}"
                         )
                     if should_reschedule:
-                        group.rollouts_to_schedule += 1
+                        self._log_attempt_finished(rollout_info, step=step, status="rescheduled", rollout=rollout)
+                        await self._reschedule_or_drop_slot(
+                            rollout_info,
+                            step=step,
+                            reason="empty_or_error",
+                            count_as_reschedule=True,
+                        )
                         continue
 
-                    group.completed_rollouts.append(rollout)
+                    self._log_attempt_finished(rollout_info, step=step, status="success", rollout=rollout)
+                    assert rollout_info.slot_index is not None
+                    group.completed_rollouts[rollout_info.slot_index] = rollout
                     if len(group.completed_rollouts) < self.rollouts_per_example:
                         continue
-                    completed_rollouts = self.groups.pop(group_id).completed_rollouts
+                    completed_by_slot = self.groups.pop(group_id).completed_rollouts
+                    completed_rollouts = [completed_by_slot[idx] for idx in sorted(completed_by_slot)]
                     completed_rollouts = await self._score_group_if_deferred(completed_rollouts)
                 except asyncio.CancelledError:
                     if group_id is not None:
@@ -422,11 +806,12 @@ class Scheduler:
                     continue
                 except Exception as e:
                     self.logger.warning(f"Rollout failed: {e}")
+                    self._log_attempt_finished(rollout_info, step=step, status="error", error=repr(e))
                     if group_id is not None:
                         await self.drop_group(group_id)
                     continue
 
-                self.buffer.update(completed_rollouts)
+                self.buffer.update(completed_rollouts, step=step)
                 accepted_rollouts = self.buffer.sample_rollouts(n=self.rollouts_per_example)
 
                 batch_rollouts.extend(accepted_rollouts)
@@ -474,6 +859,7 @@ class Scheduler:
 
     def get_metrics(self) -> dict[str, float]:
         total_rollouts = sum(self.total_rollouts_by_task.values())
+        total_attempts = max(sum(self.attempts_by_task.values()), 1)
         metrics = {
             "time/wait_for_ckpt": self.wait_for_ckpt_time,
             "time/update_weights": self.update_weights_time,
@@ -487,6 +873,18 @@ class Scheduler:
             "off_policy_level/all/max": self.max_off_policy_level,
             "off_policy_level/all/mean": self.mean_off_policy_level,
             "off_policy_level/all/min": self.min_off_policy_level,
+            "attempt/duration_s/mean": (
+                sum(self.attempt_duration_seconds) / len(self.attempt_duration_seconds)
+                if self.attempt_duration_seconds
+                else 0.0
+            ),
+            "attempt/duration_s/p95": self._percentile(self.attempt_duration_seconds, 95),
+            "attempt/duration_s/p99": self._percentile(self.attempt_duration_seconds, 99),
+            "attempt/duration_s/p998": self._percentile(self.attempt_duration_seconds, 99.8),
+            "attempt/timeout_rate": self.attempt_timeouts / total_attempts,
+            "attempt/reschedule_rate": self.attempt_reschedules / total_attempts,
+            "attempt/group_drop_rate": self.attempt_group_drops / total_attempts,
+            "worker/restart_count": self.worker_restart_count,
         }
         for task, count in self.empty_rollouts_by_task.items():
             task_total = max(self.total_rollouts_by_task[task], 1)
@@ -497,6 +895,14 @@ class Scheduler:
         for task, count in self.timeout_rollouts_by_task.items():
             task_total = max(self.total_rollouts_by_task[task], 1)
             metrics[f"timeout_rollouts/{task}"] = count / task_total
+        for task, count in self.attempt_timeouts_by_task.items():
+            task_total = max(self.attempts_by_task[task], 1)
+            metrics[f"attempt/timeout_rate/{task}"] = count / task_total
+        for task, count in self.attempt_drops_by_task.items():
+            task_total = max(self.attempts_by_task[task], 1)
+            metrics[f"attempt/drop_rate/{task}"] = count / task_total
+        for worker_name, count in self.worker_restart_count_by_name.items():
+            metrics[f"worker/restart_count/{worker_name}"] = count
         by_task: dict[str, list[int]] = {}
         for info in self.inflight_requests.values():
             by_task.setdefault(info.task, []).append(info.off_policy_steps)
@@ -509,6 +915,15 @@ class Scheduler:
         self.errored_rollouts_by_task.clear()
         self.timeout_rollouts_by_task.clear()
         self.total_rollouts_by_task.clear()
+        self.attempt_duration_seconds.clear()
+        self.attempt_timeouts = 0
+        self.attempt_reschedules = 0
+        self.attempt_group_drops = 0
+        self.attempts_by_task.clear()
+        self.attempt_timeouts_by_task.clear()
+        self.attempt_drops_by_task.clear()
+        self.worker_restart_count = 0
+        self.worker_restart_count_by_name.clear()
 
         # Add inference pool metrics (e.g. elastic pool server counts)
         metrics.update(self.inference_pool.get_metrics())

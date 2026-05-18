@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, ValidationError
 from pydantic_config import ConfigFileError
 
 from prime_rl.configs.inference import InferenceConfig
-from prime_rl.configs.orchestrator import OrchestratorConfig
+from prime_rl.configs.orchestrator import EnvConfig, OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
@@ -154,3 +154,13 @@ def test_cli_overrides_toml(tmp_path):
 def test_removed_fused_lm_head_chunk_size_field_is_rejected():
     with pytest.raises(ValidationError, match="fused_lm_head_chunk_size"):
         TrainerModelConfig.model_validate({"fused_lm_head_chunk_size": "auto"})
+
+
+def test_env_worker_count_defaults_to_single_logical_worker():
+    config = EnvConfig(id="rlm_rlvr")
+    assert config.worker_count == 1
+
+
+def test_env_worker_count_rejects_single_explicit_address_pool():
+    with pytest.raises(ValidationError, match="worker_count > 1"):
+        EnvConfig(id="rlm_rlvr", address="tcp://127.0.0.1:5555", worker_count=2)

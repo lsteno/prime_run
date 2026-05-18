@@ -1335,6 +1335,7 @@ def main() -> None:
         max_batched_subcalls=int(rollout_cfg.get("max_batched_subcalls", rollout_cfg.get("max_total_subcalls", 60))),
         capture_prompt_messages=True,
         include_budget_reminder=bool(rollout_cfg.get("include_budget_reminder", True)),
+        recursive_rlm_batch_mode=str(rollout_cfg.get("recursive_rlm_batch_mode", "serial")),
         live_trace_dir=rollout_cfg.get("live_trace_dir"),
     )
     prompt_variants = [str(item) for item in rollout_cfg.get("prompt_variants", ["sanjaya_text_v1"])]

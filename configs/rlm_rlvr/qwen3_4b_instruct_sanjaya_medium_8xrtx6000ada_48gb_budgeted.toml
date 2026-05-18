@@ -11,7 +11,7 @@
 
 output_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-8xrtx6000ada-48gb-budgeted"
 max_steps = 100
-max_async_level = 4
+max_async_level = 1
 seq_len = 131072
 
 [deployment]
@@ -95,6 +95,7 @@ extra_body = { return_token_ids = true, top_k = -1, min_p = 0.0 }
 online_difficulty_filtering = true
 easy_threshold = 1.0
 hard_threshold = 0.0
+hard_cooldown_steps = 5
 seed = 42
 
 [orchestrator.trace_export]
@@ -144,6 +145,11 @@ judge_model = "gemini-3-flash-preview"
 judge_vertex_project_env = "GOOGLE_CLOUD_PROJECT"
 judge_vertex_location = "global"
 judge_thinking_level = "medium"
+efficiency_penalty_mode = "adaptive_group"
+adaptive_efficiency_beta_max = 0.05
+adaptive_efficiency_gamma = 2.0
+adaptive_efficiency_solve_rate_floor = 0.25
+adaptive_efficiency_cost_basis = "total_tokens"
 live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-8xrtx6000ada-48gb-budgeted/live_traces"
 
 [orchestrator.eval]
@@ -199,6 +205,8 @@ judge_model = "gemini-3-flash-preview"
 judge_vertex_project_env = "GOOGLE_CLOUD_PROJECT"
 judge_vertex_location = "global"
 judge_thinking_level = "medium"
+efficiency_penalty_mode = "static_per_1k"
+efficiency_penalty_coef = 0.0
 live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-8xrtx6000ada-48gb-budgeted/live_traces_eval"
 
 [inference]

@@ -7,6 +7,7 @@ from prime_rl.configs.shared import (
     HeartbeatConfig,
     LogConfig,
     SlurmConfig,
+    TensorBoardConfig,
     WandbConfig,
 )
 from prime_rl.configs.trainer import (
@@ -55,6 +56,10 @@ class LossMaskConfig(BaseConfig):
     user: Annotated[bool, Field(description="Whether user messages contribute to the loss.")] = False
     assistant: Annotated[bool, Field(description="Whether assistant messages contribute to the loss.")] = True
     tool: Annotated[bool, Field(description="Whether tool messages contribute to the loss.")] = False
+    train_on_prompt: Annotated[
+        bool,
+        Field(description="Whether messages in the prompt portion may contribute to the loss."),
+    ] = True
 
 
 class SFTDataConfig(BaseDataConfig):
@@ -186,6 +191,9 @@ class SFTConfig(BaseConfig):
 
     # The wandb configuration
     wandb: WandbConfig | None = None
+
+    # The tensorboard configuration
+    tensorboard: TensorBoardConfig | None = None
 
     output_dir: Annotated[
         Path,

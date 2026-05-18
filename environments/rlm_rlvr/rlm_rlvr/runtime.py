@@ -60,6 +60,15 @@ class RuntimeConfig:
     max_batched_subcalls: int = 80
     capture_prompt_messages: bool = False
     include_budget_reminder: bool = True
+    recursive_rlm_batch_mode: str = "serial"
+
+    def __post_init__(self) -> None:
+        self.recursive_rlm_batch_mode = self.recursive_rlm_batch_mode.lower()
+        valid_recursive_rlm_batch_modes = {"serial", "thread"}
+        if self.recursive_rlm_batch_mode not in valid_recursive_rlm_batch_modes:
+            raise ValueError(
+                f"recursive_rlm_batch_mode must be one of {sorted(valid_recursive_rlm_batch_modes)}"
+            )
 
 
 @dataclass
@@ -163,6 +172,11 @@ class SyncInferenceSession:
         self.retry_transient_errors = retry_transient_errors
         self.openai_extra_body = openai_extra_body or {}
         self.enable_token_accounting = enable_token_accounting
+        normalized_base_url = base_url.rstrip("/")
+        self.use_max_completion_tokens = (
+            "api.openai.com" in normalized_base_url
+            and (model_name.startswith("gpt-5") or model_name.startswith("openai/gpt-5"))
+        )
         self.client = OpenAI(
             base_url=base_url,
             api_key=api_key or "EMPTY",
@@ -230,10 +244,11 @@ class SyncInferenceSession:
         temperature: float,
         top_p: float,
     ) -> tuple[str, TokenPayload]:
+        token_limit_key = "max_completion_tokens" if getattr(self, "use_max_completion_tokens", False) else "max_tokens"
         request_body = {
             "model": self.model_name,
             "messages": messages,
-            "max_tokens": max_tokens,
+            token_limit_key: max_tokens,
             "temperature": temperature,
             "top_p": top_p,
         }
@@ -981,10 +996,19 @@ class RecursiveRuntime:
         self.validate_recursive_query_batch(scheduled_prompts, max_depth=max_depth)
         payloads: list[dict[str, Any]] = []
         if scheduled_prompts:
-            workers = self.batch_max_workers(len(scheduled_prompts), requested_max_workers=max_workers)
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(self._recursive_query, prompt, model, max_depth, False) for prompt in scheduled_prompts]
-                payloads.extend(future.result() for future in futures)
+            if self.config.recursive_rlm_batch_mode == "thread":
+                workers = self.batch_max_workers(len(scheduled_prompts), requested_max_workers=max_workers)
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [
+                        pool.submit(self._recursive_query, prompt, model, max_depth, False)
+                        for prompt in scheduled_prompts
+                    ]
+                    payloads.extend(future.result() for future in futures)
+            else:
+                payloads.extend(
+                    self._recursive_query(prompt, model, max_depth, False)
+                    for prompt in scheduled_prompts
+                )
         payloads.extend(
             self._budget_error_payload(prompt=prompt, model=model, kind="recursive_query")
             for prompt in skipped_prompts

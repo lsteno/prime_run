@@ -19,6 +19,7 @@ class Buffer:
     """A buffer for storing rollouts and metadata."""
 
     POOLS = ["easy", "normal", "hard"]
+    HARD_RELEASE_STEPS_FILENAME = "hard_example_release_steps.json"
 
     def __init__(
         self,
@@ -71,6 +72,7 @@ class Buffer:
         # Initialize buffers for easy/ hard examples
         self.easy_examples: list[dict] = []
         self.hard_examples: list[dict] = []
+        self.hard_example_release_steps: dict[str, int] = {}
 
         # Initialize rollout buffer (flat list of rollouts)
         self.rollout_buffer: list[vf.RolloutOutput] = []
@@ -95,6 +97,8 @@ class Buffer:
         write_jsonl(self.easy_examples, path / "easy_examples.jsonl")
         write_jsonl(self.hard_examples, path / "hard_examples.jsonl")
         write_jsonl(self.rollout_buffer, path / "rollout_buffer.jsonl")
+        with open(path / self.HARD_RELEASE_STEPS_FILENAME, "w") as f:
+            json.dump(self.hard_example_release_steps, f)
 
     def load(self, path: Path) -> None:
         """Loads pool assignments and rollouts."""
@@ -106,6 +110,12 @@ class Buffer:
         saved_easy_examples = read_jsonl(path / "easy_examples.jsonl")
         saved_hard_examples = read_jsonl(path / "hard_examples.jsonl")
         saved_rollout_buffer = cast(list[vf.RolloutOutput], read_jsonl(path / "rollout_buffer.jsonl"))
+        release_steps_path = path / self.HARD_RELEASE_STEPS_FILENAME
+        if release_steps_path.exists():
+            with open(release_steps_path, "r") as f:
+                saved_hard_release_steps = {str(k): int(v) for k, v in json.load(f).items()}
+        else:
+            saved_hard_release_steps = {}
 
         if any(saved_easy_examples) or any(saved_hard_examples) or any(saved_rollout_buffer):
             # Build hash lookup for example buffer (env -> (example_hash -> example_id))
@@ -132,6 +142,10 @@ class Buffer:
                             example = self.example_buffer[env].pop(example_id, None)
                             if example is not None:
                                 target_pool.append(example)
+                                if target_pool is self.hard_examples and self.config.hard_cooldown_steps is not None:
+                                    self.hard_example_release_steps[example_hash] = saved_hard_release_steps.get(
+                                        example_hash, 0
+                                    )
                                 num_moved += 1
                                 break
                 return num_moved
@@ -179,6 +193,8 @@ class Buffer:
                     env_name = example["task"]
                     example_id = example["example_id"]
                     examples.remove(example)
+                    if examples is self.hard_examples:
+                        self.hard_example_release_steps.pop(self.get_example_hash(example), None)
                     self.example_buffer[env_name][example_id] = example
                 return num_moved
 
@@ -207,7 +223,41 @@ class Buffer:
 
         return sampled_examples
 
-    def update(self, rollouts: list[vf.RolloutOutput]):
+    def release_due_hard_examples(self, step: int) -> int:
+        """Moves cooldown-expired hard examples back to the normal sampling pool."""
+        if self.config.hard_cooldown_steps is None or not self.hard_examples:
+            return 0
+
+        kept_hard_examples = []
+        num_released = 0
+        for example in self.hard_examples:
+            example_hash = self.get_example_hash(example)
+            release_step = self.hard_example_release_steps.get(example_hash, 0)
+            if release_step <= step:
+                self.example_buffer[example["task"]][example["example_id"]] = example
+                self.hard_example_release_steps.pop(example_hash, None)
+                num_released += 1
+            else:
+                kept_hard_examples.append(example)
+        self.hard_examples = kept_hard_examples
+
+        if num_released:
+            self.logger.debug(f"Released {num_released} hard example(s) back to normal pool at step {step}.")
+        return num_released
+
+    def put_example_on_hard_cooldown(self, example: dict, step: int, cooldown_steps: int) -> bool:
+        """Temporarily removes an example from normal sampling after scheduler-level failure."""
+        env_name = example["task"]
+        example_id = example["example_id"]
+        if example_id not in self.example_buffer.get(env_name, {}):
+            return False
+        removed_example = self.example_buffer[env_name].pop(example_id)
+        self.hard_examples.append(removed_example)
+        self.hard_example_release_steps[self.get_example_hash(removed_example)] = step + cooldown_steps
+        self.num_examples_per_step[env_name]["hard"] += 1
+        return True
+
+    def update(self, rollouts: list[vf.RolloutOutput], step: int | None = None):
         """Updates the buffer state with completed rollouts."""
 
         rollouts_by_example = defaultdict(list)
@@ -229,6 +279,12 @@ class Buffer:
                 example = self.example_buffer[env_name].pop(example_id)
                 target_pool = self.easy_examples if pool == "easy" else self.hard_examples
                 target_pool.append(example)
+                if pool == "hard" and self.config.hard_cooldown_steps is not None:
+                    release_base_step = 0 if step is None else step
+                    release_step = release_base_step + self.config.hard_cooldown_steps
+                    self.hard_example_release_steps[self.get_example_hash(example)] = release_step
+                elif pool == "hard":
+                    self.hard_example_release_steps.pop(self.get_example_hash(example), None)
 
             self.num_examples_per_step[env_name][pool] += 1
             if self.config.online_difficulty_filtering:

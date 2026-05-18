@@ -241,6 +241,14 @@ def test_budgeted_configs_route_plain_llm_subcalls_and_judge_to_vertex() -> None
         train_args = config["orchestrator"]["env"][0]["args"]
         eval_args = config["orchestrator"]["eval"]["env"][0]["args"]
 
+        assert train_args["efficiency_penalty_mode"] == "adaptive_group"
+        assert train_args["adaptive_efficiency_beta_max"] == 0.05
+        assert train_args["adaptive_efficiency_gamma"] == 2.0
+        assert train_args["adaptive_efficiency_solve_rate_floor"] == 0.25
+        assert train_args["adaptive_efficiency_cost_basis"] == "total_tokens"
+        assert eval_args["efficiency_penalty_mode"] == "static_per_1k"
+        assert eval_args["efficiency_penalty_coef"] == 0.0
+
         for args in (train_args, eval_args):
             assert args["inference_mode"] == "local"
             assert args["inference_base_url"] == "http://localhost:8000/v1"

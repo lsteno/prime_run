@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import time
 from typing import Any
+import uuid
 
 
 def _json_safe(value: Any) -> Any:
@@ -54,9 +56,22 @@ def _trace_path(state: dict[str, Any]) -> Path | None:
 
     variant = _safe_name(str(state.get("prompt_variant") or "default"))
     sample = _sample_name(state)
+    suffix = state.get("_live_trace_suffix")
+    if suffix:
+        sample = _safe_name(f"{sample}-{suffix}")
     path = Path(str(trace_dir)).expanduser() / variant / f"{sample}.json"
     state["_live_trace_path"] = str(path)
     return path
+
+
+def assign_live_trace_suffix(state: dict[str, Any]) -> str:
+    """Assign a stable per-rollout suffix so concurrent rollouts do not share trace files."""
+    suffix = state.get("_live_trace_suffix")
+    if suffix:
+        return str(suffix)
+    suffix = f"p{os.getpid()}-{uuid.uuid4().hex[:10]}"
+    state["_live_trace_suffix"] = suffix
+    return suffix
 
 
 def _compact_segment(segment: dict[str, Any]) -> dict[str, Any]:
@@ -169,7 +184,7 @@ def write_live_trace(
     }
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     with open(tmp_path, "w", encoding="utf-8") as handle:
         json.dump(_json_safe(payload), handle, ensure_ascii=False)
     tmp_path.replace(path)

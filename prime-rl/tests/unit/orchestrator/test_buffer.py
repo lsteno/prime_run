@@ -107,6 +107,35 @@ def test_buffer_problem_pool_assignment(dummy_env_group, make_rollouts):
     assert len(get_normal_ids(buffer)) == 7
 
 
+def test_buffer_hard_cooldown_holds_then_releases(dummy_env_group, make_rollouts):
+    """Cooldown hard examples are held out only until their release step."""
+    dataset = dummy_env_group.get_dataset()
+    buffer = Buffer(
+        dataset,
+        dummy_env_group.env_names,
+        BufferConfig(
+            hard_threshold=0.0,
+            hard_cooldown_steps=5,
+            online_difficulty_filtering=True,
+        ),
+    )
+
+    example_id = dataset[0]["example_id"]
+    buffer.update(make_rollouts(dataset.select(range(1)), rewards=[0.0]), step=10)
+
+    assert example_id not in get_normal_ids(buffer)
+    assert len(buffer.hard_examples) == 1
+    assert len(buffer.rollout_buffer) == 0
+
+    assert buffer.release_due_hard_examples(14) == 0
+    assert example_id not in get_normal_ids(buffer)
+    assert len(buffer.hard_examples) == 1
+
+    assert buffer.release_due_hard_examples(15) == 1
+    assert example_id in get_normal_ids(buffer)
+    assert len(buffer.hard_examples) == 0
+
+
 def test_buffer_online_difficulty_filtering(dummy_env_group, make_rollouts):
     """With online_difficulty_filtering=True, only partial reward rollouts are kept."""
     dataset = dummy_env_group.get_dataset()
@@ -147,6 +176,53 @@ def test_buffer_save_load_with_conversion(dummy_env_group, make_rollouts, tmp_pa
     assert len(new_buffer.easy_examples) == 1
     # 2 were normal + 5 from env_b + 1 converted from easy = 8
     assert len(get_normal_ids(new_buffer)) == 8
+
+
+def test_buffer_hard_cooldown_metadata_survives_checkpoint(dummy_env_group, make_rollouts, tmp_path):
+    """Cooldown release steps are saved and restored across checkpoint load."""
+    dataset = dummy_env_group.get_dataset()
+    config = BufferConfig(hard_threshold=0.0, hard_cooldown_steps=5, hash_keys=["prompt", "task"])
+    buffer = Buffer(dataset, dummy_env_group.env_names, config)
+    example_id = dataset[0]["example_id"]
+    buffer.update(make_rollouts(dataset.select(range(1)), rewards=[0.0]), step=10)
+    buffer.save(tmp_path / "buffer")
+
+    new_buffer = Buffer(dataset, dummy_env_group.env_names, config)
+    new_buffer.load(tmp_path / "buffer")
+
+    assert example_id not in get_normal_ids(new_buffer)
+    assert len(new_buffer.hard_examples) == 1
+    assert new_buffer.release_due_hard_examples(14) == 0
+    assert example_id not in get_normal_ids(new_buffer)
+
+    assert new_buffer.release_due_hard_examples(15) == 1
+    assert example_id in get_normal_ids(new_buffer)
+    assert len(new_buffer.hard_examples) == 0
+
+
+def test_buffer_old_hard_checkpoint_releases_immediately_with_cooldown(
+    dummy_env_group, make_rollouts, tmp_path
+):
+    """Old checkpoints without release metadata do not permanently strand hard examples."""
+    dataset = dummy_env_group.get_dataset()
+    buffer = Buffer(dataset, dummy_env_group.env_names, BufferConfig(hard_threshold=0.0))
+    example_id = dataset[0]["example_id"]
+    buffer.update(make_rollouts(dataset.select(range(1)), rewards=[0.0]), step=10)
+    buffer.save(tmp_path / "buffer")
+    (tmp_path / "buffer" / Buffer.HARD_RELEASE_STEPS_FILENAME).unlink()
+
+    new_buffer = Buffer(
+        dataset,
+        dummy_env_group.env_names,
+        BufferConfig(hard_threshold=0.0, hard_cooldown_steps=5, hash_keys=["prompt", "task"]),
+    )
+    new_buffer.load(tmp_path / "buffer")
+
+    assert example_id not in get_normal_ids(new_buffer)
+    assert len(new_buffer.hard_examples) == 1
+    assert new_buffer.release_due_hard_examples(75) == 1
+    assert example_id in get_normal_ids(new_buffer)
+    assert len(new_buffer.hard_examples) == 0
 
 
 def test_buffer_env_ratios(dummy_env_group):

@@ -1,0 +1,91 @@
+# Effectiveness-focused full-SFT warmup for curated RLM trace conversations.
+#
+# Compared with the baseline curated-v2 SFT config, this disables context
+# parallelism so Prime-RL can use stack packing. Stack packing preserves whole
+# conversations instead of concatenating/truncating across trace boundaries,
+# which is the preferred signal for protocol SFT.
+
+output_dir = "../outputs/rlm-rlvr-sft-curated-v2-qwen3-4b-instruct-8xrtx6000ada-effective-32k"
+max_steps = 60
+loss_impl = "liger_fused"
+
+[deployment]
+type = "single_node"
+gpus_per_node = 8
+num_gpus = 8
+
+[wandb]
+project = "rlm-rlvr"
+name = "rlm-rlvr-sft-curated-v2-effective-32k-ac"
+offline = false
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+impl = "hf"
+seq_len = 32768
+attn = "flash_attention_2"
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+cp = 1
+tp = 1
+dp_replicate = 1
+
+[model.ac]
+freq = 1
+
+[tokenizer]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+trust_remote_code = true
+
+[data]
+type = "sft"
+name = "lsteno/rlm-rlvr-sft-v2-conversations"
+splits = ["train"]
+batch_size = 32
+micro_batch_size = 1
+seq_len = 32768
+pack_function = "stack"
+shuffle = true
+seed = 42
+
+[data.loss_mask]
+system = false
+user = false
+assistant = true
+tool = false
+
+[val]
+interval = 10
+eval_on_start = true
+
+[val.data]
+type = "sft"
+name = "lsteno/rlm-rlvr-sft-v2-conversations"
+# Hugging Face's scriptless JSONL loader maps eval.jsonl to the `test` split.
+splits = ["test"]
+batch_size = 32
+micro_batch_size = 1
+seq_len = 32768
+pack_function = "stack"
+shuffle = false
+seed = 42
+
+[val.data.loss_mask]
+system = false
+user = false
+assistant = true
+tool = false
+
+[optim]
+lr = 5e-6
+weight_decay = 0.01
+max_norm = 1.0
+
+[scheduler]
+type = "cosine"
+warmup_steps = 5
+min_lr = 5e-7
+
+[ckpt]
+interval = 25
+keep_last = 3

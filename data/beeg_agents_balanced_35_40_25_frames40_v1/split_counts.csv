@@ -1,0 +1,10 @@
+split,family,count,fraction
+train,oolong,547,0.34974424552429667
+train,frames,626,0.40025575447570333
+train,longcodeu,391,0.25
+eval,oolong,158,0.3495575221238938
+eval,frames,181,0.4004424778761062
+eval,longcodeu,113,0.25
+sft_traces_remainder,oolong,695,0.695
+sft_traces_remainder,frames,9,0.009
+sft_traces_remainder,longcodeu,296,0.296

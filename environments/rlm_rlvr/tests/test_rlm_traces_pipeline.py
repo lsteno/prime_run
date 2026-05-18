@@ -5,6 +5,7 @@ from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
 from pathlib import Path
 import sys
+import tomllib
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from pipelines.rlm_traces import export_sft
 from pipelines.rlm_traces import curate_sft_traces
 from pipelines.rlm_traces import run as trace_run
 from pipelines.rlm_traces import run_missing_with_retry
+from scripts.rlm_sft import upload_latest_weights
 
 
 def test_glm5_endpoint_resolution_uses_prime_api(monkeypatch) -> None:
@@ -349,6 +351,192 @@ def test_sft_export_filters_plain_subcalls_and_sanitizes_history() -> None:
     assert rows[0]["completion"] == [{"role": "assistant", "content": "FINAL(42)"}]
 
 
+def _strict_conversation_record() -> dict:
+    return {
+        "source_id": "source-conv",
+        "example_id": 1,
+        "exact_match": True,
+        "judge_score": None,
+        "final_answer": "42",
+        "num_llm_subcalls": 1,
+        "total_prompt_tokens": 100,
+        "total_completion_tokens": 20,
+        "total_rollout_tokens": 120,
+        "curation": {
+            "version": "curated-v2",
+            "status": "strict_sft",
+            "tags": ["strict_sft"],
+            "source_run_id": "test-run",
+            "source_input_path": "records.curated.jsonl",
+            "root_model": "openai/gpt-5.4",
+            "manual_decision_id": "source-conv:record",
+        },
+        "segments": [
+            {
+                "order": 0,
+                "kind": "root_turn",
+                "train_scope": "root_turn",
+                "is_trainable_rlm_turn": True,
+                "prompt_messages": [
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "metadata"},
+                    {"role": "user", "content": "question"},
+                ],
+                "response_text": "```repl\nprint('inspect')\n```\n\n{\"answer\": 42}",
+            },
+            {
+                "order": 1,
+                "kind": "plain_query",
+                "train_scope": "llm_subcall",
+                "is_trainable_rlm_turn": False,
+                "prompt_messages": [{"role": "user", "content": "subcall prompt"}],
+                "response_text": "subcall evidence",
+            },
+            {
+                "order": 2,
+                "kind": "root_turn",
+                "train_scope": "root_turn",
+                "is_trainable_rlm_turn": True,
+                "prompt_messages": [
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "metadata"},
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "```repl\nprint('inspect')\n```\n\n{\"answer\": 42}"},
+                    {"role": "user", "content": "Code executed:\n```python\nprint('inspect')\n```\n\nREPL output:\ninspect"},
+                    {"role": "user", "content": "Continue using the REPL."},
+                ],
+                "response_text": "FINAL(42)",
+            },
+        ],
+    }
+
+
+def test_conversation_export_uses_one_row_per_strict_trace_and_masks_feedback() -> None:
+    record = _strict_conversation_record()
+
+    rows = export_sft.extract_conversation_rows([record])
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["row_id"] == "source-conv:conversation"
+    assert [message["role"] for message in row["prompt"]] == ["system", "user", "user"]
+    assert [message["role"] for message in row["completion"]] == ["assistant", "user", "user", "assistant"]
+    assert row["completion"][1]["content"].startswith("Code executed:")
+    assert row["completion"][2]["content"] == "Continue using the REPL."
+    assert row["completion"][0]["content"] == "```repl\nprint('inspect')\n```"
+    assert row["completion"][-1]["content"] == "FINAL(42)"
+    assert row["non_empty_llm_subcall_count"] == 1
+    assert row["scrubbed_non_final_repl_turns"] == 1
+
+
+def test_conversation_export_excludes_audit_only_and_subcall_free_records() -> None:
+    strict = _strict_conversation_record()
+    audit_only = copy.deepcopy(strict)
+    audit_only["source_id"] = "audit"
+    audit_only["curation"]["status"] = "audit_only"
+    no_subcall = copy.deepcopy(strict)
+    no_subcall["source_id"] = "no-subcall"
+    no_subcall["segments"][1]["response_text"] = ""
+
+    rows = export_sft.extract_conversation_rows([strict, audit_only, no_subcall])
+
+    assert [row["source_id"] for row in rows] == ["source-conv"]
+
+
+def test_conversation_export_preserves_curated_synthetic_final_turn() -> None:
+    record = _strict_conversation_record()
+    record["segments"][2]["_curation_sft_rows"] = [
+        {
+            "row_role": "analysis_before_final",
+            "prompt_messages": record["segments"][2]["prompt_messages"],
+            "response_text": "```repl\nanswer = '42'\n```",
+        },
+        {
+            "row_role": "synthetic_final_after_feedback",
+            "prompt_messages": [
+                *record["segments"][2]["prompt_messages"],
+                {"role": "assistant", "content": "```repl\nanswer = '42'\n```"},
+                {"role": "user", "content": "REPL variables: ['answer']"},
+            ],
+            "response_text": '```repl\nFINAL_VAR("answer")\n```',
+        },
+    ]
+
+    rows = export_sft.extract_conversation_rows([record])
+
+    contents = [message["content"] for message in rows[0]["completion"] if message["role"] == "assistant"]
+    assert "```repl\nanswer = '42'\n```" in contents
+    assert '```repl\nFINAL_VAR("answer")\n```' in contents
+
+
+def test_per_root_turn_export_uses_one_row_per_root_decision_with_full_history() -> None:
+    record = _strict_conversation_record()
+
+    rows = export_sft.extract_per_root_turn_rows([record])
+
+    assert len(rows) == 2
+    assert rows[0]["row_id"] == "source-conv:root_turn:0000"
+    assert rows[0]["prompt"] == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "metadata"},
+        {"role": "user", "content": "question"},
+    ]
+    assert rows[0]["completion"] == [{"role": "assistant", "content": "```repl\nprint('inspect')\n```"}]
+    assert rows[1]["row_id"] == "source-conv:root_turn:0002"
+    assert [message["role"] for message in rows[1]["prompt"]] == [
+        "system",
+        "user",
+        "user",
+        "assistant",
+        "user",
+        "user",
+    ]
+    assert rows[1]["prompt"][3]["content"] == "visible" or "print('inspect')" in rows[1]["prompt"][3]["content"]
+    assert rows[1]["prompt"][4]["content"].startswith("Code executed:")
+    assert rows[1]["completion"] == [{"role": "assistant", "content": "FINAL(42)"}]
+    assert rows[1]["non_empty_llm_subcall_count"] == 1
+
+
+def test_per_root_turn_export_preserves_curated_synthetic_final_turns() -> None:
+    record = _strict_conversation_record()
+    record["segments"][2]["_curation_sft_rows"] = [
+        {
+            "row_role": "analysis_before_final",
+            "prompt_messages": record["segments"][2]["prompt_messages"],
+            "response_text": "```repl\nanswer = '42'\n```",
+        },
+        {
+            "row_role": "synthetic_final_after_feedback",
+            "prompt_messages": [
+                *record["segments"][2]["prompt_messages"],
+                {"role": "assistant", "content": "```repl\nanswer = '42'\n```"},
+                {"role": "user", "content": "REPL variables: ['answer']"},
+            ],
+            "response_text": '```repl\nFINAL_VAR("answer")\n```',
+        },
+    ]
+
+    rows = export_sft.extract_per_root_turn_rows([record])
+
+    assert [row["row_role"] for row in rows] == [
+        "original_or_repaired",
+        "analysis_before_final",
+        "synthetic_final_after_feedback",
+    ]
+    assert rows[-1]["prompt"][-1] == {"role": "user", "content": "REPL variables: ['answer']"}
+    assert rows[-1]["completion"] == [{"role": "assistant", "content": '```repl\nFINAL_VAR("answer")\n```'}]
+
+
+def test_sft_export_can_attach_chat_template_kwargs() -> None:
+    record = _strict_conversation_record()
+
+    rows = export_sft.extract_per_root_turn_rows([record])
+    rows = export_sft.add_chat_template_kwargs(rows, {"enable_thinking": False})
+
+    assert rows
+    assert all(row["chat_template_kwargs"] == {"enable_thinking": False} for row in rows)
+
+
 def _curation_record(*, response_text: str = "FINAL(42)", plain_response: str = "evidence", num_subcalls: int = 1):
     return {
         "source_id": "source-a",
@@ -398,6 +586,16 @@ def test_curator_tags_empty_subcalls_without_modifying_them_when_recovered() -> 
     record = _curation_record(response_text="```repl\nprint('verify')\n```", plain_response="")
     record["segments"].append(
         {
+            "order": 1,
+            "kind": "plain_query",
+            "train_scope": "llm_subcall",
+            "is_trainable_rlm_turn": False,
+            "prompt_fingerprint": "plain-b",
+            "response_text": "later evidence",
+        }
+    )
+    record["segments"].append(
+        {
             "order": 2,
             "kind": "root_turn",
             "train_scope": "root_turn",
@@ -443,8 +641,79 @@ def test_curator_repairs_final_inside_repl() -> None:
     curated, _manifest, patches, rows = curate_sft_traces.curate_records([record])
 
     assert curated[0]["curation"]["status"] == "strict_sft"
-    assert patches[0]["repair_type"] == "final_in_repl"
+    assert patches[0]["repair_type"] == "literal_final_in_repl"
     assert rows[0]["completion"] == [{"role": "assistant", "content": "FINAL(42)"}]
+
+
+def test_curator_preserves_quoted_literal_final_inside_repl_for_reviewed_sources() -> None:
+    record = _curation_record(response_text='```repl\nFINAL("Jenna Ortega")\n```')
+    record["source_id"] = "frames-0230"
+    record["answer"] = "jenna ortega"
+    record["final_answer"] = '"Jenna Ortega"'
+
+    curated, _manifest, patches, rows = curate_sft_traces.curate_records([record])
+
+    assert curated[0]["curation"]["status"] == "strict_sft"
+    assert patches == []
+    assert "literal_final_in_repl_preserved_quoted" in curated[0]["curation"]["tags"]
+    assert rows[0]["completion"] == [{"role": "assistant", "content": '```repl\nFINAL("Jenna Ortega")\n```'}]
+
+
+def test_curator_accepts_final_var_inside_repl() -> None:
+    record = _curation_record(response_text='```repl\nanswer = "42"\nFINAL_VAR("answer")\n```')
+
+    curated, _manifest, patches, rows = curate_sft_traces.curate_records([record])
+
+    assert curated[0]["curation"]["status"] == "strict_sft"
+    assert patches == []
+    assert rows[0]["completion"] == [{"role": "assistant", "content": '```repl\nanswer = "42"\nFINAL_VAR("answer")\n```'}]
+
+
+def test_curator_moves_outside_final_var_into_repl() -> None:
+    record = _curation_record(response_text="FINAL_VAR(answer)")
+
+    curated, _manifest, patches, rows = curate_sft_traces.curate_records([record])
+
+    assert curated[0]["curation"]["status"] == "strict_sft"
+    assert patches[0]["repair_type"] == "final_var_outside_repl"
+    assert rows[0]["completion"] == [{"role": "assistant", "content": '```repl\nFINAL_VAR("answer")\n```'}]
+
+
+def test_curator_excludes_reviewed_weak_subcall_traces() -> None:
+    record = _curation_record(response_text="FINAL(Harold Wilson)", plain_response="NOT_FOUND")
+    record["source_id"] = "frames-0029"
+    record["answer"] = "Harold Wilson"
+    record["final_answer"] = "Harold Wilson"
+
+    curated, _manifest, _patches, rows = curate_sft_traces.curate_records([record])
+
+    assert curated[0]["curation"]["status"] == "audit_only"
+    assert "weak_subcall_signal" in curated[0]["curation"]["tags"]
+    assert rows == []
+
+
+def test_curator_rewrites_sft_system_prompt_to_current_variant() -> None:
+    record = _curation_record(response_text="FINAL(42)")
+    record["prompt_variant"] = "sanjaya_text_depth1_llm_only_v1"
+    record["segments"][1]["prompt_messages"] = [
+        {"role": "system", "content": "old prompt with FINAL_VAR(variable_name)"},
+        {"role": "user", "content": "question"},
+    ]
+
+    _curated, _manifest, _patches, rows = curate_sft_traces.curate_records([record])
+
+    assert "FINAL_VAR(\"variable_name\")" in rows[0]["prompt"][0]["content"]
+    assert rows[0]["prompt_rewritten_to_current_variant"] is True
+
+
+def test_curator_requires_non_empty_subcall_for_strict_sft() -> None:
+    record = _curation_record(response_text="FINAL(42)", plain_response="")
+
+    curated, _manifest, _patches, rows = curate_sft_traces.curate_records([record])
+
+    assert curated[0]["curation"]["status"] == "audit_only"
+    assert "all_subcalls_empty" in curated[0]["curation"]["tags"]
+    assert rows == []
 
 
 def test_curator_splits_code_plus_final_with_existing_feedback() -> None:
@@ -513,6 +782,115 @@ def test_sft_split_groups_by_source_id() -> None:
     assert train_ids
     assert eval_ids
     assert train_ids.isdisjoint(eval_ids)
+
+
+def test_curated_v2_sft_config_is_full_sft_for_qwen_instruct() -> None:
+    config_path = REPO_ROOT / "configs" / "rlm_sft" / "local_8xrtx6000ada_48gb_qwen3_4b_instruct_curated_v2.toml"
+    config = tomllib.loads(config_path.read_text())
+
+    assert config["model"]["name"] == "Qwen/Qwen3-4B-Instruct-2507"
+    assert config["tokenizer"]["name"] == "Qwen/Qwen3-4B-Instruct-2507"
+    assert "lora" not in config["model"]
+    assert config["data"]["name"] == "lsteno/rlm-rlvr-sft-v2-conversations"
+    assert config["val"]["data"]["name"] == "lsteno/rlm-rlvr-sft-v2-conversations"
+    assert config["data"]["loss_mask"] == {"system": False, "user": False, "assistant": True, "tool": False}
+    assert config["data"]["seq_len"] == 32768
+    assert config["data"]["pack_function"] == "cat"
+
+
+def test_curated_v3_per_root_turn_sft_config_masks_prompt_history() -> None:
+    config_path = (
+        REPO_ROOT
+        / "configs"
+        / "rlm_sft"
+        / "local_8xa100_80gb_qwen3_4b_instruct_curated_v3_per_root_turn.toml"
+    )
+    config = tomllib.loads(config_path.read_text())
+
+    assert config["model"]["name"] == "Qwen/Qwen3-4B-Instruct-2507"
+    assert config["tokenizer"]["name"] == "Qwen/Qwen3-4B-Instruct-2507"
+    assert "lora" not in config["model"]
+    assert config["model"]["seq_len"] == 32768
+    assert config["model"]["cp"] == 4
+    assert config["deployment"]["num_gpus"] == 8
+    assert config["data"]["name"] == "lsteno/rlm-rlvr-sft-v3-per-root-turn"
+    assert config["val"]["data"]["name"] == "lsteno/rlm-rlvr-sft-v3-per-root-turn"
+    assert config["data"]["loss_mask"] == {
+        "system": False,
+        "user": False,
+        "assistant": True,
+        "tool": False,
+        "train_on_prompt": False,
+    }
+    assert config["val"]["data"]["loss_mask"]["train_on_prompt"] is False
+    assert config["data"]["seq_len"] == 32768
+    assert config["data"]["pack_function"] == "cat"
+
+
+def test_curated_v3_qwen3_8b_sft_config_uses_non_thinking_dataset_and_paper_style_batch() -> None:
+    config_path = (
+        REPO_ROOT
+        / "configs"
+        / "rlm_sft"
+        / "local_8xa100_80gb_qwen3_8b_nonthinking_curated_v3_per_root_turn.toml"
+    )
+    config = tomllib.loads(config_path.read_text())
+
+    assert config["model"]["name"] == "Qwen/Qwen3-8B"
+    assert config["tokenizer"]["name"] == "Qwen/Qwen3-4B-Instruct-2507"
+    assert "lora" not in config["model"]
+    assert config["model"]["seq_len"] == 32768
+    assert config["model"]["cp"] == 4
+    assert config["deployment"]["num_gpus"] == 8
+    assert config["max_steps"] == 180
+    assert config["data"]["batch_size"] == 64
+    assert config["data"]["name"] == "lsteno/rlm-rlvr-sft-v3-per-root-turn-qwen3-8b-nonthinking"
+    assert config["val"]["data"]["name"] == "lsteno/rlm-rlvr-sft-v3-per-root-turn-qwen3-8b-nonthinking"
+    assert config["data"]["loss_mask"] == {
+        "system": False,
+        "user": False,
+        "assistant": True,
+        "tool": False,
+        "train_on_prompt": False,
+    }
+    assert config["val"]["data"]["loss_mask"]["train_on_prompt"] is False
+    assert config["data"]["seq_len"] == 32768
+    assert config["data"]["pack_function"] == "cat"
+
+
+def test_upload_latest_weights_selects_largest_step_and_builds_hf_commands(tmp_path, monkeypatch) -> None:
+    (tmp_path / "weights" / "step_2").mkdir(parents=True)
+    (tmp_path / "weights" / "step_10").mkdir(parents=True)
+    (tmp_path / "weights" / "step_10" / "model.safetensors").write_text("weights")
+    (tmp_path / "weights" / "not_a_step").mkdir()
+    monkeypatch.setenv("HF_TOKEN", "test-token")
+    calls: list[tuple[str, str]] = []
+
+    class _FakeHfApi:
+        def __init__(self, token: str) -> None:
+            calls.append(("init", token))
+
+        def create_repo(self, **kwargs) -> None:
+            calls.append(("create_repo", kwargs["repo_id"]))
+
+        def upload_folder(self, **kwargs) -> None:
+            calls.append(("upload_folder", str(kwargs["folder_path"])))
+
+        def list_repo_files(self, **kwargs) -> list[str]:
+            calls.append(("list_repo_files", kwargs["repo_id"]))
+            return ["model.safetensors"]
+
+    monkeypatch.setattr(upload_latest_weights, "HfApi", _FakeHfApi)
+
+    selected = upload_latest_weights.upload_latest_weights(tmp_path, "lsteno/test-model")
+
+    assert selected == tmp_path / "weights" / "step_10"
+    assert calls == [
+        ("init", "test-token"),
+        ("create_repo", "lsteno/test-model"),
+        ("upload_folder", str(tmp_path / "weights" / "step_10")),
+        ("list_repo_files", "lsteno/test-model"),
+    ]
 
 
 def test_glm5_trace_configs_are_depth_one_llm_only() -> None:
