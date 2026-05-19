@@ -67,9 +67,20 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert config["orchestrator"]["env_worker_recovery"]["restart_on_rollout_timeout"] is True
         assert config["orchestrator"]["env_worker_recovery"]["restart_on_worker_health_failure"] is True
         assert config["orchestrator"]["attempt_logging"]["enabled"] is True
+        assert config["orchestrator"]["async_scheduling"]["prefetch_next_batch"] is False
+        assert config["orchestrator"]["async_scheduling"]["inflight_completion_cushion"] == 32
+        assert config["orchestrator"]["async_scheduling"]["max_requests_per_env_worker"] == 1
+        assert config["orchestrator"]["async_scheduling"]["max_cross_step_carryover"] == 32
+        assert config["orchestrator"]["async_scheduling"]["max_carryover_steps"] == 1
+        assert config["orchestrator"]["async_scheduling"]["cancel_stale_carryover"] is True
+        assert config["orchestrator"]["async_scheduling"]["restart_workers_for_stale_cancel"] is True
+        assert config["orchestrator"]["async_scheduling"]["batch_complete_cancel_grace_seconds"] == 2
         assert config["orchestrator"]["buffer"]["hard_cooldown_steps"] == 5
-        assert row["train_worker_count"] == "10"
-        assert row["eval_worker_count"] == "8"
+        assert "easy_threshold" not in config["orchestrator"]["buffer"]
+        assert config["orchestrator"]["buffer"]["online_filter_hard"] is True
+        assert config["orchestrator"]["buffer"]["online_filter_easy"] is False
+        assert row["train_worker_count"] == "32"
+        assert row["eval_worker_count"] == "16"
         assert row["rollout_timeout_seconds"] == "400"
         assert row["env_worker_cancel_grace_seconds"] == "5"
         assert row["max_rollout_attempts_per_slot"] == "4"
@@ -80,6 +91,14 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert row["wandb_final_samples"] == "false"
         assert row["repl_timeout_seconds"] == "300"
         assert row["hard_cooldown_steps"] == "5"
+        assert row["prefetch_next_batch"] == "false"
+        assert row["inflight_completion_cushion"] == "32"
+        assert row["max_requests_per_env_worker"] == "1"
+        assert row["max_cross_step_carryover"] == "32"
+        assert row["max_carryover_steps"] == "1"
+        assert row["cancel_stale_carryover"] == "true"
+        assert row["restart_workers_for_stale_cancel"] == "true"
+        assert row["batch_complete_cancel_grace_seconds"] == "2"
         assert row["seq_len"] == "49152"
         assert row["max_prompt_tokens"] == "47104"
         assert row["cp"] == "2"
@@ -96,8 +115,8 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert row["experiment_depth"] == "1"
         assert row["runtime_max_depth"] == "0"
         assert row["prompt_variant"] == "sanjaya_text_depth1_llm_only_v1"
-        assert config["orchestrator"]["env"][0]["worker_count"] == 10
-        assert config["orchestrator"]["eval"]["env"][0]["worker_count"] == 8
+        assert config["orchestrator"]["env"][0]["worker_count"] == 32
+        assert config["orchestrator"]["eval"]["env"][0]["worker_count"] == 16
         assert config["orchestrator"]["env"][0]["args"]["prompt_variant"] == "sanjaya_text_depth1_llm_only_v1"
         assert config["orchestrator"]["eval"]["env"][0]["args"]["prompt_variant"] == "sanjaya_text_depth1_llm_only_v1"
         assert config["orchestrator"]["env"][0]["args"]["efficiency_penalty_mode"] == "adaptive_group"

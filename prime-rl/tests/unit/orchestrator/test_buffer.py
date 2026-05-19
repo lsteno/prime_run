@@ -150,6 +150,23 @@ def test_buffer_online_difficulty_filtering(dummy_env_group, make_rollouts):
     assert len(buffer.rollout_buffer) == 6
 
 
+def test_buffer_online_difficulty_filtering_can_keep_easy_groups(dummy_env_group, make_rollouts):
+    """All-correct groups can stay trainable when reward contains cost signal."""
+    dataset = dummy_env_group.get_dataset()
+    buffer = Buffer(
+        dataset,
+        dummy_env_group.env_names,
+        BufferConfig(online_difficulty_filtering=True, online_filter_easy=False),
+    )
+    buffer.update(make_rollouts(dataset.select(range(5)), rewards=[1.0, 0.5, 0.0, 0.5, 1.0]))
+
+    # Easy and partial groups are kept; only the hard group is filtered.
+    assert len(buffer.rollout_buffer) == 8
+    metrics = buffer.get_metrics()
+    assert metrics["buffer/filtered_hard_groups"] == 1
+    assert metrics["buffer/kept_easy_groups"] == 2
+
+
 def test_buffer_no_filtering_by_default(dummy_env_group, make_rollouts):
     """With online_difficulty_filtering=False (default), all rollouts are kept."""
     dataset = dummy_env_group.get_dataset()

@@ -288,12 +288,15 @@ class Buffer:
 
             self.num_examples_per_step[env_name][pool] += 1
             if self.config.online_difficulty_filtering:
-                if avg_reward == 0.0:
+                if avg_reward == 0.0 and self.config.online_filter_hard:
                     self.num_rollouts_per_step[env_name]["hard"] += len(example_rollouts)
+                    self.filtered_hard_groups_per_step += 1
                     continue
-                elif avg_reward == 1.0:
+                elif avg_reward == 1.0 and self.config.online_filter_easy:
                     self.num_rollouts_per_step[env_name]["easy"] += len(example_rollouts)
                     continue
+                elif avg_reward == 1.0:
+                    self.kept_easy_groups_per_step += 1
 
             self.num_rollouts_per_step[env_name]["normal"] += len(example_rollouts)
             self.rollout_buffer.extend(example_rollouts)
@@ -312,11 +315,16 @@ class Buffer:
         self.num_examples_per_step = {env: zero_per_pool() for env in self.env_names}
         # num rollouts per env per step per pool (env_name -> (pool -> num_rollouts))
         self.num_rollouts_per_step = {env: zero_per_pool() for env in self.env_names}
+        self.filtered_hard_groups_per_step = 0
+        self.kept_easy_groups_per_step = 0
 
     def get_metrics(self) -> dict[str, float]:
         """Returns the buffer metrics for the current step."""
 
-        metrics = {}
+        metrics = {
+            "buffer/filtered_hard_groups": self.filtered_hard_groups_per_step,
+            "buffer/kept_easy_groups": self.kept_easy_groups_per_step,
+        }
 
         # sum over envs (e.g. log globally)
         num_examples_per_step_per_pool = {

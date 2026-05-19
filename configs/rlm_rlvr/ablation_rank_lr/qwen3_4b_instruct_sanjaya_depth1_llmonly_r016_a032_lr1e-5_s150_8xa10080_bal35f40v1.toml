@@ -104,6 +104,16 @@ restart_on_worker_health_failure = true
 [orchestrator.attempt_logging]
 enabled = true
 
+[orchestrator.async_scheduling]
+prefetch_next_batch = false
+inflight_completion_cushion = 32
+max_requests_per_env_worker = 1
+max_cross_step_carryover = 32
+max_carryover_steps = 1
+cancel_stale_carryover = true
+restart_workers_for_stale_cancel = true
+batch_complete_cancel_grace_seconds = 2
+
 [orchestrator.sampling]
 temperature = 0.7
 max_tokens = 2048
@@ -111,7 +121,8 @@ extra_body = { return_token_ids = true, top_k = -1, min_p = 0.0 }
 
 [orchestrator.buffer]
 online_difficulty_filtering = true
-easy_threshold = 1.0
+online_filter_hard = true
+online_filter_easy = false
 hard_threshold = 0.0
 hard_cooldown_steps = 5
 seed = 42
@@ -131,7 +142,7 @@ final_samples = false
 
 [[orchestrator.env]]
 id = "rlm_rlvr"
-worker_count = 10
+worker_count = 32
 
 [orchestrator.env.args]
 dataset_id = "lsteno/BEEG-agents"
@@ -195,7 +206,7 @@ extra_body = { return_token_ids = true, top_k = -1, min_p = 0.0 }
 [[orchestrator.eval.env]]
 id = "rlm_rlvr"
 name = "rlm_rlvr_eval"
-worker_count = 8
+worker_count = 16
 num_examples = 64
 rollouts_per_example = 1
 

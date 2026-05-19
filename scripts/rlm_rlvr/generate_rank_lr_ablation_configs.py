@@ -15,8 +15,9 @@ OUT_DIR = ROOT / "configs/rlm_rlvr/ablation_rank_lr"
 PROMPT_VARIANT = "sanjaya_text_depth1_llm_only_v1"
 RUNTIME_MAX_DEPTH = 0
 EXPERIMENT_DEPTH = 1
-TRAIN_WORKER_COUNT = 10
-EVAL_WORKER_COUNT = 8
+TRAIN_WORKER_COUNT = 32
+EVAL_WORKER_COUNT = 16
+MAX_REQUESTS_PER_ENV_WORKER = 1
 ROLLOUT_TIMEOUT_SECONDS = 400
 REPL_TIMEOUT_SECONDS = 300
 REPL_FAST_TIMEOUT_SECONDS = 30
@@ -34,6 +35,13 @@ MISSING_FINAL_AT_MAX_TURN_ZERO_REWARD = True
 MAX_ASYNC_LEVEL = 2
 MAX_OFF_POLICY_STEPS = 4
 HARD_COOLDOWN_STEPS = 5
+PREFETCH_NEXT_BATCH = False
+INFLIGHT_COMPLETION_CUSHION = 32
+MAX_CROSS_STEP_CARRYOVER = 32
+MAX_CARRYOVER_STEPS = 1
+CANCEL_STALE_CARRYOVER = True
+RESTART_WORKERS_FOR_STALE_CANCEL = True
+BATCH_COMPLETE_CANCEL_GRACE_SECONDS = 2
 DEPTH1_TRAIN_SEQ_LEN = 49152
 DEPTH1_MAX_PROMPT_TOKENS = 47104
 DEPTH1_CONTEXT_PARALLEL = 2
@@ -125,6 +133,21 @@ def build_config(base: str, *, rank: int, alpha: int, lr: str, run_id: str) -> s
         "[orchestrator.attempt_logging]\n"
         "enabled = true\n",
     )
+    text = insert_after_once(
+        text,
+        "[orchestrator.attempt_logging]\n"
+        "enabled = true\n",
+        "\n"
+        "[orchestrator.async_scheduling]\n"
+        f"prefetch_next_batch = {str(PREFETCH_NEXT_BATCH).lower()}\n"
+        f"inflight_completion_cushion = {INFLIGHT_COMPLETION_CUSHION}\n"
+        f"max_requests_per_env_worker = {MAX_REQUESTS_PER_ENV_WORKER}\n"
+        f"max_cross_step_carryover = {MAX_CROSS_STEP_CARRYOVER}\n"
+        f"max_carryover_steps = {MAX_CARRYOVER_STEPS}\n"
+        f"cancel_stale_carryover = {str(CANCEL_STALE_CARRYOVER).lower()}\n"
+        f"restart_workers_for_stale_cancel = {str(RESTART_WORKERS_FOR_STALE_CANCEL).lower()}\n"
+        f"batch_complete_cancel_grace_seconds = {BATCH_COMPLETE_CANCEL_GRACE_SECONDS}\n",
+    )
     text = replace_line(text, r'^name = "qwen3-4b-instruct-sanjaya-medium-8xa100-40gb-budgeted"$', f'name = "{run_id}"')
     text = replace_all(
         text,
@@ -209,6 +232,14 @@ def build_config(base: str, *, rank: int, alpha: int, lr: str, run_id: str) -> s
         needle="hard_threshold = 0.0\n",
         line=f"hard_cooldown_steps = {HARD_COOLDOWN_STEPS}",
     )
+    text = replace_all(text, "easy_threshold = 1.0\n", "")
+    text = replace_all(
+        text,
+        "online_difficulty_filtering = true\n",
+        "online_difficulty_filtering = true\n"
+        "online_filter_hard = true\n"
+        "online_filter_easy = false\n",
+    )
     text = replace_all(text, "repl_timeout_seconds = 900", f"repl_timeout_seconds = {REPL_TIMEOUT_SECONDS}")
     text = replace_all(text, "repl_fast_timeout_seconds = 30", f"repl_fast_timeout_seconds = {REPL_FAST_TIMEOUT_SECONDS}")
     text = replace_all(
@@ -268,6 +299,14 @@ def main() -> None:
                 "max_async_level": MAX_ASYNC_LEVEL,
                 "max_off_policy_steps": MAX_OFF_POLICY_STEPS,
                 "hard_cooldown_steps": HARD_COOLDOWN_STEPS,
+                "prefetch_next_batch": str(PREFETCH_NEXT_BATCH).lower(),
+                "inflight_completion_cushion": INFLIGHT_COMPLETION_CUSHION,
+                "max_requests_per_env_worker": MAX_REQUESTS_PER_ENV_WORKER,
+                "max_cross_step_carryover": MAX_CROSS_STEP_CARRYOVER,
+                "max_carryover_steps": MAX_CARRYOVER_STEPS,
+                "cancel_stale_carryover": str(CANCEL_STALE_CARRYOVER).lower(),
+                "restart_workers_for_stale_cancel": str(RESTART_WORKERS_FOR_STALE_CANCEL).lower(),
+                "batch_complete_cancel_grace_seconds": BATCH_COMPLETE_CANCEL_GRACE_SECONDS,
                 "seq_len": DEPTH1_TRAIN_SEQ_LEN,
                 "max_prompt_tokens": DEPTH1_MAX_PROMPT_TOKENS,
                 "cp": DEPTH1_CONTEXT_PARALLEL,
@@ -311,7 +350,7 @@ def main() -> None:
 
     fieldnames = list(rows[0].keys())
     with (OUT_DIR / "manifest.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     (OUT_DIR / "manifest.json").write_text(json.dumps(rows, indent=2) + "\n")

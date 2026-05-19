@@ -537,6 +537,26 @@ class BufferConfig(BaseConfig):
         ),
     ] = False
 
+    online_filter_hard: Annotated[
+        bool,
+        Field(
+            description=(
+                "When online_difficulty_filtering is enabled, filter all-zero groups out of the current "
+                "update. This keeps the standard GRPO hard-prompt filtering behavior."
+            ),
+        ),
+    ] = True
+
+    online_filter_easy: Annotated[
+        bool,
+        Field(
+            description=(
+                "When online_difficulty_filtering is enabled, filter all-one groups out of the current "
+                "update. Disable this when the reward includes relative cost signal for all-correct groups."
+            ),
+        ),
+    ] = True
+
     hash_keys: Annotated[
         list[str],
         Field(
@@ -769,6 +789,84 @@ class AttemptLoggingConfig(BaseConfig):
     ] = False
 
 
+class AsyncSchedulingConfig(BaseConfig):
+    """Controls speculative rollout scheduling across orchestrator batches."""
+
+    prefetch_next_batch: Annotated[
+        bool,
+        Field(
+            description=(
+                "Whether to fill in-flight rollouts again after the current batch target is reached. "
+                "Disable for expensive environments where speculative cross-step work is wasteful."
+            ),
+        ),
+    ] = True
+
+    inflight_completion_cushion: Annotated[
+        int | None,
+        Field(
+            ge=0,
+            description=(
+                "If set, fill only up to remaining_needed + this cushion instead of max_inflight_rollouts. "
+                "This bounds near-end overscheduling while keeping async overlap."
+            ),
+        ),
+    ] = None
+
+    max_requests_per_env_worker: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Maximum scheduler-reserved rollout requests per managed env worker. If all workers are "
+                "at this cap, rollout filling stops until one finishes instead of queueing inside workers."
+            ),
+        ),
+    ] = None
+
+    max_cross_step_carryover: Annotated[
+        int | None,
+        Field(
+            ge=0,
+            description=(
+                "Maximum number of live rollout attempts to keep after a batch completes. None preserves "
+                "legacy unbounded carryover."
+            ),
+        ),
+    ] = None
+
+    max_carryover_steps: Annotated[
+        int,
+        Field(
+            ge=0,
+            description="Maximum number of later steps in which a carried-over rollout may still be accepted.",
+        ),
+    ] = 1
+
+    cancel_stale_carryover: Annotated[
+        bool,
+        Field(description="Whether to cancel in-flight carryover attempts that are older than max_carryover_steps."),
+    ] = False
+
+    restart_workers_for_stale_cancel: Annotated[
+        bool,
+        Field(
+            description=(
+                "Whether to restart locally spawned env worker generations when stale or excess carryover "
+                "is cancelled and no kept attempt remains on that worker generation."
+            ),
+        ),
+    ] = False
+
+    batch_complete_cancel_grace_seconds: Annotated[
+        float,
+        Field(
+            ge=0,
+            description="Grace period used when restarting a worker after stale/excess batch-complete cancellation.",
+        ),
+    ] = 2.0
+
+
 class OrchestratorConfig(BaseConfig):
     """Configures the orchestrator for RL training."""
 
@@ -823,6 +921,9 @@ class OrchestratorConfig(BaseConfig):
 
     # Per-rollout attempt logs
     attempt_logging: AttemptLoggingConfig = AttemptLoggingConfig()
+
+    # Bounded async rollout scheduling
+    async_scheduling: AsyncSchedulingConfig = AsyncSchedulingConfig()
 
     # The wandb configuration
     wandb: WandbWithExtrasConfig | None = None

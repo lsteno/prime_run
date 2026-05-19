@@ -369,7 +369,22 @@ class ManagedEnvClientPool(EnvClient):
             return 0
 
     def _worker_load(self, handle: EnvWorkerHandle) -> int:
-        return handle.inflight_count + self._client_pending_count(handle.client)
+        # Scheduler-visible reservations and EnvClient pending requests normally
+        # describe the same work. Use the larger value so orphaned internal
+        # requests still count without double-counting healthy reservations.
+        return max(handle.inflight_count, self._client_pending_count(handle.client))
+
+    def worker_loads(self) -> dict[str, int]:
+        return {handle.worker_name: self._worker_load(handle) for handle in self.handles}
+
+    def at_capacity_count(self, max_requests_per_worker: int | None) -> int:
+        if max_requests_per_worker is None:
+            return 0
+        return sum(
+            1
+            for handle in self.handles
+            if not handle.quarantined and self._worker_load(handle) >= max_requests_per_worker
+        )
 
     async def reserve_worker(self, weight: int = 1) -> EnvWorkerReservation:
         weight = max(1, weight)
@@ -384,6 +399,30 @@ class ManagedEnvClientPool(EnvClient):
                     chosen.inflight_count += weight
                     return EnvWorkerReservation(self, chosen, weight=weight)
                 await self._condition.wait()
+
+    async def try_reserve_worker(
+        self,
+        *,
+        weight: int = 1,
+        max_requests_per_worker: int | None = None,
+    ) -> EnvWorkerReservation | None:
+        weight = max(1, weight)
+        async with self._condition:
+            candidates = [handle for handle in self.handles if not handle.quarantined]
+            if max_requests_per_worker is not None:
+                candidates = [
+                    handle
+                    for handle in candidates
+                    if self._worker_load(handle) + weight <= max_requests_per_worker
+                ]
+            if not candidates:
+                return None
+            min_load = min(self._worker_load(handle) for handle in candidates)
+            least_loaded = [handle for handle in candidates if self._worker_load(handle) == min_load]
+            chosen = least_loaded[self._next_index % len(least_loaded)]
+            self._next_index += 1
+            chosen.inflight_count += weight
+            return EnvWorkerReservation(self, chosen, weight=weight)
 
     async def release_worker(self, reservation: EnvWorkerReservation) -> None:
         async with self._condition:

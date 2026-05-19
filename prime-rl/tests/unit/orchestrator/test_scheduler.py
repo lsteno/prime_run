@@ -4,7 +4,7 @@ import time
 from collections import deque
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import verifiers as vf
 
@@ -350,6 +350,7 @@ def test_enforce_rollout_deadlines_times_out_running_attempt_and_reschedules_slo
 def test_enforce_rollout_deadlines_does_not_timeout_completed_success():
     async def run() -> None:
         scheduler = Scheduler.__new__(Scheduler)
+        start_time = time.perf_counter() - 10.0
         task = asyncio.create_task(asyncio.sleep(0, result={"stop_condition": "has_final_env_response"}))
         await task
         scheduler.inflight_requests = {
@@ -360,9 +361,10 @@ def test_enforce_rollout_deadlines_does_not_timeout_completed_success():
                 group_id=3,
                 slot_index=0,
                 attempt_number=1,
-                start_time_perf=time.perf_counter() - 10.0,
+                start_time_perf=start_time,
             )
         }
+        scheduler.task_done_perf = {task: start_time + 0.5}
         scheduler.config = SimpleNamespace(rollout_timeout_seconds=1.0)
         scheduler._handle_rollout_timeout = MagicMock()
 
@@ -372,3 +374,228 @@ def test_enforce_rollout_deadlines_does_not_timeout_completed_success():
         scheduler._handle_rollout_timeout.assert_not_called()
 
     asyncio.run(run())
+
+
+def test_enforce_rollout_deadlines_marks_late_success_without_training_it():
+    async def run() -> None:
+        scheduler = Scheduler.__new__(Scheduler)
+        start_time = time.perf_counter() - 10.0
+        task = asyncio.create_task(asyncio.sleep(0, result={"stop_condition": "has_final_env_response"}))
+        await task
+        scheduler.groups = {
+            3: GroupState(
+                example={"task": "rlm_rlvr", "example_id": 5, "prompt": []},
+                pending_slots=deque([]),
+            )
+        }
+        scheduler.inflight_requests = {
+            task: InflightRolloutInfo(
+                off_policy_steps=0,
+                client_config=SimpleNamespace(api_base_url="http://test", extra_headers={}),
+                task="rlm_rlvr",
+                group_id=3,
+                slot_index=0,
+                attempt_number=1,
+                start_time_perf=start_time,
+            )
+        }
+        scheduler.task_done_perf = {task: start_time + 2.0}
+        scheduler.config = SimpleNamespace(
+            rollout_timeout_seconds=1.0,
+            attempt_logging=SimpleNamespace(enabled=False),
+            output_dir=None,
+            env_worker_recovery=SimpleNamespace(
+                enabled=True,
+                max_rollout_attempts_per_slot=4,
+                max_attempts_cooldown_steps=5,
+            ),
+        )
+        scheduler.current_phase = "train"
+        scheduler.scheduler_attempts_finished = 0
+        scheduler.attempt_late_success_after_timeout = 0
+        scheduler.attempt_late_success_after_timeout_by_task = defaultdict(int)
+        scheduler.attempts_by_task = defaultdict(int)
+        scheduler.attempt_reschedules = 0
+        scheduler._release_worker_reservation = AsyncMock()
+
+        await scheduler._enforce_rollout_deadlines(step=12)
+
+        assert task not in scheduler.inflight_requests
+        assert list(scheduler.groups[3].pending_slots) == [0]
+        assert scheduler.attempt_late_success_after_timeout == 1
+        assert scheduler.attempt_reschedules == 1
+
+    asyncio.run(run())
+
+
+def test_allowed_inflight_uses_remaining_need_plus_cushion():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.max_inflight_rollouts = 100
+    scheduler.batch_size = 64
+    scheduler.token_batch_size = None
+    scheduler.scheduler_allowed_inflight = 0
+    scheduler.config = SimpleNamespace(async_scheduling=SimpleNamespace(inflight_completion_cushion=20))
+
+    assert scheduler._allowed_inflight_for_progress(0) == 84
+    assert scheduler._allowed_inflight_for_progress(60) == 24
+    assert scheduler._allowed_inflight_for_progress(64) == 20
+
+
+def test_fill_inflight_requests_respects_allowed_inflight():
+    async def run() -> None:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.max_inflight_rollouts = 100
+        scheduler.rollouts_per_example = 4
+        scheduler.inflight_requests = {}
+        scheduler.groups = {}
+        scheduler.next_group_id = 0
+
+        class FakeBuffer:
+            def sample_examples(self, n):
+                return [{"task": "rlm_rlvr", "example_id": len(scheduler.groups), "prompt": []}]
+
+        scheduler.buffer = FakeBuffer()
+
+        async def fake_schedule_rollout(group_id: int):
+            task = asyncio.create_task(asyncio.sleep(60))
+            scheduler.inflight_requests[task] = InflightRolloutInfo(
+                off_policy_steps=0,
+                client_config=SimpleNamespace(api_base_url="http://test", extra_headers={}),
+                task="rlm_rlvr",
+                group_id=group_id,
+            )
+
+        scheduler.schedule_rollout = fake_schedule_rollout
+
+        await scheduler._fill_inflight_requests(allowed_inflight=3)
+
+        assert len(scheduler.inflight_requests) == 3
+
+        await asyncio.gather(*(asyncio.create_task(asyncio.sleep(0)) for _ in []))
+        for task in scheduler.inflight_requests:
+            task.cancel()
+        await asyncio.gather(*scheduler.inflight_requests.keys(), return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_managed_env_pool_try_reserve_respects_per_worker_cap():
+    async def run() -> None:
+        class FakeWorker:
+            address = "worker://0"
+            pending_requests = {}
+
+            async def wait_for_server_startup(self, timeout=None):
+                return None
+
+            async def close(self):
+                return None
+
+        pool = ManagedEnvClientPool(
+            [
+                EnvWorkerHandle(
+                    worker_id=0,
+                    worker_name="rlm_rlvr_w0",
+                    address="worker://0",
+                    process=None,
+                    client=FakeWorker(),
+                )
+            ],
+            name="rlm_rlvr",
+        )
+
+        first = await pool.try_reserve_worker(max_requests_per_worker=1)
+        assert first is not None
+        second = await pool.try_reserve_worker(max_requests_per_worker=1)
+        assert second is None
+        assert pool.worker_loads()["rlm_rlvr_w0"] == 1
+        assert pool.at_capacity_count(1) == 1
+
+        await first.release()
+        third = await pool.try_reserve_worker(max_requests_per_worker=1)
+        assert third is not None
+        await third.release()
+
+    asyncio.run(run())
+
+
+def test_trim_carryover_keeps_bounded_oldest_attempts_and_drops_other_groups():
+    async def run() -> None:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.current_phase = "train"
+        scheduler.config = SimpleNamespace(
+            output_dir=None,
+            rollout_timeout_seconds=400,
+            attempt_logging=SimpleNamespace(enabled=False),
+            async_scheduling=SimpleNamespace(
+                max_cross_step_carryover=2,
+                restart_workers_for_stale_cancel=False,
+                batch_complete_cancel_grace_seconds=0,
+            ),
+            env_worker_recovery=SimpleNamespace(enabled=True),
+        )
+        scheduler.groups = {
+            idx: GroupState(example={"task": "rlm_rlvr", "example_id": idx, "prompt": []}, pending_slots=deque([]))
+            for idx in range(4)
+        }
+        scheduler.inflight_requests = {}
+        scheduler.scheduler_cancelled_batch_complete = 0
+        scheduler.scheduler_cancelled_batch_complete_by_worker = defaultdict(int)
+
+        for idx in range(4):
+            task = asyncio.create_task(asyncio.sleep(60))
+            scheduler.inflight_requests[task] = InflightRolloutInfo(
+                off_policy_steps=0,
+                client_config=SimpleNamespace(api_base_url="http://test", extra_headers={}),
+                task="rlm_rlvr",
+                group_id=idx,
+                slot_index=0,
+                start_time_perf=100.0 + idx,
+                worker_id=idx,
+                worker_generation=0,
+                env_worker_name=f"w{idx}",
+            )
+
+        scheduler._release_worker_reservation = AsyncMock()
+        scheduler._restart_worker_for_batch_cancel = AsyncMock()
+
+        await scheduler._trim_carryover_at_batch_completion(step=3)
+
+        kept_group_ids = {info.group_id for info in scheduler.inflight_requests.values()}
+        assert len(scheduler.inflight_requests) == 2
+        assert kept_group_ids == {0, 1}
+        assert set(scheduler.groups) == {0, 1}
+        assert scheduler.scheduler_cancelled_batch_complete == 2
+
+        for task in scheduler.inflight_requests:
+            task.cancel()
+        await asyncio.gather(*scheduler.inflight_requests.keys(), return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_stale_carryover_is_discarded_after_max_carryover_steps():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(async_scheduling=SimpleNamespace(max_carryover_steps=1))
+    current = InflightRolloutInfo(
+        off_policy_steps=0,
+        client_config=SimpleNamespace(api_base_url="http://test", extra_headers={}),
+        task="rlm_rlvr",
+        scheduled_step=9,
+    )
+    one_step_old = InflightRolloutInfo(
+        off_policy_steps=0,
+        client_config=SimpleNamespace(api_base_url="http://test", extra_headers={}),
+        task="rlm_rlvr",
+        scheduled_step=8,
+    )
+    two_steps_old = InflightRolloutInfo(
+        off_policy_steps=0,
+        client_config=SimpleNamespace(api_base_url="http://test", extra_headers={}),
+        task="rlm_rlvr",
+        scheduled_step=7,
+    )
+
+    assert scheduler._is_stale_carryover(current, step=9) is False
+    assert scheduler._is_stale_carryover(one_step_old, step=9) is False
+    assert scheduler._is_stale_carryover(two_steps_old, step=9) is True
