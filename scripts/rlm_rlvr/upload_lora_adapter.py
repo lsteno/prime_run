@@ -8,7 +8,7 @@ from pathlib import Path
 from huggingface_hub import HfApi
 
 
-DEFAULT_REPO_PREFIX = "lsteno/Qwen3-4B-Instruct-2507-RLM-RL-depth1"
+DEFAULT_REPO_PREFIX = "lsteno/qwen3-rlm-depth1"
 
 
 def step_number(path: Path) -> int | None:
@@ -37,18 +37,21 @@ def latest_adapter_step(output_dir: Path) -> Path:
 
 def repo_id_for_run(run_id: str, repo_prefix: str) -> str:
     match = re.fullmatch(
-        r"rlm-rlvr-qwen3-4b-depth1-llmonly-r(?P<rank>\d+)-a(?P<alpha>\d+)-lr(?P<lr>.+)-s(?P<steps>\d+)",
+        r"rlm-rlvr-qwen3-4b-depth1-llmonly-r(?P<rank>\d+)-a(?P<alpha>\d+)-lr(?P<lr>.+)-s(?P<steps>\d+)(?:-(?P<suffix>.+))?",
         run_id,
     )
     if match is None:
         safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id)
         return f"{repo_prefix}-{safe_run_id}-lora"
+    suffix = match.group("suffix")
+    safe_suffix = f"-{re.sub(r'[^A-Za-z0-9_.-]+', '-', suffix)}" if suffix else ""
     return (
         f"{repo_prefix}-"
         f"r{int(match.group('rank'))}-"
         f"a{int(match.group('alpha'))}-"
         f"lr{match.group('lr')}-"
-        f"s{int(match.group('steps'))}-lora"
+        f"s{int(match.group('steps'))}"
+        f"{safe_suffix}-lora"
     )
 
 

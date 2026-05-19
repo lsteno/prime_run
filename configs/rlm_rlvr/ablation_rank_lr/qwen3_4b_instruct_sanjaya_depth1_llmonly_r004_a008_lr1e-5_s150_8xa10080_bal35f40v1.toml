@@ -196,7 +196,7 @@ extra_body = { return_token_ids = true, top_k = -1, min_p = 0.0 }
 [[orchestrator.eval.env]]
 id = "rlm_rlvr"
 name = "rlm_rlvr_eval"
-worker_count = 2
+worker_count = 8
 num_examples = 64
 rollouts_per_example = 1
 

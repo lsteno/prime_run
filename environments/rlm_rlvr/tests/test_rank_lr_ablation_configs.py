@@ -69,7 +69,7 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert config["orchestrator"]["attempt_logging"]["enabled"] is True
         assert config["orchestrator"]["buffer"]["hard_cooldown_steps"] == 5
         assert row["train_worker_count"] == "10"
-        assert row["eval_worker_count"] == "2"
+        assert row["eval_worker_count"] == "8"
         assert row["rollout_timeout_seconds"] == "400"
         assert row["env_worker_cancel_grace_seconds"] == "5"
         assert row["max_rollout_attempts_per_slot"] == "4"
@@ -97,7 +97,7 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert row["runtime_max_depth"] == "0"
         assert row["prompt_variant"] == "sanjaya_text_depth1_llm_only_v1"
         assert config["orchestrator"]["env"][0]["worker_count"] == 10
-        assert config["orchestrator"]["eval"]["env"][0]["worker_count"] == 2
+        assert config["orchestrator"]["eval"]["env"][0]["worker_count"] == 8
         assert config["orchestrator"]["env"][0]["args"]["prompt_variant"] == "sanjaya_text_depth1_llm_only_v1"
         assert config["orchestrator"]["eval"]["env"][0]["args"]["prompt_variant"] == "sanjaya_text_depth1_llm_only_v1"
         assert config["orchestrator"]["env"][0]["args"]["efficiency_penalty_mode"] == "adaptive_group"

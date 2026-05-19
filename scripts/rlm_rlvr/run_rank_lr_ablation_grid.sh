@@ -8,7 +8,7 @@ END_INDEX="${END_INDEX:-999}"
 DRY_RUN="${DRY_RUN:-0}"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/outputs/rlm_rank_lr_ablation_launcher_logs}"
 UPLOAD_ADAPTERS="${UPLOAD_ADAPTERS:-1}"
-HF_LORA_REPO_PREFIX="${HF_LORA_REPO_PREFIX:-lsteno/Qwen3-4B-Instruct-2507-RLM-RL-depth1}"
+HF_LORA_REPO_PREFIX="${HF_LORA_REPO_PREFIX:-lsteno/qwen3-rlm-depth1}"
 
 mkdir -p "$LOG_DIR"
 
