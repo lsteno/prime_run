@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from collections import deque
 from collections import defaultdict
 from types import SimpleNamespace
@@ -63,7 +64,7 @@ def test_update_off_policy_does_not_increment_interleaved_on_policy_tasks():
         for task in (stale_task, survivor_task, interleaved_task):
             if task is not None and not task.done():
                 task.cancel()
-        await asyncio.sleep(0)
+        await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(run())
 
@@ -278,5 +279,96 @@ def test_reschedule_or_drop_slot_cools_down_group_after_max_attempts():
 
         assert 3 not in scheduler.groups
         assert cooldown_calls == [(5, 12, 5)]
+
+    asyncio.run(run())
+
+
+def test_enforce_rollout_deadlines_times_out_running_attempt_and_reschedules_slot():
+    async def run() -> None:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.groups = {
+            3: GroupState(
+                example={"task": "rlm_rlvr", "example_id": 5, "prompt": []},
+                pending_slots=deque([]),
+            )
+        }
+        task = asyncio.create_task(asyncio.sleep(60))
+        scheduler.inflight_requests = {
+            task: InflightRolloutInfo(
+                off_policy_steps=0,
+                client_config=SimpleNamespace(api_base_url="http://test", extra_headers={}),
+                task="rlm_rlvr",
+                group_id=3,
+                slot_index=0,
+                attempt_number=1,
+                start_time_perf=time.perf_counter() - 10.0,
+            )
+        }
+        scheduler.current_phase = "train"
+        scheduler.logger = MagicMock()
+        scheduler.sampling_args = {"temperature": 0.7}
+        scheduler.rollouts_per_example = 4
+        scheduler.total_rollouts_by_task = defaultdict(int)
+        scheduler.timeout_rollouts_by_task = defaultdict(int)
+        scheduler.empty_rollouts_by_task = defaultdict(int)
+        scheduler.errored_rollouts_by_task = defaultdict(int)
+        scheduler.attempt_timeouts = 0
+        scheduler.attempt_timeouts_by_task = defaultdict(int)
+        scheduler.attempts_by_task = defaultdict(int)
+        scheduler.attempt_reschedules = 0
+        scheduler.config = SimpleNamespace(
+            rollout_timeout_seconds=1.0,
+            env_worker_recovery=SimpleNamespace(
+                enabled=True,
+                max_rollout_attempts_per_slot=4,
+                max_attempts_cooldown_steps=5,
+            ),
+            attempt_logging=SimpleNamespace(enabled=False),
+            output_dir=None,
+        )
+        restart_calls = []
+
+        async def fake_restart(info, step):
+            restart_calls.append((info.group_id, step))
+
+        scheduler._restart_worker_for_timeout = fake_restart
+
+        await scheduler._enforce_rollout_deadlines(step=12)
+
+        assert task not in scheduler.inflight_requests
+        assert scheduler.timeout_rollouts_by_task["rlm_rlvr"] == 1
+        assert scheduler.attempt_timeouts == 1
+        assert scheduler.attempt_reschedules == 1
+        assert list(scheduler.groups[3].pending_slots) == [0]
+        assert restart_calls == [(3, 12)]
+
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+def test_enforce_rollout_deadlines_does_not_timeout_completed_success():
+    async def run() -> None:
+        scheduler = Scheduler.__new__(Scheduler)
+        task = asyncio.create_task(asyncio.sleep(0, result={"stop_condition": "has_final_env_response"}))
+        await task
+        scheduler.inflight_requests = {
+            task: InflightRolloutInfo(
+                off_policy_steps=0,
+                client_config=SimpleNamespace(api_base_url="http://test", extra_headers={}),
+                task="rlm_rlvr",
+                group_id=3,
+                slot_index=0,
+                attempt_number=1,
+                start_time_perf=time.perf_counter() - 10.0,
+            )
+        }
+        scheduler.config = SimpleNamespace(rollout_timeout_seconds=1.0)
+        scheduler._handle_rollout_timeout = MagicMock()
+
+        await scheduler._enforce_rollout_deadlines(step=12)
+
+        assert task in scheduler.inflight_requests
+        scheduler._handle_rollout_timeout.assert_not_called()
 
     asyncio.run(run())

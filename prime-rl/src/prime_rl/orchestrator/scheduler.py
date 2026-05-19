@@ -19,6 +19,7 @@ from prime_rl.orchestrator.vf_utils import (
     EnvWorkerReservation,
     ManagedEnvClientPool,
     get_seq_len,
+    make_timeout_rollout,
     run_rollout,
 )
 from prime_rl.utils.async_utils import safe_cancel, safe_cancel_all
@@ -286,6 +287,22 @@ class Scheduler:
         idx = min(len(ordered) - 1, max(0, int(round((percentile / 100.0) * (len(ordered) - 1)))))
         return ordered[idx]
 
+    def _rollout_deadline_exceeded(self, info: InflightRolloutInfo, now: float | None = None) -> bool:
+        timeout = self.config.rollout_timeout_seconds
+        if timeout is None or info.start_time_perf <= 0:
+            return False
+        return ((now or time.perf_counter()) - info.start_time_perf) >= timeout
+
+    def _timeout_rollout_for_info(self, info: InflightRolloutInfo) -> vf.RolloutOutput:
+        example: dict[str, Any] = {"task": info.task}
+        if info.group_id is not None and info.group_id in self.groups:
+            example = self.groups[info.group_id].example
+        elif info.example_id is not None:
+            example["example_id"] = info.example_id
+        timeout = self.config.rollout_timeout_seconds
+        assert timeout is not None
+        return make_timeout_rollout(example, self.sampling_args, timeout)
+
     async def drop_group(self, group_id: int, *, step: int | None = None, reason: str | None = None) -> int:
         """Drop a group and cancel any remaining in-flight rollouts for it."""
         tasks_to_cancel = []
@@ -534,6 +551,7 @@ class Scheduler:
         worker_generation: int,
         step: int,
         reason: str,
+        await_cancellation: bool = True,
     ) -> int:
         tasks_to_cancel = []
         affected_infos: list[InflightRolloutInfo] = []
@@ -549,7 +567,11 @@ class Scheduler:
             self._log_attempt_finished(info, step=step, status="cancelled_for_worker_restart")
             await self._reschedule_or_drop_slot(info, step=step, reason=reason, count_as_reschedule=True)
 
-        await safe_cancel_all(tasks_to_cancel)
+        if await_cancellation:
+            await safe_cancel_all(tasks_to_cancel)
+        else:
+            for task in tasks_to_cancel:
+                task.cancel()
         return len(tasks_to_cancel)
 
     async def _restart_worker_for_timeout(self, info: InflightRolloutInfo, step: int) -> None:
@@ -584,6 +606,7 @@ class Scheduler:
             worker_generation=info.worker_generation,
             step=step,
             reason="worker_restart",
+            await_cancellation=False,
         )
         try:
             handle = await worker_pool.restart_worker(
@@ -622,6 +645,77 @@ class Scheduler:
                 },
             )
             self.logger.warning(f"Failed to restart env worker {info.env_worker_name}: {exc!r}")
+
+    async def _handle_rollout_timeout(
+        self,
+        task: asyncio.Task,
+        info: InflightRolloutInfo,
+        *,
+        step: int,
+        reason: str,
+        rollout: vf.RolloutOutput | None = None,
+    ) -> None:
+        """Enforce a rollout timeout from scheduler-visible wall-clock state."""
+        self.inflight_requests.pop(task, None)
+        await self._release_worker_reservation(info)
+        if not task.done():
+            task.cancel()
+
+        timeout_rollout = rollout if rollout is not None else self._timeout_rollout_for_info(info)
+        self.total_rollouts_by_task[info.task] += 1
+        self.timeout_rollouts_by_task[info.task] += 1
+        self.empty_rollouts_by_task[info.task] += int(len(timeout_rollout["trajectory"]) == 0)
+        self.errored_rollouts_by_task[info.task] += int(timeout_rollout["error"] is not None)
+        self._log_attempt_finished(info, step=step, status="timeout", rollout=timeout_rollout)
+        await self._restart_worker_for_timeout(info, step=step)
+        await self._reschedule_or_drop_slot(
+            info,
+            step=step,
+            reason=reason,
+            count_as_reschedule=True,
+        )
+        group = self.groups.get(info.group_id) if info.group_id is not None else None
+        self.logger.warning(
+            f"Rollout timeout in group {info.group_id} ({info.task}) after "
+            f"{self.config.rollout_timeout_seconds}s, re-scheduling "
+            f"({len(group.completed_rollouts) if group is not None else 0}/{self.rollouts_per_example} complete, "
+            f"attempt {info.attempt_number}/"
+            f"{self.config.env_worker_recovery.max_rollout_attempts_per_slot}; reason={reason})"
+        )
+
+    async def _enforce_rollout_deadlines(self, *, step: int) -> None:
+        if self.config.rollout_timeout_seconds is None:
+            return
+        now = time.perf_counter()
+        candidates = [
+            (task, info)
+            for task, info in list(self.inflight_requests.items())
+            if self._rollout_deadline_exceeded(info, now=now)
+        ]
+        for task, info in candidates:
+            if task not in self.inflight_requests:
+                continue
+            rollout: vf.RolloutOutput | None = None
+            if task.done():
+                try:
+                    result = task.result()
+                except (asyncio.CancelledError, Exception):
+                    continue
+                if result.get("stop_condition") != "rollout_timeout":
+                    continue
+                rollout = result
+            await self._handle_rollout_timeout(
+                task,
+                info,
+                step=step,
+                reason="scheduler_wall_clock_timeout",
+                rollout=rollout,
+            )
+
+    async def _rollout_deadline_watchdog_loop(self, *, step: int) -> None:
+        while True:
+            await asyncio.sleep(1.0)
+            await self._enforce_rollout_deadlines(step=step)
 
     async def _reschedule_or_drop_slot(
         self,
@@ -718,126 +812,133 @@ class Scheduler:
         # This ensures we respect max_async_level while still listening for policy updates mid-step.
         await self.maybe_update_policy()
         self.update_policy_task = asyncio.create_task(self.update_policy_loop())
+        deadline_watchdog_task = asyncio.create_task(self._rollout_deadline_watchdog_loop(step=step))
 
         batch_start_time = time.perf_counter()
 
-        self.logger.debug("Starting to generate batch rollouts")
-        self.buffer.release_due_hard_examples(step)
+        try:
+            self.logger.debug("Starting to generate batch rollouts")
+            self.buffer.release_due_hard_examples(step)
 
-        batch_rollouts: list[vf.RolloutOutput] = []
-        batch_progress = 0
-        pbar = ProgressTracker(
-            total=self.batch_target, desc="Generating rollouts (train)", json_logging=self.json_logging, step=step
-        )
-
-        while batch_progress < self.batch_target:
-            await self._fill_inflight_requests()
-            inflight_tasks = list(self.inflight_requests.keys())
-
-            finished_tasks, _ = await asyncio.wait(
-                inflight_tasks,
-                return_when=asyncio.FIRST_COMPLETED,
+            batch_rollouts: list[vf.RolloutOutput] = []
+            batch_progress = 0
+            pbar = ProgressTracker(
+                total=self.batch_target, desc="Generating rollouts (train)", json_logging=self.json_logging, step=step
             )
-            await self.checkpoint_ready.wait()
 
-            for finished_task in finished_tasks:
-                if batch_progress >= self.batch_target:
-                    break
-
-                rollout_info = self.inflight_requests.pop(finished_task, None)
-                if rollout_info is None:
-                    continue
-                await self._release_worker_reservation(rollout_info)
-
-                group_id = rollout_info.group_id
-
-                try:
-                    group = self.groups.get(group_id)
-                    if group is None:
-                        continue
-                    rollout = finished_task.result()
-
-                    task = rollout_info.task
-                    self.total_rollouts_by_task[task] += 1
-                    should_reschedule = False
-                    if rollout.get("stop_condition") == "rollout_timeout":
-                        self.timeout_rollouts_by_task[task] += 1
-                        self.empty_rollouts_by_task[task] += int(len(rollout["trajectory"]) == 0)
-                        self.errored_rollouts_by_task[task] += int(rollout["error"] is not None)
-                        self._log_attempt_finished(rollout_info, step=step, status="timeout", rollout=rollout)
-                        await self._restart_worker_for_timeout(rollout_info, step=step)
-                        await self._reschedule_or_drop_slot(
-                            rollout_info,
-                            step=step,
-                            reason="rollout_timeout",
-                            count_as_reschedule=True,
-                        )
-                        self.logger.warning(
-                            f"Rollout timeout in group {group_id} ({task}) after "
-                            f"{self.config.rollout_timeout_seconds}s, re-scheduling "
-                            f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete, "
-                            f"attempt {rollout_info.attempt_number}/"
-                            f"{self.config.env_worker_recovery.max_rollout_attempts_per_slot})"
-                        )
-                        continue
-                    if len(rollout["trajectory"]) == 0:
-                        self.empty_rollouts_by_task[task] += 1
-                        should_reschedule = True
-                        self.logger.warning(
-                            f"Empty trajectory in group {group_id} ({task}), re-scheduling "
-                            f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete)"
-                        )
-                    if rollout["error"] is not None:
-                        self.errored_rollouts_by_task[task] += 1
-                        should_reschedule = True
-                        self.logger.warning(
-                            f"Rollout error in group {group_id} ({task}), re-scheduling "
-                            f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete): "
-                            f"{rollout['error']['error_chain_repr']}"
-                        )
-                    if should_reschedule:
-                        self._log_attempt_finished(rollout_info, step=step, status="rescheduled", rollout=rollout)
-                        await self._reschedule_or_drop_slot(
-                            rollout_info,
-                            step=step,
-                            reason="empty_or_error",
-                            count_as_reschedule=True,
-                        )
-                        continue
-
-                    self._log_attempt_finished(rollout_info, step=step, status="success", rollout=rollout)
-                    assert rollout_info.slot_index is not None
-                    group.completed_rollouts[rollout_info.slot_index] = rollout
-                    if len(group.completed_rollouts) < self.rollouts_per_example:
-                        continue
-                    completed_by_slot = self.groups.pop(group_id).completed_rollouts
-                    completed_rollouts = [completed_by_slot[idx] for idx in sorted(completed_by_slot)]
-                    completed_rollouts = await self._score_group_if_deferred(completed_rollouts)
-                except asyncio.CancelledError:
-                    if group_id is not None:
-                        await self.drop_group(group_id)
-                    continue
-                except Exception as e:
-                    self.logger.warning(f"Rollout failed: {e}")
-                    self._log_attempt_finished(rollout_info, step=step, status="error", error=repr(e))
-                    if group_id is not None:
-                        await self.drop_group(group_id)
+            while batch_progress < self.batch_target:
+                await self._fill_inflight_requests()
+                inflight_tasks = list(self.inflight_requests.keys())
+                if not inflight_tasks:
+                    await asyncio.sleep(1.0)
                     continue
 
-                self.buffer.update(completed_rollouts, step=step)
-                accepted_rollouts = self.buffer.sample_rollouts(n=self.rollouts_per_example)
+                finished_tasks, _ = await asyncio.wait(
+                    inflight_tasks,
+                    timeout=1.0,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                await self.checkpoint_ready.wait()
+                await self._enforce_rollout_deadlines(step=step)
 
-                batch_rollouts.extend(accepted_rollouts)
-                progress_increment = self.get_batch_progress_increment(accepted_rollouts)
-                batch_progress += progress_increment
-                pbar.update(progress_increment)
+                for finished_task in finished_tasks:
+                    if batch_progress >= self.batch_target:
+                        break
 
-        await self._fill_inflight_requests()
+                    rollout_info = self.inflight_requests.pop(finished_task, None)
+                    if rollout_info is None:
+                        continue
+                    await self._release_worker_reservation(rollout_info)
 
-        batch_rollouts = self.finalize_batch_rollouts(batch_rollouts)
-        pbar.close()
-        self.last_batch_generation_time = time.perf_counter() - batch_start_time
-        return batch_rollouts
+                    group_id = rollout_info.group_id
+
+                    try:
+                        group = self.groups.get(group_id)
+                        if group is None:
+                            continue
+                        rollout = finished_task.result()
+
+                        task = rollout_info.task
+                        if self._rollout_deadline_exceeded(rollout_info) and rollout.get("stop_condition") == "rollout_timeout":
+                            await self._handle_rollout_timeout(
+                                finished_task,
+                                rollout_info,
+                                step=step,
+                                reason="scheduler_wall_clock_timeout",
+                                rollout=rollout,
+                            )
+                            continue
+                        self.total_rollouts_by_task[task] += 1
+                        should_reschedule = False
+                        if rollout.get("stop_condition") == "rollout_timeout":
+                            await self._handle_rollout_timeout(
+                                finished_task,
+                                rollout_info,
+                                step=step,
+                                reason="rollout_timeout",
+                                rollout=rollout,
+                            )
+                            continue
+                        if len(rollout["trajectory"]) == 0:
+                            self.empty_rollouts_by_task[task] += 1
+                            should_reschedule = True
+                            self.logger.warning(
+                                f"Empty trajectory in group {group_id} ({task}), re-scheduling "
+                                f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete)"
+                            )
+                        if rollout["error"] is not None:
+                            self.errored_rollouts_by_task[task] += 1
+                            should_reschedule = True
+                            self.logger.warning(
+                                f"Rollout error in group {group_id} ({task}), re-scheduling "
+                                f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete): "
+                                f"{rollout['error']['error_chain_repr']}"
+                            )
+                        if should_reschedule:
+                            self._log_attempt_finished(rollout_info, step=step, status="rescheduled", rollout=rollout)
+                            await self._reschedule_or_drop_slot(
+                                rollout_info,
+                                step=step,
+                                reason="empty_or_error",
+                                count_as_reschedule=True,
+                            )
+                            continue
+
+                        self._log_attempt_finished(rollout_info, step=step, status="success", rollout=rollout)
+                        assert rollout_info.slot_index is not None
+                        group.completed_rollouts[rollout_info.slot_index] = rollout
+                        if len(group.completed_rollouts) < self.rollouts_per_example:
+                            continue
+                        completed_by_slot = self.groups.pop(group_id).completed_rollouts
+                        completed_rollouts = [completed_by_slot[idx] for idx in sorted(completed_by_slot)]
+                        completed_rollouts = await self._score_group_if_deferred(completed_rollouts)
+                    except asyncio.CancelledError:
+                        if group_id is not None:
+                            await self.drop_group(group_id)
+                        continue
+                    except Exception as e:
+                        self.logger.warning(f"Rollout failed: {e}")
+                        self._log_attempt_finished(rollout_info, step=step, status="error", error=repr(e))
+                        if group_id is not None:
+                            await self.drop_group(group_id)
+                        continue
+
+                    self.buffer.update(completed_rollouts, step=step)
+                    accepted_rollouts = self.buffer.sample_rollouts(n=self.rollouts_per_example)
+
+                    batch_rollouts.extend(accepted_rollouts)
+                    progress_increment = self.get_batch_progress_increment(accepted_rollouts)
+                    batch_progress += progress_increment
+                    pbar.update(progress_increment)
+
+            await self._fill_inflight_requests()
+
+            batch_rollouts = self.finalize_batch_rollouts(batch_rollouts)
+            pbar.close()
+            self.last_batch_generation_time = time.perf_counter() - batch_start_time
+            return batch_rollouts
+        finally:
+            await safe_cancel(deadline_watchdog_task)
 
     async def stop(self) -> None:
         await self.cancel_inflight_rollouts()
