@@ -81,6 +81,13 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         super().__init__(max_turns=runtime_config.max_iterations + 2, interleaved_rollouts=True, **kwargs)
         self.runtime_config = runtime_config
 
+    @vf.stop(priority=10)
+    async def max_turns_reached(self, state: vf.State) -> bool:
+        """Treat a failed forced-finalize response as the max-turn stop condition."""
+        if state.get("hit_max_turn_without_final"):
+            return True
+        return len(state["trajectory"]) >= self.max_turns and self.max_turns > 0
+
     async def setup_state(self, state: vf.State) -> vf.State:
         client = state["client"]
         if not isinstance(client, AsyncOpenAI):

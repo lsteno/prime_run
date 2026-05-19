@@ -47,6 +47,10 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert config["output_dir"] == f"../{row['output_dir']}"
         assert config["wandb"]["project"] == "rlm-rlvr"
         assert config["wandb"]["name"] == row["wandb_name"]
+        assert config["orchestrator"]["wandb"]["log_extras"]["interval"] == 10
+        assert config["orchestrator"]["wandb"]["log_extras"]["sample_max_chars"] == 8000
+        assert config["orchestrator"]["wandb"]["log_extras"]["sample_include_input_ids"] is False
+        assert config["orchestrator"]["wandb"]["log_extras"]["final_samples"] is False
 
         assert config["trainer"]["optim"]["lr"] == float(row["lr"])
         assert config["trainer"]["model"]["lora"]["rank"] == int(row["rank"])
@@ -70,6 +74,10 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert row["env_worker_cancel_grace_seconds"] == "5"
         assert row["max_rollout_attempts_per_slot"] == "4"
         assert row["max_attempts_cooldown_steps"] == "5"
+        assert row["wandb_log_extras_interval"] == "10"
+        assert row["wandb_sample_max_chars"] == "8000"
+        assert row["wandb_sample_include_input_ids"] == "false"
+        assert row["wandb_final_samples"] == "false"
         assert row["repl_timeout_seconds"] == "300"
         assert row["hard_cooldown_steps"] == "5"
         assert row["seq_len"] == "49152"

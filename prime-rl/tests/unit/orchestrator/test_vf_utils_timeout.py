@@ -237,6 +237,11 @@ def test_managed_env_client_pool_routes_active_reservation():
 
 
 def test_required_state_columns_include_rlm_protocol_metrics():
+    assert "used_forced_finalize_prompt" in REQUIRED_STATE_COLUMNS
+    assert "hit_max_turn_without_final" in REQUIRED_STATE_COLUMNS
+    assert "missing_final" in REQUIRED_STATE_COLUMNS
+    assert "finalized_before_forced_prompt" in REQUIRED_STATE_COLUMNS
+    assert "finalized_on_forced_prompt" in REQUIRED_STATE_COLUMNS
     assert "used_repl" in REQUIRED_STATE_COLUMNS
     assert "used_llm_subcalls" in REQUIRED_STATE_COLUMNS
     assert "num_llm_subcalls" in REQUIRED_STATE_COLUMNS

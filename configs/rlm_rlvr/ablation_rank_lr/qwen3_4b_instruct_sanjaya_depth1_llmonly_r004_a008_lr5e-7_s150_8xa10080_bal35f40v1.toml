@@ -125,7 +125,10 @@ include_metrics = true
 [orchestrator.wandb.log_extras]
 samples = true
 distributions = true
-interval = 1
+interval = 10
+sample_max_chars = 8000
+sample_include_input_ids = false
+final_samples = false
 
 [[orchestrator.env]]
 id = "rlm_rlvr"

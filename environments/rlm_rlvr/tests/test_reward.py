@@ -285,6 +285,72 @@ def test_build_rubric_zeroes_missing_formal_final_at_max_turn(monkeypatch) -> No
     assert state["reward_max_turn_penalty"] == 0.0
 
 
+def test_build_rubric_zeroes_missing_final_from_stop_condition_without_flags(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+        max_turn_penalty_enabled=True,
+        missing_final_at_max_turn_zero_reward=True,
+    )
+    reward_fn = rubric.funcs[0]
+    state = {
+        "final_answer": None,
+        "stop_condition": "max_turns_reached",
+        "efficiency_penalty_coef": 0.0,
+        "rlm_segments": [],
+        "trajectory": [],
+    }
+
+    score = asyncio.run(reward_fn(state, [{"content": "42"}], "42", {"question": "What is the answer?"}))
+
+    assert score == 0.0
+    assert state["reward_correctness"] == 0.0
+    assert state["judge_predicted_answer"] == "42"
+    assert state["judge_raw_response"] == "[missing_final_at_max_turn]"
+
+
+def test_build_rubric_zeroes_missing_final_from_trajectory_debug(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+        max_turn_penalty_enabled=True,
+        missing_final_at_max_turn_zero_reward=True,
+    )
+    reward_fn = rubric.funcs[0]
+    state = {
+        "final_answer": None,
+        "efficiency_penalty_coef": 0.0,
+        "rlm_segments": [],
+        "trajectory": [
+            {
+                "extras": {
+                    "rlm_debug": {
+                        "missing_final": True,
+                    }
+                }
+            }
+        ],
+    }
+
+    score = asyncio.run(reward_fn(state, [{"content": "42"}], "42", {"question": "What is the answer?"}))
+
+    assert score == 0.0
+    assert state["reward_correctness"] == 0.0
+    assert state["judge_raw_response"] == "[missing_final_at_max_turn]"
+
+
 def test_build_rubric_penalizes_correct_forced_finalize_turn(monkeypatch) -> None:
     class _DummyAsyncOpenAI:
         def __init__(self, *args, **kwargs) -> None:
@@ -460,6 +526,49 @@ def test_adaptive_group_penalizes_correct_forced_finalize_turn(monkeypatch) -> N
     assert scores == [0.75, 1.0, 1.0, 1.0]
     assert states[0]["reward_correctness"] == 1.0
     assert states[0]["reward_group_solve_rate"] == 1.0
+    assert states[0]["reward_max_turn_penalty"] == 0.25
+
+
+def test_adaptive_group_zeroes_missing_final_and_penalizes_valid_correct_rollouts(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    async def _judge_zero(*args, **kwargs):
+        del args, kwargs
+        return 0.0, "0", None
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    monkeypatch.setattr(reward_module, "_call_binary_judge", _judge_zero)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+        efficiency_penalty_mode="adaptive_group",
+        adaptive_efficiency_beta_max=0.15,
+        adaptive_efficiency_gamma=1.0,
+        max_turn_penalty_enabled=True,
+        max_turn_penalty=0.25,
+        missing_final_at_max_turn_zero_reward=True,
+    )
+    reward_fn = rubric.funcs[0]
+    states = [
+        _adaptive_test_state("42", 20),
+        _adaptive_test_state("42", 80),
+        _adaptive_test_state(None, 100),
+        _adaptive_test_state("wrong", 10),
+    ]
+    states[0]["finalized_on_forced_prompt"] = True
+    states[2]["stop_condition"] = "max_turns_reached"
+    states[2]["completion"] = [{"content": "42"}]
+
+    scores = asyncio.run(reward_fn(states))
+
+    # Two of four rollouts are valid-correct, so beta is 0.15 * ((0.5 - 0.25) / 0.75).
+    expected_beta = 0.15 * ((0.5 - 0.25) / 0.75)
+    assert scores == [0.75, 1.0 - expected_beta, 0.0, 0.0]
+    assert states[2]["reward_correctness"] == 0.0
+    assert states[2]["judge_raw_response"] == "[missing_final_at_max_turn]"
     assert states[0]["reward_max_turn_penalty"] == 0.25
 
 

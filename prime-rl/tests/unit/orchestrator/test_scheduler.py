@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections import deque
 from collections import defaultdict
 from types import SimpleNamespace
@@ -218,6 +219,17 @@ def test_schedule_rollout_records_worker_attempt_metadata():
             scheduler_module.run_rollout = original_run_rollout
 
     asyncio.run(run())
+
+
+def test_scheduler_metadata_helpers_accept_json_string_info():
+    scheduler = Scheduler.__new__(Scheduler)
+    example = {
+        "task": "rlm_rlvr",
+        "info": json.dumps({"source_id": "frames-123", "dataset_name": "frames"}),
+    }
+
+    assert scheduler._source_id(example) == "frames-123"
+    assert scheduler._dataset_name(example) == "frames"
 
 
 def test_reschedule_or_drop_slot_cools_down_group_after_max_attempts():

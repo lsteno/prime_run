@@ -126,6 +126,18 @@ def build_config(base: str, *, rank: int, alpha: int, lr: str, run_id: str) -> s
         "enabled = true\n",
     )
     text = replace_line(text, r'^name = "qwen3-4b-instruct-sanjaya-medium-8xa100-40gb-budgeted"$', f'name = "{run_id}"')
+    text = replace_all(
+        text,
+        "samples = true\n"
+        "distributions = true\n"
+        "interval = 1\n",
+        "samples = true\n"
+        "distributions = true\n"
+        "interval = 10\n"
+        "sample_max_chars = 8000\n"
+        "sample_include_input_ids = false\n"
+        "final_samples = false\n",
+    )
     text = replace_line(text, r"^lr = .+$", f"lr = {lr}")
     text = replace_line(text, r"^rank = \d+$", f"rank = {rank}")
     text = replace_line(text, r"^alpha = \d+$", f"alpha = {alpha}")
@@ -268,6 +280,10 @@ def main() -> None:
                 "env_worker_cancel_grace_seconds": ENV_WORKER_CANCEL_GRACE_SECONDS,
                 "max_rollout_attempts_per_slot": MAX_ROLLOUT_ATTEMPTS_PER_SLOT,
                 "max_attempts_cooldown_steps": MAX_ATTEMPTS_COOLDOWN_STEPS,
+                "wandb_log_extras_interval": 10,
+                "wandb_sample_max_chars": 8000,
+                "wandb_sample_include_input_ids": "false",
+                "wandb_final_samples": "false",
                 "repl_timeout_seconds": REPL_TIMEOUT_SECONDS,
                 "max_total_subcalls": MAX_TOTAL_SUBCALLS,
                 "max_batched_subcalls": MAX_BATCHED_SUBCALLS,

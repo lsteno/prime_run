@@ -34,6 +34,11 @@ from prime_rl.orchestrator.buffer import Buffer
 from prime_rl.orchestrator.ckpt import Progress, setup_ckpt_manager
 from prime_rl.orchestrator.eval_utils import evaluate_env
 from prime_rl.orchestrator.filters import apply_filters, setup_filters
+from prime_rl.orchestrator.logging_metrics import (
+    rlm_cost_subcall_metrics,
+    rlm_protocol_metrics,
+    stable_stop_condition_metrics,
+)
 from prime_rl.orchestrator.scheduler import Scheduler
 from prime_rl.orchestrator.trace_export import export_rollout_traces
 from prime_rl.orchestrator.utils import (
@@ -785,13 +790,13 @@ async def orchestrate(config: OrchestratorConfig):
             "is_truncated/all/mean": by_example.is_truncated.mean().mean(),
             "is_truncated/all/max": by_example.is_truncated.mean().max(),
             "is_truncated/all/min": by_example.is_truncated.mean().min(),
-            "stop_condition/all/generation_truncated": (
-                results_df.is_truncated & (results_df.stop_condition != "prompt_too_long")
-            ).mean(),
+            **stable_stop_condition_metrics(results_df, prefix="all"),
             **{
                 f"stop_condition/all/{sc}": rate
                 for sc, rate in results_df.stop_condition.dropna().value_counts(normalize=True).items()
             },
+            **rlm_protocol_metrics(results_df, metrics_df, prefix="all"),
+            **rlm_cost_subcall_metrics(results_df, metrics_df, prefix="all"),
             "samples_per_rollout/all/mean": by_example.samples_per_rollout.mean().mean(),
             "samples_per_rollout/all/max": by_example.samples_per_rollout.mean().max(),
             "samples_per_rollout/all/min": by_example.samples_per_rollout.mean().min(),
@@ -859,9 +864,9 @@ async def orchestrate(config: OrchestratorConfig):
             to_log[f"solve_none/{env}"] = solve_none
             to_log[f"solve_all/{env}"] = solve_all
             to_log[f"effective_batch_size/{env}"] = effective_batch_size
-            to_log[f"stop_condition/{env}/generation_truncated"] = (
-                env_df.is_truncated & (env_df.stop_condition != "prompt_too_long")
-            ).mean()
+            to_log.update(stable_stop_condition_metrics(env_df, prefix=env))
+            to_log.update(rlm_protocol_metrics(env_df, metrics_df.loc[env_df.index], prefix=env))
+            to_log.update(rlm_cost_subcall_metrics(env_df, metrics_df.loc[env_df.index], prefix=env))
             for sc, rate in env_df.stop_condition.dropna().value_counts(normalize=True).items():
                 to_log[f"stop_condition/{env}/{sc}"] = rate
             env_metrics_df = metrics_df.loc[env_df.index]

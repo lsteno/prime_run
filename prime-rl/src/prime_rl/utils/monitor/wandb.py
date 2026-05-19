@@ -67,7 +67,6 @@ class WandbMonitor(Monitor):
                     "task",
                     "example_id",
                     "messages",
-                    "input_ids",
                     "answer",
                     "expected_answers",
                     "rlm_answer",
@@ -75,6 +74,8 @@ class WandbMonitor(Monitor):
                     "judge_raw_response",
                     "reward",
                 ]
+                if config.log_extras.sample_include_input_ids:
+                    self.samples_cols.insert(4, "input_ids")
                 self.samples_table = wandb.Table(
                     columns=self.samples_cols,
                     log_mode="INCREMENTAL",
@@ -114,6 +115,19 @@ class WandbMonitor(Monitor):
             self.logger.debug(f"Found WANDB_ARGS in environment variables {wandb_args}")
             sys.argv = json.loads(wandb_args)
 
+    def _truncate_sample_text(self, text: str) -> str:
+        if (
+            not self.config
+            or not isinstance(self.config, WandbWithExtrasConfig)
+            or not self.config.log_extras
+            or self.config.log_extras.sample_max_chars <= 0
+            or len(text) <= self.config.log_extras.sample_max_chars
+        ):
+            return text
+        max_chars = self.config.log_extras.sample_max_chars
+        omitted = len(text) - max_chars
+        return f"{text[:max_chars]}\n...[truncated {omitted} chars; full trace is on disk]"
+
     def log(self, metrics: dict[str, Any], step: int | None = None) -> None:
         self.history.append(metrics)
         if not self.is_master:
@@ -150,14 +164,13 @@ class WandbMonitor(Monitor):
             last_step = trajectory[-1]
             tokens = last_step["tokens"]
             full_ids = tokens["prompt_ids"] + tokens["completion_ids"]
-            messages_text = self.tokenizer.decode(full_ids)
+            messages_text = self._truncate_sample_text(self.tokenizer.decode(full_ids))
             debug = self._rollout_debug(rollout)
             sample = {
                 "step": step,
                 "task": rollout.get("task"),
                 "example_id": rollout["example_id"],
                 "messages": messages_text,
-                "input_ids": str(full_ids),
                 "answer": rollout.get("answer"),
                 "expected_answers": json.dumps(debug.get("expected_answers", [])),
                 "rlm_answer": self._rollout_answer(rollout),
@@ -165,6 +178,9 @@ class WandbMonitor(Monitor):
                 "judge_raw_response": debug.get("judge_raw_response"),
                 "reward": rollout["reward"],
             }
+            if self.config.log_extras.sample_include_input_ids:
+                sample["input_ids"] = str(full_ids)
+                sample = {column: sample[column] for column in self.samples_cols}
             assert list(sample.keys()) == self.samples_cols, (
                 "Order of columns in the table must be the same as order of the keys here"
             )
@@ -184,6 +200,7 @@ class WandbMonitor(Monitor):
             or not isinstance(self.config, WandbWithExtrasConfig)
             or not self.config.log_extras
             or not self.config.log_extras.samples
+            or not self.config.log_extras.final_samples
         ):
             return
 

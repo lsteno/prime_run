@@ -877,6 +877,16 @@ def test_env_response_marks_missing_final_after_forced_finalize(tmp_path) -> Non
     assert state["finalized_on_forced_prompt"] is False
 
 
+def test_env_max_turn_stop_catches_missing_forced_final(tmp_path) -> None:
+    environment = object.__new__(RLMRLVREnv)
+    environment.max_turns = 3
+    state = _root_env_response_state(tmp_path)
+    state["trajectory"] = [{"prompt": [], "completion": []}]
+    state["hit_max_turn_without_final"] = True
+
+    assert asyncio.run(environment.max_turns_reached(state)) is True
+
+
 def test_add_trajectory_step_marks_root_turn_trainable_with_prompt_provenance(monkeypatch) -> None:
     import rlm_rlvr.env as env_module
 

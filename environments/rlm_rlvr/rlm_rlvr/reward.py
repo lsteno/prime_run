@@ -82,6 +82,24 @@ def _get_predicted_answer(state: vf.State, completion) -> str:
     return ""
 
 
+def _last_rlm_debug(state: vf.State) -> dict[str, Any]:
+    trajectory = state.get("trajectory") or []
+    if not trajectory:
+        return {}
+    last_step = trajectory[-1]
+    if not isinstance(last_step, dict):
+        return {}
+    extras = last_step.get("extras") or {}
+    debug = extras.get("rlm_debug") or {}
+    return debug if isinstance(debug, dict) else {}
+
+
+def _state_bool_with_debug_fallback(state: vf.State, key: str) -> bool:
+    if key in state:
+        return bool(state.get(key))
+    return bool(_last_rlm_debug(state).get(key))
+
+
 def _get_expected_answers(answer: str, info: dict[str, Any] | None) -> list[str]:
     if info and info.get("acceptable_answers"):
         return [str(item) for item in info["acceptable_answers"]]
@@ -359,7 +377,11 @@ def _record_judge_payload(
 
 
 def _missing_formal_final_at_max_turn(state: vf.State) -> bool:
-    return bool(state.get("hit_max_turn_without_final") or state.get("missing_final"))
+    if _state_bool_with_debug_fallback(state, "hit_max_turn_without_final"):
+        return True
+    if _state_bool_with_debug_fallback(state, "missing_final"):
+        return True
+    return state.get("final_answer") is None and state.get("stop_condition") == "max_turns_reached"
 
 
 def _max_turn_penalty_from_state(
@@ -371,7 +393,7 @@ def _max_turn_penalty_from_state(
 ) -> float:
     if not max_turn_penalty_enabled or correctness <= 0.0:
         return 0.0
-    if state.get("finalized_on_forced_prompt"):
+    if _state_bool_with_debug_fallback(state, "finalized_on_forced_prompt"):
         return max(0.0, max_turn_penalty)
     return 0.0
 

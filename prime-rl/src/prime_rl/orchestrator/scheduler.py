@@ -207,8 +207,21 @@ class Scheduler:
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
         return min(clients, key=lambda c: inflight[self._client_identity(c)])
 
-    def _source_id(self, example: dict) -> str | None:
+    @staticmethod
+    def _example_info(example: dict) -> dict[str, Any]:
         info = example.get("info") or {}
+        if isinstance(info, dict):
+            return info
+        if isinstance(info, str):
+            try:
+                decoded = json.loads(info)
+            except json.JSONDecodeError:
+                return {}
+            return decoded if isinstance(decoded, dict) else {}
+        return {}
+
+    def _source_id(self, example: dict) -> str | None:
+        info = self._example_info(example)
         for key in ("source_id", "id", "row_id"):
             if key in example:
                 return str(example[key])
@@ -217,7 +230,7 @@ class Scheduler:
         return None
 
     def _dataset_name(self, example: dict) -> str | None:
-        info = example.get("info") or {}
+        info = self._example_info(example)
         for key in ("dataset", "dataset_name", "source_dataset"):
             if key in example:
                 return str(example[key])
