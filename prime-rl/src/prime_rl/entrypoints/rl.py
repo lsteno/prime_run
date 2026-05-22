@@ -1,5 +1,6 @@
 import json
 import os
+import copy
 import subprocess
 import sys
 import time
@@ -28,6 +29,68 @@ TRAINER_TOML = "trainer.toml"
 ORCHESTRATOR_TOML = "orchestrator.toml"
 INFERENCE_TOML = "inference.toml"
 TEACHER_INFERENCE_TOML = "teacher_inference.toml"
+
+
+def _configure_local_nccl_independent_inference_servers(config: RLConfig) -> list[Path]:
+    """Split local NCCL inference DP into independent vLLM servers.
+
+    Prime-RL's NCCL broadcaster assigns inference ranks by enumerating
+    orchestrator admin clients. A single vLLM process with internal DP exposes
+    one admin endpoint, so all DP workers receive the same server rank. For
+    local full-FT NCCL runs, launch one vLLM server per inference TP group
+    instead, giving the orchestrator one admin client per receiver group.
+    """
+    if config.deployment.type != "single_node":
+        return []
+    if config.inference is None or config.weight_broadcast is None or config.weight_broadcast.type != "nccl":
+        return []
+
+    num_infer_gpus = config.deployment.num_infer_gpus
+    tp = config.inference.parallel.tp
+    if num_infer_gpus <= tp:
+        return []
+    if num_infer_gpus % tp != 0:
+        raise ValueError(
+            f"num_infer_gpus ({num_infer_gpus}) must be divisible by inference.parallel.tp ({tp}) "
+            "for local independent NCCL inference servers."
+        )
+    if config.inference.data_parallel_size_local not in (None, 1):
+        raise ValueError(
+            "Local independent NCCL inference servers require inference.data_parallel_size_local to be unset or 1."
+        )
+
+    server_count = num_infer_gpus // tp
+    base_port = config.inference.server.port
+    host = config.inference.server.host or "localhost"
+    client_host = "localhost" if host in {"0.0.0.0", "::"} else host
+
+    config.orchestrator.client.base_url = [f"http://{client_host}:{base_port + i}/v1" for i in range(server_count)]
+    config.orchestrator.client.dp_rank_count = 1
+
+    # The base inference config written to inference.toml is server 0. Extra
+    # server configs are emitted by rl_local after write_subconfigs().
+    config.inference.server.port = base_port
+    config.inference.parallel.dp = 1
+    config.inference.data_parallel_size_local = 1
+    config.inference.api_server_count = 1
+
+    return [Path(f"inference_{i}.toml") for i in range(1, server_count)]
+
+
+def _write_local_nccl_extra_inference_configs(config: RLConfig, config_dir: Path, extra_paths: list[Path]) -> None:
+    if config.inference is None or not extra_paths:
+        return
+    import tomli_w
+
+    base_port = config.inference.server.port
+    for index, relative_path in enumerate(extra_paths, start=1):
+        server_config = copy.deepcopy(config.inference)
+        server_config.server.port = base_port + index
+        server_config.parallel.dp = 1
+        server_config.data_parallel_size_local = 1
+        server_config.api_server_count = 1
+        with open(config_dir / relative_path, "wb") as f:
+            tomli_w.dump(server_config.model_dump(exclude_none=True, mode="json"), f)
 
 
 def get_physical_gpu_ids() -> list[int]:
@@ -102,8 +165,11 @@ def rl_local(config: RLConfig):
             "If you rely on persisted wandb login state instead, verify it is available to child processes before restarting the run."
         )
 
+    extra_inference_config_paths = _configure_local_nccl_independent_inference_servers(config)
+
     config_dir = config.output_dir / "configs"
     write_subconfigs(config, config_dir)
+    _write_local_nccl_extra_inference_configs(config, config_dir, extra_inference_config_paths)
     logger.info(f"Wrote subconfigs to {config_dir}")
 
     if config.dry_run:
@@ -168,34 +234,45 @@ def rl_local(config: RLConfig):
     stop_events: dict[str, Event] = {}
 
     try:
-        # Optionally, start inference process
+        # Optionally, start inference process(es)
         if config.inference:
-            inference_cmd = ["uv", "run", "--no-sync", "inference", "@", (config_dir / INFERENCE_TOML).as_posix()]
-            logger.info(f"Starting inference on GPU(s) {' '.join(map(str, infer_gpu_ids))}")
-            logger.debug(f"Inference start command: {' '.join(inference_cmd)}")
-            # If we don't log stdout, the server hangs
-            with open(log_dir / "inference.stdout", "w") as log_file:
-                inference_process = Popen(
-                    inference_cmd,
-                    env={
-                        **os.environ,
-                        "CUDA_VISIBLE_DEVICES": ",".join(map(str, infer_gpu_ids)),
-                    },
-                    stdout=log_file,
-                    stderr=log_file,
-                )
-            processes.append(inference_process)
+            inference_config_paths = [Path(INFERENCE_TOML), *extra_inference_config_paths]
+            tp = config.inference.parallel.tp
+            for server_idx, inference_config_path in enumerate(inference_config_paths):
+                server_gpu_ids = infer_gpu_ids[server_idx * tp : (server_idx + 1) * tp]
+                if not server_gpu_ids:
+                    raise RuntimeError(
+                        f"No GPU IDs available for inference server {server_idx}; "
+                        f"inference_config_paths={inference_config_paths}, infer_gpu_ids={infer_gpu_ids}"
+                    )
+                inference_cmd = ["uv", "run", "--no-sync", "inference", "@", (config_dir / inference_config_path).as_posix()]
+                process_name = "inference" if server_idx == 0 else f"inference_{server_idx}"
+                log_name = "inference.stdout" if server_idx == 0 else f"inference_{server_idx}.stdout"
+                logger.info(f"Starting {process_name} on GPU(s) {' '.join(map(str, server_gpu_ids))}")
+                logger.debug(f"{process_name} start command: {' '.join(inference_cmd)}")
+                # If we don't log stdout, the server hangs
+                with open(log_dir / log_name, "w") as log_file:
+                    inference_process = Popen(
+                        inference_cmd,
+                        env={
+                            **os.environ,
+                            "CUDA_VISIBLE_DEVICES": ",".join(map(str, server_gpu_ids)),
+                        },
+                        stdout=log_file,
+                        stderr=log_file,
+                    )
+                processes.append(inference_process)
 
-            # Start monitoring thread
-            stop_event = Event()
-            stop_events["inference"] = stop_event
-            monitor_thread = Thread(
-                target=monitor_process,
-                args=(inference_process, stop_event, error_queue, "inference"),
-                daemon=True,
-            )
-            monitor_thread.start()
-            monitor_threads.append(monitor_thread)
+                # Start monitoring thread
+                stop_event = Event()
+                stop_events[process_name] = stop_event
+                monitor_thread = Thread(
+                    target=monitor_process,
+                    args=(inference_process, stop_event, error_queue, process_name),
+                    daemon=True,
+                )
+                monitor_thread.start()
+                monitor_threads.append(monitor_thread)
         else:
             logger.warning(
                 "No inference config specified, skipping starting inference server. Make sure your inference server is running."

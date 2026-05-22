@@ -7,6 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 ABLATION_DIR = ROOT / "configs/rlm_rlvr/ablation_rank_lr"
+FULL_FT_CONFIG = (
+    ROOT
+    / "configs/rlm_rlvr/full_ft/qwen3_4b_instruct_sanjaya_depth1_llmonly_fullft_lr1e-6_s150_8xa10080_bal35f40v1.toml"
+)
 
 
 def _load_manifest() -> list[dict[str, str]]:
@@ -174,3 +178,57 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert eval_args["efficiency_penalty_applies_to"] == "all_rollouts"
         assert eval_args["reward_clip_min"] == -0.5
         assert eval_args["reward_clip_max"] == 1.0
+
+
+def test_full_ft_pilot_config_removes_lora_and_uses_nccl_broadcast() -> None:
+    config = tomllib.loads(FULL_FT_CONFIG.read_text())
+
+    assert config["output_dir"] == "../outputs/rlm-rlvr-qwen3-4b-depth1-llmonly-fullft-lr1e-6-s150-bal35f40v1"
+    assert config["max_steps"] == 150
+    assert config["max_async_level"] == 1
+    assert config["weight_broadcast"]["type"] == "nccl"
+    assert config["weight_broadcast"]["port"] == 29501
+    assert config["weight_broadcast"]["timeout"] == 1200
+
+    assert config["trainer"]["optim"]["lr"] == 1e-6
+    assert config["trainer"]["optim"]["type"] == "adamw"
+    assert config["trainer"]["optim"]["weight_decay"] == 0.0
+    assert config["trainer"]["optim"]["max_norm"] == 1.0
+    assert config["trainer"]["scheduler"]["type"] == "constant"
+    assert "lora" not in config["trainer"]["model"]
+    assert config["trainer"]["model"]["seq_len"] == 49152
+    assert config["trainer"]["model"]["cp"] == 2
+    assert config["trainer"]["model"]["tp"] == 1
+    assert config["trainer"]["model"]["dp_replicate"] == 1
+    assert config["trainer"]["model"]["optimization_dtype"] == "bfloat16"
+    assert config["trainer"]["model"]["reduce_dtype"] == "bfloat16"
+    assert config["trainer"]["model"]["ac"]["freq"] == 2
+    assert config["trainer"]["loss"]["kl_tau"] == 1e-3
+
+    assert config["orchestrator"]["batch_size"] == 64
+    assert config["orchestrator"]["rollouts_per_example"] == 4
+    assert config["orchestrator"]["max_off_policy_steps"] == 2
+    assert config["orchestrator"]["env_worker_recovery"]["drop_group_on_first_timeout"] is False
+    assert config["orchestrator"]["group_scoring"]["enabled"] is True
+    assert config["orchestrator"]["env"][0]["worker_count"] == 32
+    assert config["orchestrator"]["eval"]["env"][0]["worker_count"] == 16
+
+    train_args = config["orchestrator"]["env"][0]["args"]
+    eval_args = config["orchestrator"]["eval"]["env"][0]["args"]
+    assert train_args["prompt_variant"] == "sanjaya_text_depth1_llm_only_v1"
+    assert train_args["max_depth"] == 0
+    assert train_args["efficiency_penalty_mode"] == "adaptive_group"
+    assert train_args["adaptive_efficiency_beta_max"] == 0.15
+    assert train_args["adaptive_efficiency_gamma"] == 1.0
+    assert train_args["adaptive_efficiency_solve_rate_floor"] == 0.25
+    assert train_args["efficiency_penalty_applies_to"] == "correct_only"
+    assert train_args["max_turn_penalty_enabled"] is True
+    assert train_args["missing_final_at_max_turn_zero_reward"] is True
+    assert eval_args["efficiency_penalty_applies_to"] == "correct_only"
+
+    inference = config["inference"]
+    assert "max_loras" not in inference
+    assert "max_cpu_loras" not in inference
+    assert inference["api_server_count"] == 4
+    assert config["inference"]["parallel"]["dp"] == 4
+    assert config["inference"]["parallel"]["tp"] == 1

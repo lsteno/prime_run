@@ -12,6 +12,10 @@ from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
+from prime_rl.entrypoints.rl import (
+    _configure_local_nccl_independent_inference_servers,
+    _write_local_nccl_extra_inference_configs,
+)
 from prime_rl.utils.config import BaseConfig, cli
 
 # All config config classes
@@ -164,3 +168,38 @@ def test_env_worker_count_defaults_to_single_logical_worker():
 def test_env_worker_count_rejects_single_explicit_address_pool():
     with pytest.raises(ValidationError, match="worker_count > 1"):
         EnvConfig(id="rlm_rlvr", address="tcp://127.0.0.1:5555", worker_count=2)
+
+
+def test_local_nccl_broadcast_splits_inference_servers(tmp_path):
+    """Local full-FT NCCL needs one admin client per inference receiver."""
+    repo_root = Path(__file__).resolve().parents[3]
+    config_path = (
+        repo_root
+        / "configs/rlm_rlvr/full_ft/qwen3_4b_instruct_sanjaya_depth1_llmonly_fullft_lr1e-6_s150_8xa10080_bal35f40v1.toml"
+    )
+    config = cli(RLConfig, args=["@", config_path.as_posix(), "--dry-run"])
+
+    extra_paths = _configure_local_nccl_independent_inference_servers(config)
+
+    assert extra_paths == [Path("inference_1.toml"), Path("inference_2.toml"), Path("inference_3.toml")]
+    assert config.trainer.weight_broadcast.type == "nccl"
+    assert config.trainer.weight_broadcast.inference_world_size == 4
+    assert config.orchestrator.client.base_url == [
+        "http://localhost:8000/v1",
+        "http://localhost:8001/v1",
+        "http://localhost:8002/v1",
+        "http://localhost:8003/v1",
+    ]
+    assert config.orchestrator.client.dp_rank_count == 1
+    assert config.inference.server.port == 8000
+    assert config.inference.parallel.tp == 1
+    assert config.inference.parallel.dp == 1
+    assert config.inference.data_parallel_size_local == 1
+    assert config.inference.api_server_count == 1
+
+    _write_local_nccl_extra_inference_configs(config, tmp_path, extra_paths)
+    generated = [cli(InferenceConfig, args=["@", (tmp_path / path).as_posix()]) for path in extra_paths]
+
+    assert [server.server.port for server in generated] == [8001, 8002, 8003]
+    assert [server.parallel.dp for server in generated] == [1, 1, 1]
+    assert [server.api_server_count for server in generated] == [1, 1, 1]
