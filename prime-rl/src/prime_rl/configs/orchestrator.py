@@ -769,6 +769,27 @@ class EnvWorkerRecoveryConfig(BaseConfig):
         ),
     ] = 5
 
+    drop_group_on_first_timeout: Annotated[
+        bool,
+        Field(
+            description=(
+                "Whether a rollout timeout should drop the whole training group immediately instead of "
+                "retrying the timed-out slot until max_rollout_attempts_per_slot."
+            ),
+        ),
+    ] = False
+
+    first_timeout_cooldown_steps: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "When drop_group_on_first_timeout is enabled, hold the timed-out prompt out of normal "
+                "training sampling for this many orchestrator steps."
+            ),
+        ),
+    ] = 5
+
     restart_on_rollout_timeout: Annotated[
         bool,
         Field(description="Whether a rollout timeout should trigger a worker restart for local worker pools."),
@@ -867,6 +888,39 @@ class AsyncSchedulingConfig(BaseConfig):
     ] = 2.0
 
 
+class GroupScoringConfig(BaseConfig):
+    """Controls deferred group reward scoring concurrency."""
+
+    enabled: Annotated[
+        bool,
+        Field(
+            description=(
+                "Whether deferred group reward scoring may run in background tasks instead of blocking "
+                "the rollout scheduler hot path."
+            ),
+        ),
+    ] = False
+
+    max_concurrency: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Maximum number of completed rollout groups to score concurrently.",
+        ),
+    ] = 8
+
+    max_pending_groups: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Maximum number of completed groups waiting for or actively running reward scoring. "
+                "Rollout scheduling pauses at this cap to avoid unbounded unscored work."
+            ),
+        ),
+    ] = 64
+
+
 class OrchestratorConfig(BaseConfig):
     """Configures the orchestrator for RL training."""
 
@@ -924,6 +978,9 @@ class OrchestratorConfig(BaseConfig):
 
     # Bounded async rollout scheduling
     async_scheduling: AsyncSchedulingConfig = AsyncSchedulingConfig()
+
+    # Deferred group scoring concurrency
+    group_scoring: GroupScoringConfig = GroupScoringConfig()
 
     # The wandb configuration
     wandb: WandbWithExtrasConfig | None = None

@@ -257,6 +257,24 @@ class Buffer:
         self.num_examples_per_step[env_name]["hard"] += 1
         return True
 
+    @staticmethod
+    def _difficulty_score(example_rollouts: list[vf.RolloutOutput]) -> float:
+        """Use binary correctness for difficulty filtering when available.
+
+        Shaped rewards may be negative after cost penalties, but hard/easy filtering
+        should still reflect whether the policy solved the prompt.
+        """
+        correctness_values: list[float] = []
+        for rollout in example_rollouts:
+            metrics = rollout.get("metrics") or {}
+            if "correctness_metric" not in metrics:
+                return mean([r["reward"] for r in example_rollouts])
+            try:
+                correctness_values.append(float(metrics["correctness_metric"]))
+            except (TypeError, ValueError):
+                return mean([r["reward"] for r in example_rollouts])
+        return mean(correctness_values)
+
     def update(self, rollouts: list[vf.RolloutOutput], step: int | None = None):
         """Updates the buffer state with completed rollouts."""
 
@@ -265,12 +283,12 @@ class Buffer:
             rollouts_by_example[rollout["example_id"]].append(rollout)
 
         for example_id, example_rollouts in rollouts_by_example.items():
-            avg_reward = mean([r["reward"] for r in example_rollouts])
+            difficulty_score = self._difficulty_score(example_rollouts)
             env_name = example_rollouts[0]["task"]
 
-            if self.config.easy_threshold is not None and avg_reward >= self.config.easy_threshold:
+            if self.config.easy_threshold is not None and difficulty_score >= self.config.easy_threshold:
                 pool = "easy"
-            elif self.config.hard_threshold is not None and avg_reward <= self.config.hard_threshold:
+            elif self.config.hard_threshold is not None and difficulty_score <= self.config.hard_threshold:
                 pool = "hard"
             else:
                 pool = "normal"
@@ -288,14 +306,14 @@ class Buffer:
 
             self.num_examples_per_step[env_name][pool] += 1
             if self.config.online_difficulty_filtering:
-                if avg_reward == 0.0 and self.config.online_filter_hard:
+                if difficulty_score == 0.0 and self.config.online_filter_hard:
                     self.num_rollouts_per_step[env_name]["hard"] += len(example_rollouts)
                     self.filtered_hard_groups_per_step += 1
                     continue
-                elif avg_reward == 1.0 and self.config.online_filter_easy:
+                elif difficulty_score == 1.0 and self.config.online_filter_easy:
                     self.num_rollouts_per_step[env_name]["easy"] += len(example_rollouts)
                     continue
-                elif avg_reward == 1.0:
+                elif difficulty_score == 1.0:
                     self.kept_easy_groups_per_step += 1
 
             self.num_rollouts_per_step[env_name]["normal"] += len(example_rollouts)

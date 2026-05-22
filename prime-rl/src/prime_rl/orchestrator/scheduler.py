@@ -72,6 +72,22 @@ class GroupState:
     pinned_client: vf.ClientConfig | None = None
 
 
+@dataclass(frozen=True)
+class GroupScoringInfo:
+    """Metadata for a completed group being scored off the rollout hot path."""
+
+    group_id: int
+    scheduled_step: int
+    source_id: str | None
+    example_id: int | None
+    dataset_name: str | None
+    task: str
+    created_time_perf: float
+    created_time_iso: str
+    rollout_count: int
+    example: dict
+
+
 class Scheduler:
     """
     Asynchronously manages scheduling of rollout requests and policy updates.
@@ -134,6 +150,9 @@ class Scheduler:
         # Track in-progress groups while rollouts are generated independently.
         self.next_group_id = 0
         self.groups: dict[int, GroupState] = {}
+        self.group_scoring_tasks: dict[asyncio.Task, GroupScoringInfo] = {}
+        self.group_scoring_done_perf: dict[asyncio.Task, float] = {}
+        self.group_scoring_semaphore = asyncio.Semaphore(config.group_scoring.max_concurrency)
 
         self.step, self.ckpt_step = 0, 0
         self.checkpoint_ready = asyncio.Event()
@@ -154,10 +173,13 @@ class Scheduler:
         self.attempt_late_success_after_timeout = 0
         self.attempt_reschedules = 0
         self.attempt_group_drops = 0
+        self.attempt_group_drops_first_timeout = 0
+        self.timeout_cooldown_groups = 0
         self.attempts_by_task: dict[str, int] = defaultdict(int)
         self.attempt_timeouts_by_task: dict[str, int] = defaultdict(int)
         self.attempt_late_success_after_timeout_by_task: dict[str, int] = defaultdict(int)
         self.attempt_drops_by_task: dict[str, int] = defaultdict(int)
+        self.attempt_first_timeout_drops_by_task: dict[str, int] = defaultdict(int)
         self.worker_restart_count = 0
         self.worker_restart_count_by_name: dict[str, int] = defaultdict(int)
         self.scheduler_attempts_started = 0
@@ -168,6 +190,14 @@ class Scheduler:
         self.scheduler_cancelled_batch_complete = 0
         self.scheduler_cancelled_batch_complete_by_worker: dict[str, int] = defaultdict(int)
         self.scheduler_allowed_inflight = max_inflight_rollouts
+        self.group_scoring_started = 0
+        self.group_scoring_finished = 0
+        self.group_scoring_failed = 0
+        self.group_scoring_stale = 0
+        self.group_scoring_max_pending_reached = 0
+        self.group_scoring_runtime_seconds: list[float] = []
+        self.group_scoring_queue_wait_seconds: list[float] = []
+        self.group_scoring_lag_seconds: list[float] = []
 
     @property
     def uses_token_batching(self) -> bool:
@@ -204,6 +234,10 @@ class Scheduler:
         self.inflight_requests.clear()
         self.task_done_perf.clear()
         self.groups.clear()
+        if getattr(self, "group_scoring_tasks", None):
+            await safe_cancel_all(list(self.group_scoring_tasks))
+            self.group_scoring_tasks.clear()
+            self.group_scoring_done_perf.clear()
         self.cancelled_rollouts_count += count
 
     @staticmethod
@@ -365,17 +399,29 @@ class Scheduler:
         assert timeout is not None
         return make_timeout_rollout(example, self.sampling_args, timeout)
 
-    async def drop_group(self, group_id: int, *, step: int | None = None, reason: str | None = None) -> int:
+    async def drop_group(
+        self,
+        group_id: int,
+        *,
+        step: int | None = None,
+        reason: str | None = None,
+        cooldown_steps: int | None = None,
+    ) -> int:
         """Drop a group and cancel any remaining in-flight rollouts for it."""
         tasks_to_cancel = []
         group = self.groups.pop(group_id, None)
         if group is not None:
             group.dropped = True
             if step is not None and self.config.env_worker_recovery.enabled:
+                resolved_cooldown_steps = (
+                    cooldown_steps
+                    if cooldown_steps is not None
+                    else self.config.env_worker_recovery.max_attempts_cooldown_steps
+                )
                 self.buffer.put_example_on_hard_cooldown(
                     group.example,
                     step=step,
-                    cooldown_steps=self.config.env_worker_recovery.max_attempts_cooldown_steps,
+                    cooldown_steps=resolved_cooldown_steps,
                 )
                 self._log_attempt_event(
                     "group_dropped",
@@ -389,6 +435,7 @@ class Scheduler:
                         "task": group.example.get("task"),
                         "reason": reason or "group_dropped",
                         "group_completed_count": len(group.completed_rollouts),
+                        "cooldown_steps": resolved_cooldown_steps,
                     },
                 )
         for task, info in list(self.inflight_requests.items()):
@@ -544,6 +591,15 @@ class Scheduler:
         return allowed
 
     async def _schedule_next_request(self, *, allowed_inflight: int | None = None) -> bool:
+        group_scoring_config = getattr(getattr(self, "config", None), "group_scoring", None)
+        if (
+            group_scoring_config is not None
+            and group_scoring_config.enabled
+            and len(getattr(self, "group_scoring_tasks", {})) >= group_scoring_config.max_pending_groups
+        ):
+            self.group_scoring_max_pending_reached = getattr(self, "group_scoring_max_pending_reached", 0) + 1
+            return False
+
         inflight_cap = self.max_inflight_rollouts if allowed_inflight is None else allowed_inflight
         remaining_capacity = inflight_cap - self.inflight_rollout_count
 
@@ -642,6 +698,14 @@ class Scheduler:
     def _should_defer_group_scoring(self, task: str) -> bool:
         return task in self.deferred_group_scoring_tasks and self.config.verification.enabled
 
+    def _should_score_group_in_background(self, task: str) -> bool:
+        group_scoring_config = getattr(self.config, "group_scoring", None)
+        return (
+            group_scoring_config is not None
+            and group_scoring_config.enabled
+            and self._should_defer_group_scoring(task)
+        )
+
     async def _score_group_if_deferred(self, completed_rollouts: list[vf.RolloutOutput]) -> list[vf.RolloutOutput]:
         if not completed_rollouts:
             return completed_rollouts
@@ -651,6 +715,176 @@ class Scheduler:
         env_for_task = self.env.get_env_for_task(task)
         await env_for_task.rubric.score_group(cast(list[vf.State], completed_rollouts))
         return completed_rollouts
+
+    async def _score_group_with_semaphore(
+        self,
+        completed_rollouts: list[vf.RolloutOutput],
+    ) -> tuple[list[vf.RolloutOutput], float, float]:
+        async with self.group_scoring_semaphore:
+            start_time = time.perf_counter()
+            scored_rollouts = await self._score_group_if_deferred(completed_rollouts)
+            end_time = time.perf_counter()
+            return scored_rollouts, start_time, end_time
+
+    def _enqueue_group_scoring(
+        self,
+        *,
+        group_id: int,
+        example: dict,
+        completed_rollouts: list[vf.RolloutOutput],
+        scheduled_step: int,
+    ) -> None:
+        if not hasattr(self, "group_scoring_tasks"):
+            self.group_scoring_tasks = {}
+        if not hasattr(self, "group_scoring_done_perf"):
+            self.group_scoring_done_perf = {}
+        if not hasattr(self, "group_scoring_runtime_seconds"):
+            self.group_scoring_runtime_seconds = []
+        if not hasattr(self, "group_scoring_queue_wait_seconds"):
+            self.group_scoring_queue_wait_seconds = []
+        if not hasattr(self, "group_scoring_lag_seconds"):
+            self.group_scoring_lag_seconds = []
+        info = GroupScoringInfo(
+            group_id=group_id,
+            scheduled_step=scheduled_step,
+            source_id=self._source_id(example),
+            example_id=example.get("example_id"),
+            dataset_name=self._dataset_name(example),
+            task=example["task"],
+            created_time_perf=time.perf_counter(),
+            created_time_iso=datetime.now(UTC).isoformat(),
+            rollout_count=len(completed_rollouts),
+            example=example,
+        )
+        task = asyncio.create_task(self._score_group_with_semaphore(completed_rollouts))
+        task.add_done_callback(lambda t: self.group_scoring_done_perf.setdefault(t, time.perf_counter()))
+        self.group_scoring_tasks[task] = info
+        self.group_scoring_started = getattr(self, "group_scoring_started", 0) + 1
+
+    async def _process_finished_scoring_task(
+        self,
+        finished_task: asyncio.Task,
+        *,
+        step: int,
+        batch_rollouts: list[vf.RolloutOutput],
+        batch_progress: int,
+        pbar: ProgressTracker,
+    ) -> int:
+        info = self.group_scoring_tasks.pop(finished_task, None)
+        if info is None:
+            return batch_progress
+        consume_time = time.perf_counter()
+        done_time = getattr(self, "group_scoring_done_perf", {}).pop(finished_task, None)
+        if done_time is None:
+            done_time = consume_time
+        lag_s = max(0.0, consume_time - done_time)
+        if not hasattr(self, "group_scoring_lag_seconds"):
+            self.group_scoring_lag_seconds = []
+        self.group_scoring_lag_seconds.append(lag_s)
+        if (step - info.scheduled_step) > self.config.async_scheduling.max_carryover_steps:
+            self.group_scoring_stale = getattr(self, "group_scoring_stale", 0) + 1
+            self._log_attempt_event(
+                "group_scoring_stale",
+                {
+                    "phase": self.current_phase,
+                    "step": step,
+                    "scheduled_step": info.scheduled_step,
+                    "group_id": info.group_id,
+                    "source_id": info.source_id,
+                    "example_id": info.example_id,
+                    "dataset_name": info.dataset_name,
+                    "task": info.task,
+                    "scheduler_lag_ms": lag_s * 1000.0,
+                    "rollout_count": info.rollout_count,
+                },
+            )
+            return batch_progress
+        try:
+            scored_rollouts, scoring_start_time, scoring_end_time = finished_task.result()
+        except asyncio.CancelledError:
+            return batch_progress
+        except Exception as e:
+            self.group_scoring_failed = getattr(self, "group_scoring_failed", 0) + 1
+            self.logger.warning(f"Group scoring failed for group {info.group_id} ({info.task}): {e}")
+            self._log_attempt_event(
+                "group_scoring_failed",
+                {
+                    "phase": self.current_phase,
+                    "step": step,
+                    "scheduled_step": info.scheduled_step,
+                    "group_id": info.group_id,
+                    "source_id": info.source_id,
+                    "example_id": info.example_id,
+                    "dataset_name": info.dataset_name,
+                    "task": info.task,
+                    "error": repr(e),
+                    "scheduler_lag_ms": lag_s * 1000.0,
+                    "rollout_count": info.rollout_count,
+                },
+            )
+            if self.config.env_worker_recovery.enabled:
+                self.buffer.put_example_on_hard_cooldown(
+                    info.example,
+                    step=step,
+                    cooldown_steps=self.config.env_worker_recovery.max_attempts_cooldown_steps,
+                )
+            return batch_progress
+
+        runtime_s = max(0.0, scoring_end_time - scoring_start_time)
+        queue_wait_s = max(0.0, scoring_start_time - info.created_time_perf)
+        if not hasattr(self, "group_scoring_runtime_seconds"):
+            self.group_scoring_runtime_seconds = []
+        if not hasattr(self, "group_scoring_queue_wait_seconds"):
+            self.group_scoring_queue_wait_seconds = []
+        self.group_scoring_runtime_seconds.append(runtime_s)
+        self.group_scoring_queue_wait_seconds.append(queue_wait_s)
+        self.group_scoring_finished = getattr(self, "group_scoring_finished", 0) + 1
+        self._log_attempt_event(
+            "group_scoring_finished",
+            {
+                "phase": self.current_phase,
+                "step": step,
+                "scheduled_step": info.scheduled_step,
+                "group_id": info.group_id,
+                "source_id": info.source_id,
+                "example_id": info.example_id,
+                "dataset_name": info.dataset_name,
+                "task": info.task,
+                "duration_ms": runtime_s * 1000.0,
+                "queue_wait_ms": queue_wait_s * 1000.0,
+                "scheduler_lag_ms": lag_s * 1000.0,
+                "rollout_count": info.rollout_count,
+            },
+        )
+        self.buffer.update(scored_rollouts, step=step)
+        if batch_progress < self.batch_target:
+            batch_progress = self._consume_rollout_buffer_into_batch(
+                batch_rollouts=batch_rollouts,
+                batch_progress=batch_progress,
+                pbar=pbar,
+            )
+        return batch_progress
+
+    async def _drain_done_group_scoring_tasks(
+        self,
+        *,
+        step: int,
+        batch_rollouts: list[vf.RolloutOutput],
+        batch_progress: int,
+        pbar: ProgressTracker,
+    ) -> int:
+        while True:
+            done_tasks = [task for task in list(getattr(self, "group_scoring_tasks", {})) if task.done()]
+            if not done_tasks:
+                return batch_progress
+            for task in done_tasks:
+                batch_progress = await self._process_finished_scoring_task(
+                    task,
+                    step=step,
+                    batch_rollouts=batch_rollouts,
+                    batch_progress=batch_progress,
+                    pbar=pbar,
+                )
 
     async def _cancel_inflight_for_worker_generation(
         self,
@@ -767,13 +1001,53 @@ class Scheduler:
             self.logger.warning(f"Failed to restart env worker {info.env_worker_name}: {exc!r}")
 
     async def _restart_worker_for_timeout(self, info: InflightRolloutInfo, step: int) -> None:
-        if not self.config.env_worker_recovery.restart_on_rollout_timeout:
+        if not getattr(self.config.env_worker_recovery, "restart_on_rollout_timeout", True):
             return
         await self._restart_worker_generation(
             info,
             step=step,
             reason="rollout_timeout",
             cancel_existing_inflight=True,
+        )
+
+    def _should_drop_group_on_first_timeout(self) -> bool:
+        return (
+            self.current_phase == "train"
+            and getattr(self.config.env_worker_recovery, "enabled", False)
+            and getattr(self.config.env_worker_recovery, "drop_group_on_first_timeout", False)
+        )
+
+    async def _drop_group_on_timeout(self, info: InflightRolloutInfo, *, step: int, reason: str) -> None:
+        if info.group_id is None:
+            return
+        if info.group_id not in self.groups:
+            return
+        cooldown_steps = self.config.env_worker_recovery.first_timeout_cooldown_steps
+        if not hasattr(self, "attempt_group_drops"):
+            self.attempt_group_drops = 0
+        if not hasattr(self, "attempt_group_drops_first_timeout"):
+            self.attempt_group_drops_first_timeout = 0
+        if not hasattr(self, "timeout_cooldown_groups"):
+            self.timeout_cooldown_groups = 0
+        if not hasattr(self, "attempt_drops_by_task"):
+            self.attempt_drops_by_task = defaultdict(int)
+        if not hasattr(self, "attempt_first_timeout_drops_by_task"):
+            self.attempt_first_timeout_drops_by_task = defaultdict(int)
+        self.attempt_group_drops += 1
+        self.attempt_group_drops_first_timeout += 1
+        self.timeout_cooldown_groups += 1
+        self.attempt_drops_by_task[info.task] += 1
+        self.attempt_first_timeout_drops_by_task[info.task] += 1
+        cancelled_count = await self.drop_group(
+            info.group_id,
+            step=step,
+            reason=reason,
+            cooldown_steps=cooldown_steps,
+        )
+        self.logger.warning(
+            f"Dropped group {info.group_id} ({info.task}) after first timeout; "
+            f"cancelled {cancelled_count} sibling attempt(s) and cooled down example for "
+            f"{cooldown_steps} step(s). reason={reason}"
         )
 
     async def _handle_rollout_timeout(
@@ -798,6 +1072,9 @@ class Scheduler:
         self.errored_rollouts_by_task[info.task] += int(timeout_rollout["error"] is not None)
         self._log_attempt_finished(info, step=step, status="timeout", rollout=timeout_rollout, task=task)
         await self._restart_worker_for_timeout(info, step=step)
+        if self._should_drop_group_on_first_timeout():
+            await self._drop_group_on_timeout(info, step=step, reason=reason)
+            return
         await self._reschedule_or_drop_slot(
             info,
             step=step,
@@ -843,12 +1120,20 @@ class Scheduler:
                             error="worker_runtime_exceeded_timeout",
                             task=task,
                         )
-                        await self._reschedule_or_drop_slot(
-                            info,
-                            step=step,
-                            reason="late_success_after_timeout",
-                            count_as_reschedule=True,
-                        )
+                        await self._restart_worker_for_timeout(info, step=step)
+                        if self._should_drop_group_on_first_timeout():
+                            await self._drop_group_on_timeout(
+                                info,
+                                step=step,
+                                reason="late_success_after_timeout",
+                            )
+                        else:
+                            await self._reschedule_or_drop_slot(
+                                info,
+                                step=step,
+                                reason="late_success_after_timeout",
+                                count_as_reschedule=True,
+                            )
                     continue
                 rollout = result
             await self._handle_rollout_timeout(
@@ -948,7 +1233,8 @@ class Scheduler:
             if task not in self.inflight_requests:
                 continue
             self.inflight_requests.pop(task, None)
-            self.task_done_perf.pop(task, None)
+            if hasattr(self, "task_done_perf"):
+                self.task_done_perf.pop(task, None)
             await self._release_worker_reservation(info)
             cancelled_tasks.append(task)
             task.cancel()
@@ -1227,12 +1513,20 @@ class Scheduler:
                     error="worker_runtime_exceeded_timeout",
                     task=finished_task,
                 )
-                await self._reschedule_or_drop_slot(
-                    rollout_info,
-                    step=step,
-                    reason="late_success_after_timeout",
-                    count_as_reschedule=True,
-                )
+                await self._restart_worker_for_timeout(rollout_info, step=step)
+                if self._should_drop_group_on_first_timeout():
+                    await self._drop_group_on_timeout(
+                        rollout_info,
+                        step=step,
+                        reason="late_success_after_timeout",
+                    )
+                else:
+                    await self._reschedule_or_drop_slot(
+                        rollout_info,
+                        step=step,
+                        reason="late_success_after_timeout",
+                        count_as_reschedule=True,
+                    )
                 return batch_progress
             self.total_rollouts_by_task[task] += 1
             should_reschedule = False
@@ -1274,8 +1568,17 @@ class Scheduler:
             group.completed_rollouts[rollout_info.slot_index] = rollout
             if len(group.completed_rollouts) < self.rollouts_per_example:
                 return batch_progress
-            completed_by_slot = self.groups.pop(group_id).completed_rollouts
+            completed_group = self.groups.pop(group_id)
+            completed_by_slot = completed_group.completed_rollouts
             completed_rollouts = [completed_by_slot[idx] for idx in sorted(completed_by_slot)]
+            if self._should_score_group_in_background(task):
+                self._enqueue_group_scoring(
+                    group_id=group_id,
+                    example=completed_group.example,
+                    completed_rollouts=completed_rollouts,
+                    scheduled_step=rollout_info.scheduled_step,
+                )
+                return batch_progress
             completed_rollouts = await self._score_group_if_deferred(completed_rollouts)
         except asyncio.CancelledError:
             if group_id is not None:
@@ -1349,6 +1652,12 @@ class Scheduler:
             )
 
             while batch_progress < self.batch_target:
+                batch_progress = await self._drain_done_group_scoring_tasks(
+                    step=step,
+                    batch_rollouts=batch_rollouts,
+                    batch_progress=batch_progress,
+                    pbar=pbar,
+                )
                 batch_progress = self._consume_rollout_buffer_into_batch(
                     batch_rollouts=batch_rollouts,
                     batch_progress=batch_progress,
@@ -1359,12 +1668,14 @@ class Scheduler:
                 allowed_inflight = self._allowed_inflight_for_progress(batch_progress)
                 await self._fill_inflight_requests(allowed_inflight=allowed_inflight)
                 inflight_tasks = list(self.inflight_requests.keys())
-                if not inflight_tasks:
+                scoring_tasks = list(getattr(self, "group_scoring_tasks", {}).keys())
+                wait_tasks = inflight_tasks + scoring_tasks
+                if not wait_tasks:
                     await asyncio.sleep(1.0)
                     continue
 
                 finished_tasks, _ = await asyncio.wait(
-                    inflight_tasks,
+                    wait_tasks,
                     timeout=1.0,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -1372,17 +1683,32 @@ class Scheduler:
                 await self._enforce_rollout_deadlines(step=step)
 
                 for finished_task in finished_tasks:
-                    batch_progress = await self._process_finished_task(
-                        finished_task,
-                        step=step,
-                        batch_rollouts=batch_rollouts,
-                        batch_progress=batch_progress,
-                        pbar=pbar,
-                    )
+                    if finished_task in self.inflight_requests:
+                        batch_progress = await self._process_finished_task(
+                            finished_task,
+                            step=step,
+                            batch_rollouts=batch_rollouts,
+                            batch_progress=batch_progress,
+                            pbar=pbar,
+                        )
+                    elif finished_task in getattr(self, "group_scoring_tasks", {}):
+                        batch_progress = await self._process_finished_scoring_task(
+                            finished_task,
+                            step=step,
+                            batch_rollouts=batch_rollouts,
+                            batch_progress=batch_progress,
+                            pbar=pbar,
+                        )
 
             if self.config.async_scheduling.prefetch_next_batch:
                 await self._fill_inflight_requests()
             batch_progress = await self._drain_done_tasks(
+                step=step,
+                batch_rollouts=batch_rollouts,
+                batch_progress=batch_progress,
+                pbar=pbar,
+            )
+            batch_progress = await self._drain_done_group_scoring_tasks(
                 step=step,
                 batch_rollouts=batch_rollouts,
                 batch_progress=batch_progress,
@@ -1494,9 +1820,57 @@ class Scheduler:
             "attempt/late_success_after_timeout_rate": self.attempt_late_success_after_timeout / total_attempts,
             "attempt/reschedule_rate": self.attempt_reschedules / total_attempts,
             "attempt/group_drop_rate": self.attempt_group_drops / total_attempts,
+            "attempt/group_drop_first_timeout_rate": self.attempt_group_drops_first_timeout / total_attempts,
+            "buffer/timeout_cooldown_groups": self.timeout_cooldown_groups,
             "worker/restart_count": self.worker_restart_count,
             "worker/max_effective_load": max(worker_loads, default=0),
             "worker/at_capacity_count": at_capacity_count,
+            "group_scoring/active_tasks": len(getattr(self, "group_scoring_tasks", {})),
+            "group_scoring/pending_tasks": len(getattr(self, "group_scoring_tasks", {})),
+            "group_scoring/started_groups": getattr(self, "group_scoring_started", 0),
+            "group_scoring/finished_groups": getattr(self, "group_scoring_finished", 0),
+            "group_scoring/failed_groups": getattr(self, "group_scoring_failed", 0),
+            "group_scoring/stale_groups": getattr(self, "group_scoring_stale", 0),
+            "group_scoring/max_pending_reached": getattr(self, "group_scoring_max_pending_reached", 0),
+            "group_scoring/runtime_s/mean": (
+                sum(self.group_scoring_runtime_seconds) / len(self.group_scoring_runtime_seconds)
+                if getattr(self, "group_scoring_runtime_seconds", [])
+                else 0.0
+            ),
+            "group_scoring/runtime_s/p95": self._percentile(
+                getattr(self, "group_scoring_runtime_seconds", []),
+                95,
+            ),
+            "group_scoring/runtime_s/p99": self._percentile(
+                getattr(self, "group_scoring_runtime_seconds", []),
+                99,
+            ),
+            "group_scoring/queue_wait_s/mean": (
+                sum(self.group_scoring_queue_wait_seconds) / len(self.group_scoring_queue_wait_seconds)
+                if getattr(self, "group_scoring_queue_wait_seconds", [])
+                else 0.0
+            ),
+            "group_scoring/queue_wait_s/p95": self._percentile(
+                getattr(self, "group_scoring_queue_wait_seconds", []),
+                95,
+            ),
+            "group_scoring/queue_wait_s/p99": self._percentile(
+                getattr(self, "group_scoring_queue_wait_seconds", []),
+                99,
+            ),
+            "group_scoring/lag_s/mean": (
+                sum(self.group_scoring_lag_seconds) / len(self.group_scoring_lag_seconds)
+                if getattr(self, "group_scoring_lag_seconds", [])
+                else 0.0
+            ),
+            "group_scoring/lag_s/p95": self._percentile(
+                getattr(self, "group_scoring_lag_seconds", []),
+                95,
+            ),
+            "group_scoring/lag_s/p99": self._percentile(
+                getattr(self, "group_scoring_lag_seconds", []),
+                99,
+            ),
         }
         for task, count in self.empty_rollouts_by_task.items():
             task_total = max(self.total_rollouts_by_task[task], 1)
@@ -1516,6 +1890,9 @@ class Scheduler:
         for task, count in self.attempt_drops_by_task.items():
             task_total = max(self.attempts_by_task[task], 1)
             metrics[f"attempt/drop_rate/{task}"] = count / task_total
+        for task, count in self.attempt_first_timeout_drops_by_task.items():
+            task_total = max(self.attempts_by_task[task], 1)
+            metrics[f"attempt/first_timeout_drop_rate/{task}"] = count / task_total
         for worker_name, count in self.worker_restart_count_by_name.items():
             metrics[f"worker/restart_count/{worker_name}"] = count
         for worker_name, count in self.scheduler_cancelled_batch_complete_by_worker.items():
@@ -1539,10 +1916,13 @@ class Scheduler:
         self.attempt_late_success_after_timeout = 0
         self.attempt_reschedules = 0
         self.attempt_group_drops = 0
+        self.attempt_group_drops_first_timeout = 0
+        self.timeout_cooldown_groups = 0
         self.attempts_by_task.clear()
         self.attempt_timeouts_by_task.clear()
         self.attempt_late_success_after_timeout_by_task.clear()
         self.attempt_drops_by_task.clear()
+        self.attempt_first_timeout_drops_by_task.clear()
         self.worker_restart_count = 0
         self.worker_restart_count_by_name.clear()
         self.scheduler_attempts_started = 0
@@ -1552,6 +1932,14 @@ class Scheduler:
         self.scheduler_stale_after_batch_complete = 0
         self.scheduler_cancelled_batch_complete = 0
         self.scheduler_cancelled_batch_complete_by_worker.clear()
+        self.group_scoring_started = 0
+        self.group_scoring_finished = 0
+        self.group_scoring_failed = 0
+        self.group_scoring_stale = 0
+        self.group_scoring_max_pending_reached = 0
+        self.group_scoring_runtime_seconds.clear()
+        self.group_scoring_queue_wait_seconds.clear()
+        self.group_scoring_lag_seconds.clear()
 
         # Add inference pool metrics (e.g. elastic pool server counts)
         metrics.update(self.inference_pool.get_metrics())

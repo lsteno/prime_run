@@ -64,6 +64,8 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert config["orchestrator"]["env_worker_recovery"]["cancel_grace_seconds"] == 5
         assert config["orchestrator"]["env_worker_recovery"]["max_rollout_attempts_per_slot"] == 4
         assert config["orchestrator"]["env_worker_recovery"]["max_attempts_cooldown_steps"] == 5
+        assert config["orchestrator"]["env_worker_recovery"]["drop_group_on_first_timeout"] is False
+        assert config["orchestrator"]["env_worker_recovery"]["first_timeout_cooldown_steps"] == 5
         assert config["orchestrator"]["env_worker_recovery"]["restart_on_rollout_timeout"] is True
         assert config["orchestrator"]["env_worker_recovery"]["restart_on_worker_health_failure"] is True
         assert config["orchestrator"]["attempt_logging"]["enabled"] is True
@@ -75,6 +77,9 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert config["orchestrator"]["async_scheduling"]["cancel_stale_carryover"] is True
         assert config["orchestrator"]["async_scheduling"]["restart_workers_for_stale_cancel"] is True
         assert config["orchestrator"]["async_scheduling"]["batch_complete_cancel_grace_seconds"] == 2
+        assert config["orchestrator"]["group_scoring"]["enabled"] is True
+        assert config["orchestrator"]["group_scoring"]["max_concurrency"] == 8
+        assert config["orchestrator"]["group_scoring"]["max_pending_groups"] == 64
         assert config["orchestrator"]["buffer"]["hard_cooldown_steps"] == 5
         assert "easy_threshold" not in config["orchestrator"]["buffer"]
         assert config["orchestrator"]["buffer"]["online_filter_hard"] is True
@@ -85,6 +90,8 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert row["env_worker_cancel_grace_seconds"] == "5"
         assert row["max_rollout_attempts_per_slot"] == "4"
         assert row["max_attempts_cooldown_steps"] == "5"
+        assert row["drop_group_on_first_timeout"] == "false"
+        assert row["first_timeout_cooldown_steps"] == "5"
         assert row["wandb_log_extras_interval"] == "10"
         assert row["wandb_sample_max_chars"] == "8000"
         assert row["wandb_sample_include_input_ids"] == "false"
@@ -99,14 +106,23 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert row["cancel_stale_carryover"] == "true"
         assert row["restart_workers_for_stale_cancel"] == "true"
         assert row["batch_complete_cancel_grace_seconds"] == "2"
+        assert row["group_scoring_enabled"] == "true"
+        assert row["group_scoring_max_concurrency"] == "8"
+        assert row["group_scoring_max_pending_groups"] == "64"
         assert row["seq_len"] == "49152"
         assert row["max_prompt_tokens"] == "47104"
         assert row["cp"] == "2"
         assert row["max_total_subcalls"] == "50"
         assert row["max_batched_subcalls"] == "50"
+        assert row["llm_subcall_empty_response_max_attempts"] == "3"
+        assert row["llm_subcall_empty_response_base_retry_seconds"] == "1.0"
+        assert row["llm_subcall_empty_response_max_retry_seconds"] == "10.0"
         assert row["adaptive_efficiency_beta_max"] == "0.15"
         assert row["adaptive_efficiency_gamma"] == "1.0"
         assert row["adaptive_efficiency_solve_rate_floor"] == "0.25"
+        assert row["efficiency_penalty_applies_to"] == "all_rollouts"
+        assert row["reward_clip_min"] == "-0.5"
+        assert row["reward_clip_max"] == "1.0"
         assert row["max_turn_penalty_enabled"] == "true"
         assert row["max_turn_penalty"] == "0.25"
         assert row["missing_final_at_max_turn_zero_reward"] == "true"
@@ -123,6 +139,9 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert config["orchestrator"]["env"][0]["args"]["adaptive_efficiency_beta_max"] == 0.15
         assert config["orchestrator"]["env"][0]["args"]["adaptive_efficiency_gamma"] == 1.0
         assert config["orchestrator"]["env"][0]["args"]["adaptive_efficiency_solve_rate_floor"] == 0.25
+        assert config["orchestrator"]["env"][0]["args"]["efficiency_penalty_applies_to"] == "all_rollouts"
+        assert config["orchestrator"]["env"][0]["args"]["reward_clip_min"] == -0.5
+        assert config["orchestrator"]["env"][0]["args"]["reward_clip_max"] == 1.0
         assert config["orchestrator"]["env"][0]["args"]["max_iterations"] == 15
         assert config["orchestrator"]["env"][0]["args"]["max_depth"] == 0
         assert config["orchestrator"]["env"][0]["args"]["max_prompt_tokens"] == 47104
@@ -136,6 +155,12 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert config["orchestrator"]["env"][0]["args"]["max_batched_subcalls"] == 50
         assert config["orchestrator"]["eval"]["env"][0]["args"]["max_total_subcalls"] == 50
         assert config["orchestrator"]["eval"]["env"][0]["args"]["max_batched_subcalls"] == 50
+        assert config["orchestrator"]["env"][0]["args"]["llm_subcall_empty_response_max_attempts"] == 3
+        assert config["orchestrator"]["env"][0]["args"]["llm_subcall_empty_response_base_retry_seconds"] == 1.0
+        assert config["orchestrator"]["env"][0]["args"]["llm_subcall_empty_response_max_retry_seconds"] == 10.0
+        assert config["orchestrator"]["eval"]["env"][0]["args"]["llm_subcall_empty_response_max_attempts"] == 3
+        assert config["orchestrator"]["eval"]["env"][0]["args"]["llm_subcall_empty_response_base_retry_seconds"] == 1.0
+        assert config["orchestrator"]["eval"]["env"][0]["args"]["llm_subcall_empty_response_max_retry_seconds"] == 10.0
         assert config["orchestrator"]["env"][0]["args"]["max_turn_penalty_enabled"] is True
         assert config["orchestrator"]["env"][0]["args"]["max_turn_penalty"] == 0.25
         assert config["orchestrator"]["env"][0]["args"]["missing_final_at_max_turn_zero_reward"] is True
@@ -146,3 +171,6 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         eval_args = config["orchestrator"]["eval"]["env"][0]["args"]
         assert eval_args["efficiency_penalty_mode"] == "static_per_1k"
         assert eval_args["efficiency_penalty_coef"] == 0.0
+        assert eval_args["efficiency_penalty_applies_to"] == "all_rollouts"
+        assert eval_args["reward_clip_min"] == -0.5
+        assert eval_args["reward_clip_max"] == 1.0

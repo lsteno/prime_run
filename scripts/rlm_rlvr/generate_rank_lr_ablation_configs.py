@@ -24,11 +24,19 @@ REPL_FAST_TIMEOUT_SECONDS = 30
 ENV_WORKER_CANCEL_GRACE_SECONDS = 5
 MAX_ROLLOUT_ATTEMPTS_PER_SLOT = 4
 MAX_ATTEMPTS_COOLDOWN_STEPS = 5
+DROP_GROUP_ON_FIRST_TIMEOUT = False
+FIRST_TIMEOUT_COOLDOWN_STEPS = 5
 MAX_TOTAL_SUBCALLS = 50
 MAX_BATCHED_SUBCALLS = 50
+LLM_SUBCALL_EMPTY_RESPONSE_MAX_ATTEMPTS = 3
+LLM_SUBCALL_EMPTY_RESPONSE_BASE_RETRY_SECONDS = 1.0
+LLM_SUBCALL_EMPTY_RESPONSE_MAX_RETRY_SECONDS = 10.0
 ADAPTIVE_EFFICIENCY_BETA_MAX = 0.15
 ADAPTIVE_EFFICIENCY_GAMMA = 1.0
 ADAPTIVE_EFFICIENCY_SOLVE_RATE_FLOOR = 0.25
+EFFICIENCY_PENALTY_APPLIES_TO = "all_rollouts"
+REWARD_CLIP_MIN = -0.5
+REWARD_CLIP_MAX = 1.0
 MAX_TURN_PENALTY_ENABLED = True
 MAX_TURN_PENALTY = 0.25
 MISSING_FINAL_AT_MAX_TURN_ZERO_REWARD = True
@@ -42,6 +50,9 @@ MAX_CARRYOVER_STEPS = 1
 CANCEL_STALE_CARRYOVER = True
 RESTART_WORKERS_FOR_STALE_CANCEL = True
 BATCH_COMPLETE_CANCEL_GRACE_SECONDS = 2
+GROUP_SCORING_ENABLED = True
+GROUP_SCORING_MAX_CONCURRENCY = 8
+GROUP_SCORING_MAX_PENDING_GROUPS = 64
 DEPTH1_TRAIN_SEQ_LEN = 49152
 DEPTH1_MAX_PROMPT_TOKENS = 47104
 DEPTH1_CONTEXT_PARALLEL = 2
@@ -127,6 +138,8 @@ def build_config(base: str, *, rank: int, alpha: int, lr: str, run_id: str) -> s
         f"cancel_grace_seconds = {ENV_WORKER_CANCEL_GRACE_SECONDS}\n"
         f"max_rollout_attempts_per_slot = {MAX_ROLLOUT_ATTEMPTS_PER_SLOT}\n"
         f"max_attempts_cooldown_steps = {MAX_ATTEMPTS_COOLDOWN_STEPS}\n"
+        f"drop_group_on_first_timeout = {str(DROP_GROUP_ON_FIRST_TIMEOUT).lower()}\n"
+        f"first_timeout_cooldown_steps = {FIRST_TIMEOUT_COOLDOWN_STEPS}\n"
         "restart_on_rollout_timeout = true\n"
         "restart_on_worker_health_failure = true\n"
         "\n"
@@ -147,6 +160,15 @@ def build_config(base: str, *, rank: int, alpha: int, lr: str, run_id: str) -> s
         f"cancel_stale_carryover = {str(CANCEL_STALE_CARRYOVER).lower()}\n"
         f"restart_workers_for_stale_cancel = {str(RESTART_WORKERS_FOR_STALE_CANCEL).lower()}\n"
         f"batch_complete_cancel_grace_seconds = {BATCH_COMPLETE_CANCEL_GRACE_SECONDS}\n",
+    )
+    text = insert_after_once(
+        text,
+        f"batch_complete_cancel_grace_seconds = {BATCH_COMPLETE_CANCEL_GRACE_SECONDS}\n",
+        "\n"
+        "[orchestrator.group_scoring]\n"
+        f"enabled = {str(GROUP_SCORING_ENABLED).lower()}\n"
+        f"max_concurrency = {GROUP_SCORING_MAX_CONCURRENCY}\n"
+        f"max_pending_groups = {GROUP_SCORING_MAX_PENDING_GROUPS}\n",
     )
     text = replace_line(text, r'^name = "qwen3-4b-instruct-sanjaya-medium-8xa100-40gb-budgeted"$', f'name = "{run_id}"')
     text = replace_all(
@@ -195,6 +217,14 @@ def build_config(base: str, *, rank: int, alpha: int, lr: str, run_id: str) -> s
     text = replace_all(text, "max_depth = 2", f"max_depth = {RUNTIME_MAX_DEPTH}")
     text = replace_all(text, "max_total_subcalls = 80", f"max_total_subcalls = {MAX_TOTAL_SUBCALLS}")
     text = replace_all(text, "max_batched_subcalls = 80", f"max_batched_subcalls = {MAX_BATCHED_SUBCALLS}")
+    text = replace_all(
+        text,
+        'llm_subcall_thinking_level = "medium"\n',
+        'llm_subcall_thinking_level = "medium"\n'
+        f"llm_subcall_empty_response_max_attempts = {LLM_SUBCALL_EMPTY_RESPONSE_MAX_ATTEMPTS}\n"
+        f"llm_subcall_empty_response_base_retry_seconds = {LLM_SUBCALL_EMPTY_RESPONSE_BASE_RETRY_SECONDS}\n"
+        f"llm_subcall_empty_response_max_retry_seconds = {LLM_SUBCALL_EMPTY_RESPONSE_MAX_RETRY_SECONDS}\n",
+    )
     text = replace_line(
         text,
         r"^adaptive_efficiency_beta_max = .+$",
@@ -214,6 +244,9 @@ def build_config(base: str, *, rank: int, alpha: int, lr: str, run_id: str) -> s
         text,
         'adaptive_efficiency_cost_basis = "total_tokens"\n',
         'adaptive_efficiency_cost_basis = "total_tokens"\n'
+        f'efficiency_penalty_applies_to = "{EFFICIENCY_PENALTY_APPLIES_TO}"\n'
+        f"reward_clip_min = {REWARD_CLIP_MIN}\n"
+        f"reward_clip_max = {REWARD_CLIP_MAX}\n"
         f"max_turn_penalty_enabled = {str(MAX_TURN_PENALTY_ENABLED).lower()}\n"
         f"max_turn_penalty = {MAX_TURN_PENALTY}\n"
         f"missing_final_at_max_turn_zero_reward = {str(MISSING_FINAL_AT_MAX_TURN_ZERO_REWARD).lower()}\n",
@@ -222,6 +255,9 @@ def build_config(base: str, *, rank: int, alpha: int, lr: str, run_id: str) -> s
         text,
         "efficiency_penalty_coef = 0.0\n",
         "efficiency_penalty_coef = 0.0\n"
+        f'efficiency_penalty_applies_to = "{EFFICIENCY_PENALTY_APPLIES_TO}"\n'
+        f"reward_clip_min = {REWARD_CLIP_MIN}\n"
+        f"reward_clip_max = {REWARD_CLIP_MAX}\n"
         f"max_turn_penalty_enabled = {str(MAX_TURN_PENALTY_ENABLED).lower()}\n"
         f"max_turn_penalty = {MAX_TURN_PENALTY}\n"
         f"missing_final_at_max_turn_zero_reward = {str(MISSING_FINAL_AT_MAX_TURN_ZERO_REWARD).lower()}\n",
@@ -307,6 +343,9 @@ def main() -> None:
                 "cancel_stale_carryover": str(CANCEL_STALE_CARRYOVER).lower(),
                 "restart_workers_for_stale_cancel": str(RESTART_WORKERS_FOR_STALE_CANCEL).lower(),
                 "batch_complete_cancel_grace_seconds": BATCH_COMPLETE_CANCEL_GRACE_SECONDS,
+                "group_scoring_enabled": str(GROUP_SCORING_ENABLED).lower(),
+                "group_scoring_max_concurrency": GROUP_SCORING_MAX_CONCURRENCY,
+                "group_scoring_max_pending_groups": GROUP_SCORING_MAX_PENDING_GROUPS,
                 "seq_len": DEPTH1_TRAIN_SEQ_LEN,
                 "max_prompt_tokens": DEPTH1_MAX_PROMPT_TOKENS,
                 "cp": DEPTH1_CONTEXT_PARALLEL,
@@ -319,6 +358,8 @@ def main() -> None:
                 "env_worker_cancel_grace_seconds": ENV_WORKER_CANCEL_GRACE_SECONDS,
                 "max_rollout_attempts_per_slot": MAX_ROLLOUT_ATTEMPTS_PER_SLOT,
                 "max_attempts_cooldown_steps": MAX_ATTEMPTS_COOLDOWN_STEPS,
+                "drop_group_on_first_timeout": str(DROP_GROUP_ON_FIRST_TIMEOUT).lower(),
+                "first_timeout_cooldown_steps": FIRST_TIMEOUT_COOLDOWN_STEPS,
                 "wandb_log_extras_interval": 10,
                 "wandb_sample_max_chars": 8000,
                 "wandb_sample_include_input_ids": "false",
@@ -326,9 +367,15 @@ def main() -> None:
                 "repl_timeout_seconds": REPL_TIMEOUT_SECONDS,
                 "max_total_subcalls": MAX_TOTAL_SUBCALLS,
                 "max_batched_subcalls": MAX_BATCHED_SUBCALLS,
+                "llm_subcall_empty_response_max_attempts": LLM_SUBCALL_EMPTY_RESPONSE_MAX_ATTEMPTS,
+                "llm_subcall_empty_response_base_retry_seconds": LLM_SUBCALL_EMPTY_RESPONSE_BASE_RETRY_SECONDS,
+                "llm_subcall_empty_response_max_retry_seconds": LLM_SUBCALL_EMPTY_RESPONSE_MAX_RETRY_SECONDS,
                 "adaptive_efficiency_beta_max": ADAPTIVE_EFFICIENCY_BETA_MAX,
                 "adaptive_efficiency_gamma": ADAPTIVE_EFFICIENCY_GAMMA,
                 "adaptive_efficiency_solve_rate_floor": ADAPTIVE_EFFICIENCY_SOLVE_RATE_FLOOR,
+                "efficiency_penalty_applies_to": EFFICIENCY_PENALTY_APPLIES_TO,
+                "reward_clip_min": REWARD_CLIP_MIN,
+                "reward_clip_max": REWARD_CLIP_MAX,
                 "max_turn_penalty_enabled": str(MAX_TURN_PENALTY_ENABLED).lower(),
                 "max_turn_penalty": MAX_TURN_PENALTY,
                 "missing_final_at_max_turn_zero_reward": str(MISSING_FINAL_AT_MAX_TURN_ZERO_REWARD).lower(),

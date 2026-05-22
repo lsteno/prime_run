@@ -51,12 +51,17 @@ def dummy_env_group(mock_openai_client, dummy_dataset) -> vf.EnvGroup:
 
 @pytest.fixture
 def make_rollouts():
-    def _make_rollouts(dataset: Dataset, rewards: list[float]) -> list[vf.RolloutOutput]:
+    def _make_rollouts(
+        dataset: Dataset,
+        rewards: list[float],
+        correctness: list[float] | None = None,
+    ) -> list[vf.RolloutOutput]:
         all_rollouts = []
         for i, reward in enumerate(rewards):
             task = dataset[i]["task"]
             example_id = dataset[i]["example_id"]
             prompt = dataset[i]["prompt"]
+            rollout_metrics = {} if correctness is None else {"correctness_metric": correctness[i]}
             rollouts = [
                 vf.RolloutOutput(
                     example_id=example_id,
@@ -70,7 +75,7 @@ def make_rollouts():
                     is_truncated=False,
                     reward=reward,
                     advantage=1.0,
-                    metrics={},
+                    metrics=rollout_metrics,
                 )
             ] * 2
             all_rollouts.extend(rollouts)
@@ -165,6 +170,29 @@ def test_buffer_online_difficulty_filtering_can_keep_easy_groups(dummy_env_group
     metrics = buffer.get_metrics()
     assert metrics["buffer/filtered_hard_groups"] == 1
     assert metrics["buffer/kept_easy_groups"] == 2
+
+
+def test_buffer_online_difficulty_filtering_uses_correctness_not_shaped_reward(dummy_env_group, make_rollouts):
+    """Negative cost-shaped reward should not make mixed solved groups look hard."""
+    dataset = dummy_env_group.get_dataset()
+    buffer = Buffer(
+        dataset,
+        dummy_env_group.env_names,
+        BufferConfig(online_difficulty_filtering=True, online_filter_easy=False),
+    )
+    buffer.update(
+        make_rollouts(
+            dataset.select(range(3)),
+            rewards=[-0.25, -0.10, 0.75],
+            correctness=[0.0, 0.5, 1.0],
+        )
+    )
+
+    # The all-wrong group is filtered. The mixed and all-correct groups are kept.
+    assert len(buffer.rollout_buffer) == 4
+    metrics = buffer.get_metrics()
+    assert metrics["buffer/filtered_hard_groups"] == 1
+    assert metrics["buffer/kept_easy_groups"] == 1
 
 
 def test_buffer_no_filtering_by_default(dummy_env_group, make_rollouts):

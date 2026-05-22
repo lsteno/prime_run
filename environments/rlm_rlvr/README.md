@@ -77,6 +77,9 @@ Notes:
 | `adaptive_efficiency_gamma` | `float` | `2.0` | Exponent for the solve-rate ramp in group mode |
 | `adaptive_efficiency_solve_rate_floor` | `float` | `0.25` | No adaptive cost pressure is applied when group solve rate is at or below this floor |
 | `adaptive_efficiency_cost_basis` | `str` | `"total_tokens"` | Token-cost basis for adaptive group penalty. Currently supports total rollout tokens |
+| `efficiency_penalty_applies_to` | `str` | `"correct_only"` | Scope for cost shaping. Use `"correct_only"` for backward-compatible behavior or `"all_rollouts"` to make expensive wrong rollouts negative when adaptive beta is active |
+| `reward_clip_min` | `float` | `0.0` | Lower bound for shaped reward. Active cost-only negative-penalty sweeps set this to `-0.5` |
+| `reward_clip_max` | `float` | `1.0` | Upper bound for shaped reward |
 | `inference_mode` | `str` | `"hosted"` | Inference routing mode. Use `hosted` for managed hosted training and `local` for self-managed `prime-rl` on local or on-demand GPUs |
 | `inference_base_url` | `str \| null` | `null` | Override the OpenAI-compatible inference endpoint. Usually unset for self-managed `prime-rl`, which wires the local inference server automatically |
 | `inference_api_key` | `str \| null` | `null` | Override API key for the inference endpoint. Usually unset for self-managed `prime-rl` local inference |
@@ -110,10 +113,11 @@ Summarize key metrics your rubric emits and how they’re interpreted.
 
 | Metric | Meaning |
 | ------ | ------- |
-| `reward` | Zero for incorrect/no-answer rollouts; correct rollouts minus optional static or adaptive token-cost penalty clipped at zero |
+| `reward` | Correctness minus optional static/adaptive token-cost penalty and max-turn penalty, clipped by `reward_clip_min` / `reward_clip_max` |
 | `correctness` | Raw binary judge score before cost shaping |
 | `judge_score` | Binary judge score for observability |
 | `efficiency_penalty` | Static or adaptive token-cost penalty subtracted from reward |
+| `incorrect_cost_penalty` | Portion of the cost penalty applied to incorrect rollouts when `efficiency_penalty_applies_to = "all_rollouts"` |
 | `cost_prompt_tokens` | Total prompt tokens consumed across all root turns, recursive turns, and subcalls |
 | `cost_completion_tokens` | Total completion tokens consumed across all root turns, recursive turns, and subcalls |
 | `cost_total_tokens` | Sum of prompt and completion tokens used for cost shaping |

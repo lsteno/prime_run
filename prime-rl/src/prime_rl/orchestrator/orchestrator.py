@@ -755,17 +755,21 @@ async def orchestrate(config: OrchestratorConfig):
         progress.total_problems += num_unique_examples
         throughput = num_tokens / generate_completions_time
 
-        def compute_solve_rates(df):
+        def compute_solve_rates(df, metric_df: pd.DataFrame | None = None):
             """Compute solve_none, solve_all, effective_batch_size for a set of rollouts."""
-            reward_per_problem = df.groupby("example_id").reward.sum()
-            solve_none = (reward_per_problem == 0).mean()
-            solve_all = (reward_per_problem == config.rollouts_per_example).mean()
+            if metric_df is not None and not metric_df.empty and "correctness_metric" in metric_df.columns:
+                correctness = pd.to_numeric(metric_df["correctness_metric"], errors="coerce").reindex(df.index)
+                score_per_problem = correctness.fillna(0.0).groupby(df["example_id"]).sum()
+            else:
+                score_per_problem = df.groupby("example_id").reward.sum()
+            solve_none = (score_per_problem <= 0.0).mean()
+            solve_all = (score_per_problem >= config.rollouts_per_example).mean()
             return solve_none, solve_all, 1 - solve_none - solve_all
 
         # Group by example_id to average across rollouts within each problem
         by_example = results_df.groupby("example_id")
 
-        solve_none, solve_all, effective_batch_size = compute_solve_rates(results_df)
+        solve_none, solve_all, effective_batch_size = compute_solve_rates(results_df, metrics_df)
         to_log = {
             # Progress metrics
             "progress/tokens": num_tokens,
@@ -860,16 +864,16 @@ async def orchestrate(config: OrchestratorConfig):
             to_log[f"reward/{env}/mean"] = env_by_example.reward.mean().mean()
             to_log[f"reward/{env}/max"] = env_by_example.reward.mean().max()
             to_log[f"reward/{env}/min"] = env_by_example.reward.mean().min()
-            solve_none, solve_all, effective_batch_size = compute_solve_rates(env_df)
+            env_metrics_df = metrics_df.loc[env_df.index]
+            solve_none, solve_all, effective_batch_size = compute_solve_rates(env_df, env_metrics_df)
             to_log[f"solve_none/{env}"] = solve_none
             to_log[f"solve_all/{env}"] = solve_all
             to_log[f"effective_batch_size/{env}"] = effective_batch_size
             to_log.update(stable_stop_condition_metrics(env_df, prefix=env))
-            to_log.update(rlm_protocol_metrics(env_df, metrics_df.loc[env_df.index], prefix=env))
-            to_log.update(rlm_cost_subcall_metrics(env_df, metrics_df.loc[env_df.index], prefix=env))
+            to_log.update(rlm_protocol_metrics(env_df, env_metrics_df, prefix=env))
+            to_log.update(rlm_cost_subcall_metrics(env_df, env_metrics_df, prefix=env))
             for sc, rate in env_df.stop_condition.dropna().value_counts(normalize=True).items():
                 to_log[f"stop_condition/{env}/{sc}"] = rate
-            env_metrics_df = metrics_df.loc[env_df.index]
             for metric in metrics_df.columns:
                 to_log[f"metrics/{env}/{metric}"] = env_metrics_df.groupby(env_df["example_id"])[metric].mean().mean()
 

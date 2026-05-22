@@ -214,7 +214,7 @@ def test_build_rubric_no_answer_reward_is_zero_with_cost_penalty(monkeypatch) ->
 
     assert score == 0.0
     assert state["reward_correctness"] == 0.0
-    assert state["reward_efficiency_penalty"] == 0.02
+    assert state["reward_efficiency_penalty"] == 0.0
     assert state["reward_total"] == 0.0
 
 
@@ -251,8 +251,48 @@ def test_build_rubric_incorrect_judge_reward_is_zero_with_cost_penalty(monkeypat
 
     assert score == 0.0
     assert state["reward_correctness"] == 0.0
-    assert state["reward_efficiency_penalty"] == 0.02
+    assert state["reward_efficiency_penalty"] == 0.0
     assert state["reward_total"] == 0.0
+
+
+def test_static_cost_penalty_can_make_incorrect_rollout_negative_when_enabled(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    async def _judge_zero(*args, **kwargs):
+        del args, kwargs
+        return 0.0, "0", None
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    monkeypatch.setattr(reward_module, "_call_binary_judge", _judge_zero)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+        efficiency_penalty_applies_to="all_rollouts",
+        reward_clip_min=-0.5,
+    )
+    reward_fn = rubric.funcs[0]
+    state = {
+        "final_answer": "wrong",
+        "efficiency_penalty_coef": 2.0,
+        "rlm_segments": [
+            {
+                "prompt_ids": list(range(600)),
+                "completion_ids": list(range(400)),
+            }
+        ],
+        "trajectory": [],
+    }
+
+    score = asyncio.run(reward_fn(state, [], "42", {"question": "What is the answer?"}))
+
+    assert score == -0.5
+    assert state["reward_correctness"] == 0.0
+    assert state["reward_efficiency_penalty"] == 2.0
+    assert state["reward_incorrect_cost_penalty"] == 2.0
+    assert state["reward_total"] == -0.5
 
 
 def test_build_rubric_zeroes_missing_formal_final_at_max_turn(monkeypatch) -> None:
@@ -459,7 +499,7 @@ def test_adaptive_group_single_correct_hard_group_has_no_cost_penalty(monkeypatc
     assert states[0]["reward_adaptive_normalized_cost"] == 0.0
 
 
-def test_adaptive_group_penalizes_only_correct_rollouts_by_relative_cost(monkeypatch) -> None:
+def test_adaptive_group_penalizes_only_correct_rollouts_by_relative_cost_by_default(monkeypatch) -> None:
     rubric = _adaptive_rubric(monkeypatch)
     reward_fn = rubric.funcs[0]
     states = [
@@ -479,6 +519,80 @@ def test_adaptive_group_penalizes_only_correct_rollouts_by_relative_cost(monkeyp
     assert all(score > scores[3] for score in scores[:3])
     assert states[3]["reward_adaptive_normalized_cost"] == 0.0
     assert states[3]["reward_efficiency_penalty"] == 0.0
+
+
+def test_adaptive_group_can_penalize_incorrect_rollouts_by_relative_group_cost(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    async def _judge_zero(*args, **kwargs):
+        del args, kwargs
+        return 0.0, "0", None
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    monkeypatch.setattr(reward_module, "_call_binary_judge", _judge_zero)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+        efficiency_penalty_mode="adaptive_group",
+        adaptive_efficiency_beta_max=0.15,
+        adaptive_efficiency_gamma=1.0,
+        efficiency_penalty_applies_to="all_rollouts",
+        reward_clip_min=-0.5,
+        reward_clip_max=1.0,
+    )
+    reward_fn = rubric.funcs[0]
+    states = [
+        _adaptive_test_state("42", 20),
+        _adaptive_test_state("wrong", 40),
+        _adaptive_test_state("wrong", 80),
+        _adaptive_test_state("42", 100),
+    ]
+
+    scores = asyncio.run(reward_fn(states))
+
+    expected_beta = 0.15 * ((0.5 - 0.25) / 0.75)
+    assert scores[0] == 1.0
+    assert scores[1] == -(expected_beta * ((40 - 20) / (100 - 20)))
+    assert scores[2] == -(expected_beta * ((80 - 20) / (100 - 20)))
+    assert scores[3] == 1.0 - expected_beta
+    assert states[1]["reward_correctness"] == 0.0
+    assert states[1]["reward_efficiency_penalty"] > 0.0
+    assert states[1]["reward_incorrect_cost_penalty"] == states[1]["reward_efficiency_penalty"]
+
+
+def test_adaptive_group_all_wrong_keeps_beta_zero_even_with_all_rollouts_penalty(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    async def _judge_zero(*args, **kwargs):
+        del args, kwargs
+        return 0.0, "0", None
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    monkeypatch.setattr(reward_module, "_call_binary_judge", _judge_zero)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+        efficiency_penalty_mode="adaptive_group",
+        adaptive_efficiency_beta_max=0.15,
+        adaptive_efficiency_gamma=1.0,
+        efficiency_penalty_applies_to="all_rollouts",
+        reward_clip_min=-0.5,
+        reward_clip_max=1.0,
+    )
+    reward_fn = rubric.funcs[0]
+    states = [_adaptive_test_state("wrong", total_tokens) for total_tokens in (20, 40, 80, 100)]
+
+    scores = asyncio.run(reward_fn(states))
+
+    assert scores == [0.0, 0.0, 0.0, 0.0]
+    assert all(state["reward_adaptive_beta"] == 0.0 for state in states)
+    assert all(state["reward_incorrect_cost_penalty"] == 0.0 for state in states)
 
 
 def test_adaptive_group_all_correct_compresses_cost(monkeypatch) -> None:

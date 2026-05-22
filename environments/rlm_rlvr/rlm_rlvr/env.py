@@ -105,6 +105,9 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         state["adaptive_efficiency_gamma"] = getattr(self, "adaptive_efficiency_gamma", 2.0)
         state["adaptive_efficiency_solve_rate_floor"] = getattr(self, "adaptive_efficiency_solve_rate_floor", 0.25)
         state["adaptive_efficiency_cost_basis"] = getattr(self, "adaptive_efficiency_cost_basis", "total_tokens")
+        state["efficiency_penalty_applies_to"] = getattr(self, "efficiency_penalty_applies_to", "correct_only")
+        state["reward_clip_min"] = getattr(self, "reward_clip_min", 0.0)
+        state["reward_clip_max"] = getattr(self, "reward_clip_max", 1.0)
         state["used_repl"] = False
         state["used_recursion"] = False
         state["used_llm_subcalls"] = False
@@ -403,6 +406,9 @@ def load_environment(
     adaptive_efficiency_gamma: float = 2.0,
     adaptive_efficiency_solve_rate_floor: float = 0.25,
     adaptive_efficiency_cost_basis: str = "total_tokens",
+    efficiency_penalty_applies_to: str = "correct_only",
+    reward_clip_min: float = 0.0,
+    reward_clip_max: float = 1.0,
     max_turn_penalty_enabled: bool = False,
     max_turn_penalty: float = 0.25,
     missing_final_at_max_turn_zero_reward: bool = True,
@@ -454,6 +460,11 @@ def load_environment(
     valid_adaptive_cost_bases = {"total_tokens"}
     if adaptive_efficiency_cost_basis not in valid_adaptive_cost_bases:
         raise ValueError(f"adaptive_efficiency_cost_basis must be one of {sorted(valid_adaptive_cost_bases)}")
+    valid_efficiency_penalty_scopes = {"correct_only", "all_rollouts"}
+    if efficiency_penalty_applies_to not in valid_efficiency_penalty_scopes:
+        raise ValueError(f"efficiency_penalty_applies_to must be one of {sorted(valid_efficiency_penalty_scopes)}")
+    if reward_clip_min > reward_clip_max:
+        raise ValueError("reward_clip_min must be <= reward_clip_max")
     if max_turn_penalty < 0.0:
         raise ValueError("max_turn_penalty must be >= 0.0")
 
@@ -596,6 +607,9 @@ def load_environment(
         adaptive_efficiency_gamma=adaptive_efficiency_gamma,
         adaptive_efficiency_solve_rate_floor=adaptive_efficiency_solve_rate_floor,
         adaptive_efficiency_cost_basis=adaptive_efficiency_cost_basis,
+        efficiency_penalty_applies_to=efficiency_penalty_applies_to,
+        reward_clip_min=reward_clip_min,
+        reward_clip_max=reward_clip_max,
         max_turn_penalty_enabled=max_turn_penalty_enabled,
         max_turn_penalty=max_turn_penalty,
         missing_final_at_max_turn_zero_reward=missing_final_at_max_turn_zero_reward,
@@ -613,6 +627,9 @@ def load_environment(
         adaptive_efficiency_gamma=adaptive_efficiency_gamma,
         adaptive_efficiency_solve_rate_floor=adaptive_efficiency_solve_rate_floor,
         adaptive_efficiency_cost_basis=adaptive_efficiency_cost_basis,
+        efficiency_penalty_applies_to=efficiency_penalty_applies_to,
+        reward_clip_min=reward_clip_min,
+        reward_clip_max=reward_clip_max,
         max_turn_penalty_enabled=max_turn_penalty_enabled,
         max_turn_penalty=max_turn_penalty,
         missing_final_at_max_turn_zero_reward=missing_final_at_max_turn_zero_reward,

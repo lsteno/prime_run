@@ -53,6 +53,7 @@ _JUDGE_RETRY_MAX_SECONDS = 30.0
 _VERTEX_JUDGE_MAX_OUTPUT_TOKENS = 1024
 _VALID_EFFICIENCY_PENALTY_MODES = {"static_per_1k", "adaptive_group"}
 _VALID_ADAPTIVE_COST_BASES = {"total_tokens"}
+_VALID_EFFICIENCY_PENALTY_SCOPES = {"correct_only", "all_rollouts"}
 
 
 @dataclass(frozen=True)
@@ -484,10 +485,12 @@ def _record_reward_breakdown(
     adaptive_beta: float | None = None,
     adaptive_normalized_cost: float | None = None,
     adaptive_cost_penalty: float | None = None,
+    incorrect_cost_penalty: float = 0.0,
     max_turn_penalty: float = 0.0,
 ) -> None:
     state["reward_correctness"] = correctness
     state["reward_efficiency_penalty"] = efficiency_penalty
+    state["reward_incorrect_cost_penalty"] = incorrect_cost_penalty
     state["reward_max_turn_penalty"] = max_turn_penalty
     state["reward_total"] = total_reward
     state["cost_prompt_tokens"] = float(prompt_tokens)
@@ -513,6 +516,7 @@ def _record_reward_breakdown(
     debug_payload = {
         "reward_correctness": correctness,
         "reward_efficiency_penalty": efficiency_penalty,
+        "reward_incorrect_cost_penalty": incorrect_cost_penalty,
         "reward_max_turn_penalty": max_turn_penalty,
         "reward_total": total_reward,
         "cost_prompt_tokens": prompt_tokens,
@@ -770,6 +774,17 @@ def _adaptive_cost_value(state: vf.State, *, cost_basis: str) -> int:
     return _segment_rollout_token_breakdown(state).total_tokens
 
 
+def _min_max_normalized(value: int, *, min_value: int, max_value: int) -> float:
+    span = max_value - min_value
+    if span <= 0:
+        return 0.0
+    return (float(value) - float(min_value)) / float(span)
+
+
+def _clip_reward(value: float, *, reward_clip_min: float, reward_clip_max: float) -> float:
+    return min(reward_clip_max, max(reward_clip_min, value))
+
+
 def build_rubric(
     *,
     judge_model: str,
@@ -785,6 +800,9 @@ def build_rubric(
     adaptive_efficiency_gamma: float = 2.0,
     adaptive_efficiency_solve_rate_floor: float = 0.25,
     adaptive_efficiency_cost_basis: str = "total_tokens",
+    efficiency_penalty_applies_to: str = "correct_only",
+    reward_clip_min: float = 0.0,
+    reward_clip_max: float = 1.0,
     max_turn_penalty_enabled: bool = False,
     max_turn_penalty: float = 0.25,
     missing_final_at_max_turn_zero_reward: bool = True,
@@ -793,6 +811,10 @@ def build_rubric(
         raise ValueError(f"efficiency_penalty_mode must be one of {sorted(_VALID_EFFICIENCY_PENALTY_MODES)}")
     if adaptive_efficiency_cost_basis not in _VALID_ADAPTIVE_COST_BASES:
         raise ValueError(f"adaptive_efficiency_cost_basis must be one of {sorted(_VALID_ADAPTIVE_COST_BASES)}")
+    if efficiency_penalty_applies_to not in _VALID_EFFICIENCY_PENALTY_SCOPES:
+        raise ValueError(f"efficiency_penalty_applies_to must be one of {sorted(_VALID_EFFICIENCY_PENALTY_SCOPES)}")
+    if reward_clip_min > reward_clip_max:
+        raise ValueError("reward_clip_min must be <= reward_clip_max")
     if adaptive_efficiency_beta_max < 0.0:
         raise ValueError("adaptive_efficiency_beta_max must be >= 0.0")
     if adaptive_efficiency_gamma <= 0.0:
@@ -837,21 +859,25 @@ def build_rubric(
             max_turn_penalty=max_turn_penalty,
         )
 
-        total_reward = (
-            max(0.0, correctness_result.score - terminal_penalty - efficiency_penalty)
-            if correctness_result.score > 0.0
-            else 0.0
+        scoped_efficiency_penalty = efficiency_penalty if (
+            correctness_result.score > 0.0 or efficiency_penalty_applies_to == "all_rollouts"
+        ) else 0.0
+        total_reward = _clip_reward(
+            correctness_result.score - terminal_penalty - scoped_efficiency_penalty,
+            reward_clip_min=reward_clip_min,
+            reward_clip_max=reward_clip_max,
         )
         _record_reward_breakdown(
             state,
             correctness=correctness_result.score,
-            efficiency_penalty=efficiency_penalty,
+            efficiency_penalty=scoped_efficiency_penalty,
             total_reward=total_reward,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
             trainable_tokens=breakdown.trainable_tokens,
             plain_subcall_tokens=breakdown.plain_subcall_tokens,
+            incorrect_cost_penalty=scoped_efficiency_penalty if correctness_result.score <= 0.0 else 0.0,
             max_turn_penalty=terminal_penalty,
         )
         return total_reward
@@ -884,24 +910,32 @@ def build_rubric(
 
         costs = [_adaptive_cost_value(state, cost_basis=adaptive_efficiency_cost_basis) for state in states]
         correct_costs = [cost for cost, correctness in zip(costs, correctness_scores, strict=True) if correctness > 0.0]
-        min_correct_cost = min(correct_costs) if len(correct_costs) >= 2 else 0
-        max_correct_cost = max(correct_costs) if len(correct_costs) >= 2 else 0
-        cost_span = max_correct_cost - min_correct_cost
+        if efficiency_penalty_applies_to == "all_rollouts":
+            normalization_costs = costs
+        else:
+            normalization_costs = correct_costs
+        min_cost = min(normalization_costs) if len(normalization_costs) >= 2 else 0
+        max_cost = max(normalization_costs) if len(normalization_costs) >= 2 else 0
 
         rewards: list[float] = []
         for state, correctness, cost in zip(states, correctness_scores, costs, strict=True):
             breakdown = _segment_rollout_token_breakdown(state)
             normalized_cost = 0.0
-            if correctness > 0.0 and cost_span > 0:
-                normalized_cost = (float(cost) - float(min_correct_cost)) / float(cost_span)
-            adaptive_cost_penalty = beta * normalized_cost if correctness > 0.0 else 0.0
+            applies_to_rollout = correctness > 0.0 or efficiency_penalty_applies_to == "all_rollouts"
+            if applies_to_rollout:
+                normalized_cost = _min_max_normalized(cost, min_value=min_cost, max_value=max_cost)
+            adaptive_cost_penalty = beta * normalized_cost if applies_to_rollout else 0.0
             terminal_penalty = _max_turn_penalty_from_state(
                 state,
                 correctness=correctness,
                 max_turn_penalty_enabled=max_turn_penalty_enabled,
                 max_turn_penalty=max_turn_penalty,
             )
-            total_reward = max(0.0, 1.0 - terminal_penalty - adaptive_cost_penalty) if correctness > 0.0 else 0.0
+            total_reward = _clip_reward(
+                correctness - terminal_penalty - adaptive_cost_penalty,
+                reward_clip_min=reward_clip_min,
+                reward_clip_max=reward_clip_max,
+            )
             _record_reward_breakdown(
                 state,
                 correctness=correctness,
@@ -916,6 +950,7 @@ def build_rubric(
                 adaptive_beta=beta,
                 adaptive_normalized_cost=normalized_cost,
                 adaptive_cost_penalty=adaptive_cost_penalty,
+                incorrect_cost_penalty=adaptive_cost_penalty if correctness <= 0.0 else 0.0,
                 max_turn_penalty=terminal_penalty,
             )
             rewards.append(total_reward)
@@ -936,6 +971,10 @@ async def judge_score_metric(state: vf.State) -> float:
 
 async def efficiency_penalty_metric(state: vf.State) -> float:
     return float(state.get("reward_efficiency_penalty", 0.0))
+
+
+async def incorrect_cost_penalty_metric(state: vf.State) -> float:
+    return float(state.get("reward_incorrect_cost_penalty", 0.0))
 
 
 async def max_turn_penalty_metric(state: vf.State) -> float:
@@ -1034,6 +1073,7 @@ def add_metrics(rubric: vf.Rubric) -> vf.Rubric:
     rubric.add_metric(correctness_metric)
     rubric.add_metric(judge_score_metric)
     rubric.add_metric(efficiency_penalty_metric)
+    rubric.add_metric(incorrect_cost_penalty_metric)
     rubric.add_metric(max_turn_penalty_metric)
     rubric.add_metric(cost_prompt_tokens_metric)
     rubric.add_metric(cost_completion_tokens_metric)

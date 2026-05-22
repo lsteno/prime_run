@@ -2,8 +2,7 @@
 # Keep these as separate runs so LoRA rank is a true trainer-side ablation.
 # Depth-1 LLM-only setup: prompt omits RLM tools; runtime max_depth=0 blocks recursive RLM children.
 # Dataset: local derived BEEG parquets (balanced35_40_25_frames40_v1) with train/eval near 35% oolong, 40% frames, 25% longcodeu.
-# Ablation parameters: rank=4, alpha=8, lr=1e-4, max_steps=150.
-# Note: rank 4 uses Prime-RL dense LoRA's non-grouped fallback path.
+# Ablation parameters: rank=64, alpha=128, lr=1e-4, max_steps=150.
 
 # LoRA rank/LR ablation run for Qwen3 4B Instruct on a single 8x A100 80GB node,
 # with depth-1 LLM-only orchestration, lower rollout pressure, and an enabled subcall budget.
@@ -14,9 +13,9 @@
 #
 # Run from prime-rl:
 #   cd prime-rl
-#   uv run rl @ ../configs/rlm_rlvr/ablation_rank_lr/qwen3_4b_instruct_sanjaya_depth1_llmonly_r004_a008_lr1e-4_s150_8xa10080_bal35f40v1.toml
+#   uv run rl @ ../configs/rlm_rlvr/ablation_rank_lr/qwen3_4b_instruct_sanjaya_depth1_llmonly_r064_a128_lr1e-4_s150_8xa10080_bal35f40v1.toml
 
-output_dir = "../outputs/rlm-rlvr-qwen3-4b-depth1-llmonly-r4-a8-lr1e-4-s150-bal35f40v1"
+output_dir = "../outputs/rlm-rlvr-qwen3-4b-depth1-llmonly-r64-a128-lr1e-4-s150-bal35f40v1"
 max_steps = 150
 max_async_level = 2
 seq_len = 49152
@@ -32,9 +31,10 @@ name = "Qwen/Qwen3-4B-Instruct-2507"
 
 [wandb]
 project = "rlm-rlvr"
-name = "rlm-rlvr-qwen3-4b-depth1-llmonly-r4-a8-lr1e-4-s150-bal35f40v1"
+name = "rlm-rlvr-qwen3-4b-depth1-llmonly-r64-a128-lr1e-4-s150-bal35f40v1"
 
 [ckpt]
+resume_step = -1
 interval = 25
 keep_last = 2
 keep_interval = 100
@@ -62,8 +62,8 @@ fused_lm_head_token_chunk_size = "auto"
 freq = 2
 
 [trainer.model.lora]
-rank = 4
-alpha = 8
+rank = 64
+alpha = 128
 dropout = 0.0
 target_modules = [
     "q_proj",
@@ -202,7 +202,7 @@ reward_clip_max = 1.0
 max_turn_penalty_enabled = true
 max_turn_penalty = 0.25
 missing_final_at_max_turn_zero_reward = true
-live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-depth1-llmonly-r4-a8-lr1e-4-s150-bal35f40v1/live_traces"
+live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-depth1-llmonly-r64-a128-lr1e-4-s150-bal35f40v1/live_traces"
 
 [orchestrator.eval]
 interval = 25
@@ -271,7 +271,7 @@ reward_clip_max = 1.0
 max_turn_penalty_enabled = true
 max_turn_penalty = 0.25
 missing_final_at_max_turn_zero_reward = true
-live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-depth1-llmonly-r4-a8-lr1e-4-s150-bal35f40v1/live_traces_eval"
+live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-depth1-llmonly-r64-a128-lr1e-4-s150-bal35f40v1/live_traces_eval"
 
 [inference]
 gpu_memory_utilization = 0.90
