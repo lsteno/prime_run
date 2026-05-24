@@ -1160,8 +1160,8 @@ class OrchestratorConfig(BaseConfig):
     @model_validator(mode="after")
     def nccl_max_async_level(self):
         if self.weight_broadcast.type == "nccl":
-            if not self.max_async_level == 1:
-                raise ValueError("max_async_level must be 1 for NCCL broadcast")
+            if self.max_async_level > 2:
+                raise ValueError("max_async_level must be <= 2 for NCCL broadcast")
         return self
 
     @model_validator(mode="after")

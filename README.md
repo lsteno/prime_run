@@ -19,24 +19,44 @@ routed to Vertex Gemini Flash-Lite in the active configs.
 ## Current Status
 
 - Environment: `environments/rlm_rlvr`
-- Main prompt: `sanjaya_text_v1`
-- Depth-1 trace-generation prompt: `sanjaya_text_depth1_llm_only_v1`
+- Current RL prompt: `sanjaya_text_depth1_llm_only_v1`
 - RL base model: `Qwen/Qwen3-4B-Instruct-2507`
+- Current training mode: full-parameter RLVR, no LoRA
+- Current dataset: balanced local BEEG split at
+  `data/beeg_agents_balanced_35_40_25_frames40_v1`
 - Plain LLM subcalls: Vertex `gemini-3.1-flash-lite`
 - Judge: Vertex `gemini-3-flash-preview`
-- Active local training configs:
-  - `configs/rlm_rlvr/qwen3_4b_instruct_sanjaya_medium_4xa100_80gb_budgeted.toml`
-  - `configs/rlm_rlvr/qwen3_4b_instruct_sanjaya_medium_8xa100_40gb_budgeted.toml`
-  - `configs/rlm_rlvr/qwen3_4b_instruct_sanjaya_medium_8xrtx6000ada_48gb_budgeted.toml`
+- Active full-FT config:
+  - `configs/rlm_rlvr/full_ft/qwen3_4b_instruct_sanjaya_depth1_llmonly_fullft_lr5e-6_s150_8xa10080_bal35f40v1_ncclfixed_allrollouts.toml`
+- Main LoRA sweep configs:
+  - `configs/rlm_rlvr/ablation_rank_lr/qwen3_4b_instruct_sanjaya_depth1_llmonly_r*_a*_lr*_s150_8xa10080_bal35f40v1.toml`
 - Trace-generation driver for the expanded SFT split:
   - `pipelines/rlm_traces/run_missing_with_retry.py`
   - `pipelines/rlm_traces/examples/generate_prime_gpt54_gpt55_vertex_flash_lite_sft_missing_auto_retry.toml`
 - Curated trace data:
-  - `outputs/rlm_traces/combined-good-sft-traces-v1`
-  - `outputs/rlm_traces/combined-good-sft-traces-v1/curated-v1`
+  - `outputs/rlm_traces/combined-good-sft-traces-v2/curated-v2-reviewed`
+  - `outputs/rlm_traces/combined-good-sft-traces-v2/sft_dataset_v2_conversations`
 
-The current curated strict SFT set has 244 accepted traces and 927 trainable SFT
-rows. It excludes plain subcall rows from SFT and keeps only trainable RLM turns.
+The project has moved away from SFT as the main path. Both whole-trajectory SFT
+and per-root-turn SFT taught some protocol surface, but neither gave a reliable
+eval improvement over the base model. Current work focuses on RLVR from the
+base Qwen model, first with LoRA rank/LR sweeps and now with a full-parameter
+pilot using NCCL weight broadcast.
+
+Current full-FT run shape:
+
+- 8x A100 80GB single-node pod
+- GPUs 0-3: four independent vLLM inference servers
+- GPUs 4-7: full-parameter trainer
+- weight sync: NCCL full-model broadcast
+- LR: `5e-6`
+- KL coefficient: `kl_tau = 1e-3`
+- batch size: 64 rollout samples
+- rollouts per example: 4
+- runtime depth: `max_depth = 0`, meaning no recursive child RLMs; plain
+  `llm_query*` calls are still enabled and recorded as depth-1 subcalls
+- reward: adaptive cost penalty applies to all rollouts, finalization-contract
+  penalty enabled
 
 ## Repository Map
 
@@ -82,10 +102,17 @@ Important runtime behavior:
   `worker_backend = "process"`, because the local REPL mutates process-global
   state such as cwd/stdout/stderr during execution.
 
-The model is expected to finish with `FINAL(...)` or `FINAL_VAR(...)` outside
-the REPL block. `FINAL(...)` is parsed as text; it is not a Python function and
-does not evaluate expressions. `FINAL_VAR(name)` resolves a previously created
-REPL variable.
+The model is expected to finish with either a literal final answer or a REPL
+variable final:
+
+- `FINAL(actual literal answer)` is parsed as text outside a REPL block. It is
+  not a Python function and does not evaluate expressions.
+- `FINAL_VAR("answer")` is a Python REPL helper and should be used inside a
+  `repl` block when the answer already lives in a Python variable.
+
+Do not use expression finals such as `FINAL(json.dumps(answer))` or
+`FINAL(answer)`. Those teach the wrong protocol because `FINAL(...)` is parsed,
+not computed.
 
 ## Prompt Strategy
 
@@ -144,10 +171,13 @@ Active training configs now use:
 
 ```toml
 efficiency_penalty_mode = "adaptive_group"
-adaptive_efficiency_beta_max = 0.05
-adaptive_efficiency_gamma = 2.0
+adaptive_efficiency_beta_max = 0.15
+adaptive_efficiency_gamma = 1.0
 adaptive_efficiency_solve_rate_floor = 0.25
 adaptive_efficiency_cost_basis = "total_tokens"
+efficiency_penalty_applies_to = "all_rollouts"
+reward_clip_min = -0.5
+reward_clip_max = 1.0
 ```
 
 For a GRPO group:
@@ -158,20 +188,42 @@ beta = 0                                  if s <= 0.25
 beta = beta_max * ((s - 0.25) / 0.75)^gamma otherwise
 ```
 
-Only correct rollouts are penalized for cost:
+The original adaptive implementation penalized only correct rollouts. Current
+full-FT and later LoRA configs use `efficiency_penalty_applies_to =
+"all_rollouts"` so expensive wrong behavior is worse than cheap wrong behavior
+when the group has some solvability signal:
 
 ```text
-wrong rollout reward = 0
-correct rollout reward = 1 - beta * normalized_cost
+correct rollout reward = 1 - terminal_penalty - beta * normalized_cost
+wrong rollout reward = 0 - beta * normalized_cost
+reward = clip(reward, -0.5, 1.0)
 ```
 
-`normalized_cost` is min-max normalized over correct rollouts within the same
-prompt group. If fewer than two rollouts are correct, or all correct costs are
-equal, the cost penalty is zero.
+`normalized_cost` is min-max normalized within the same prompt group. In
+`correct_only` mode it is computed over correct rollouts only; in
+`all_rollouts` mode it is computed across the whole group. Solve rate and online
+difficulty filtering still use binary correctness, not shaped reward. If
+`s <= adaptive_efficiency_solve_rate_floor`, beta is zero, so all-wrong groups
+are not trained to prefer short wrong answers.
+
+Finalization penalties are separate from cost:
+
+```toml
+max_turn_penalty_enabled = true
+max_turn_penalty = 0.25
+missing_final_at_max_turn_zero_reward = true
+```
+
+If the rollout reaches the forced-finalize turn and still does not produce a
+formal `FINAL(...)`/`FINAL_VAR(...)`, correctness is forced to zero. If the
+rollout only produces a correct formal final after the forced-finalize prompt,
+it keeps correctness credit but subtracts the max-turn penalty.
 
 This implements the current thesis hypothesis for cost pressure: hard prompts
-should be allowed to think, while easy/high-solve-rate prompts should learn to
-solve with fewer total tokens and fewer unnecessary subcalls.
+with all-zero solve rate should not receive cheap-wrong pressure, mixed groups
+should learn correctness while making expensive wrong behavior worse than
+ordinary wrong behavior, and all-correct groups should become useful for cost
+compression.
 
 ## Token And Trace Accounting
 
@@ -230,12 +282,28 @@ judge_thinking_level = "medium"
 Required environment/auth:
 
 - `GOOGLE_CLOUD_PROJECT`
-- Application Default Credentials for Vertex
+- `GOOGLE_APPLICATION_CREDENTIALS` pointing at a Vertex-capable service-account
+  JSON when possible
 - `PRIME_API_KEY` for Prime Inference teacher models
 - `HF_TOKEN` when pushing datasets/checkpoints to Hugging Face
 - `WANDB_API_KEY` for W&B logging
 
-On fresh Ubuntu pods, install and configure Google Cloud CLI before Vertex runs:
+The current pod setup uses a service-account JSON copied to:
+
+```text
+/home/ubuntu/.config/gcloud/vertex.json
+```
+
+and exports:
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=/home/ubuntu/.config/gcloud/vertex.json
+export GOOGLE_CLOUD_PROJECT=ambient-empire-492113-d7
+```
+
+This is preferred over user ADC because it does not expire mid-run. If a service
+account is not available, use ADC as a fallback. On fresh Ubuntu pods, install
+and configure Google Cloud CLI before Vertex runs:
 
 ```bash
 sudo snap install google-cloud-cli --classic
@@ -250,40 +318,75 @@ the ADC file must be readable by that user.
 
 ## Training Configs And Hardware
 
-The active RL configs target rented Prime on-demand nodes:
+The current primary run is a full-parameter pilot on an 8x A100 80GB node:
 
-- 4x A100 80GB
-- 8x A100 40GB
-- 8x RTX 6000 Ada 48GB
-
-Current training shape:
-
-- model: `Qwen/Qwen3-4B-Instruct-2507`
-- LoRA rank: 64
-- LoRA alpha: 128
-- root/recursive max output: 2048 tokens
-- max turns: 12-15 depending on config
-- subcall budget: 60-80 total calls depending on config
-- `orchestrator.rollouts_per_example = 4`
-- `orchestrator.use_token_client = false`
-- trace export enabled with segments and metrics
-
-Because plain subcalls are offloaded to Vertex, GPU requirements are dominated
-by local root/recursive rollout inference and LoRA training, not teacher
-subcalls. In practice, 4x A100 80GB and 8x RTX 6000 Ada 48GB are realistic
-targets for current experiments; 8x A100/H100-class nodes give more rollout and
-training headroom.
-
-Launch pattern:
-
-```bash
-cd prime-rl
-uv run rl @ ../configs/rlm_rlvr/qwen3_4b_instruct_sanjaya_medium_8xrtx6000ada_48gb_budgeted.toml
+```text
+configs/rlm_rlvr/full_ft/qwen3_4b_instruct_sanjaya_depth1_llmonly_fullft_lr5e-6_s150_8xa10080_bal35f40v1_ncclfixed_allrollouts.toml
 ```
 
-## Trace Generation And SFT Warmup
+Current full-FT shape:
 
-The trace pipeline was built to create supervised warmup data before RL.
+- model: `Qwen/Qwen3-4B-Instruct-2507`
+- optimizer: AdamW, `lr = 5e-6`, constant schedule, `weight_decay = 0.0`
+- KL: `kl_tau = 1e-3`
+- trainer sequence length: `49152`
+- trainer parallelism: `cp = 2`, `tp = 1`, `dp_replicate = 1`
+- activation checkpointing: `freq = 1`
+- chunked LM head: `fused_lm_head_token_chunk_size = 1024`
+- rollout batch size: 64 samples
+- rollouts per example: 4
+- max async level: 1
+- max off-policy steps: 2
+- max root turn tokens: 2048
+- max subcall tokens: 2048
+- max turns: 15
+- subcall budget: 50 total calls and 50 batched calls
+- trace export enabled with segments and metrics
+
+The 8-GPU full-FT layout is:
+
+| GPU range | Role |
+| --- | --- |
+| 0-3 | Four independent vLLM inference servers |
+| 4-7 | Full-parameter trainer |
+
+Full-model updates use NCCL broadcast. This matters: filesystem broadcast is
+too slow for full FT because it would serialize/reload the whole 4B model every
+step. The local Prime-RL entrypoint was patched to split single-node NCCL
+inference into four independent vLLM servers on ports `8000`-`8003`, then pass
+all four base URLs to the orchestrator.
+
+Launch pattern on a pod:
+
+```bash
+cd /home/ubuntu/prime_run/prime-rl
+set -a
+source ../.env
+set +a
+export GOOGLE_APPLICATION_CREDENTIALS=/home/ubuntu/.config/gcloud/vertex.json
+export GOOGLE_CLOUD_PROJECT=ambient-empire-492113-d7
+export WANDB_PROJECT=rlm-rlvr
+uv run rl @ ../configs/rlm_rlvr/full_ft/qwen3_4b_instruct_sanjaya_depth1_llmonly_fullft_lr5e-6_s150_8xa10080_bal35f40v1_ncclfixed_allrollouts.toml
+```
+
+The LoRA rank/LR sweep remains useful context and a fallback path:
+
+| LoRA rank | LoRA alpha | Learning rates tested |
+| ---: | ---: | --- |
+| 4 | 8 | `5e-7`, `1e-5`, `1e-4` |
+| 16 | 32 | `5e-7`, `1e-5`, `1e-4` |
+| 64 | 128 | `5e-7`, `1e-5`, `1e-4` |
+
+The most important LoRA lesson was not simply "higher LR is better." Some
+high-LR LoRA runs collapsed into one useless subcall or long REPL loops. The
+current full-FT run keeps the infrastructure fixes but removes LoRA capacity as
+a confound.
+
+## Trace Generation And SFT Attempts
+
+The trace pipeline was built to create supervised warmup data before RL. It is
+still valuable for analysis and future distillation, but SFT is no longer the
+main training path for this thesis.
 
 Initial idea:
 
@@ -304,6 +407,22 @@ Important experiments:
 - Claude Opus 4.7 and Qwen3 Coder Next were tested on remaining not-good traces.
   Qwen3 Coder Next recovered a small additional set; Claude was weak in that
   retry slice.
+
+SFT was tried in two forms:
+
+1. one full multi-turn conversation row per trace
+2. one row per root RLM turn, matching the paper more closely:
+
+```text
+input  = full history up to this root decision point
+target = next root action/finalization
+```
+
+Both approaches taught some surface protocol but did not produce a reliable eval
+improvement over the base model. The likely causes were limited data volume,
+teacher/deployment distribution mismatch, repeated early boilerplate, and a
+base model that can imitate shallow REPL protocol without learning robust
+delegation.
 
 The first combined good set used this criterion:
 
@@ -341,6 +460,18 @@ Final curated stats:
 The curation repaired finalization protocol issues but did not invent missing
 subcall content. Empty subcalls were tagged; traces where the model made no
 later useful subcall after an empty one were moved to audit-only.
+
+The expanded reviewed curation layer lives under:
+
+```text
+outputs/rlm_traces/combined-good-sft-traces-v2/curated-v2-reviewed
+```
+
+Derived SFT conversation exports live under:
+
+```text
+outputs/rlm_traces/combined-good-sft-traces-v2/sft_dataset_v2_conversations
+```
 
 ## Expanded SFT Split
 
@@ -388,9 +519,16 @@ uv run --project environments/rlm_rlvr python pipelines/rlm_traces/progress.py \
 | Judge retries | Vertex 429/5xx/auth transient failures otherwise caused noisy zero rewards and wasted rollouts |
 | Empty subcall retries | Gemini occasionally returns empty text; retrying prevents bad traces and bad training signals |
 | Subcall budgets and timeouts | Some traces over-delegated or hung; budgets keep rollout cost bounded and timeouts protect training steps |
+| Worker-level recovery | A timed-out rollout can otherwise leave an env worker stuck on abandoned work; managed workers can be quarantined/restarted by generation |
+| Attempt logging | Per-rollout JSONL logs record source ID, worker ID, start/end, true worker runtime, scheduler lag, timeout/reschedule/drop state, and token/subcall stats |
+| Background group scoring | Deferred judge/adaptive scoring used to block the scheduler hot path; moving group scoring to bounded background tasks keeps vLLM fed |
+| Bounded async scheduling | Unbounded speculative rollout carryover wasted work; current scheduling caps inflight work, accepts one-step carryover, and discards stale completions |
+| Hard cooldown instead of permanent hard pool | All-zero groups are filtered from the current update but return after a short cooldown, so hard prompts can become learnable later |
 | Process workers for trace generation | The local REPL mutates process-global cwd/stdout; processes avoid thread-safety bugs while still parallelizing generation |
 | Curated SFT trace layer | Raw traces contain useful behavior plus protocol noise; curation preserves decomposition while removing bad finalization patterns |
-| Adaptive cost penalty | Static token penalties pressure hard prompts too early. Adaptive group shaping penalizes cost mainly when the model can already solve the prompt |
+| Adaptive cost penalty | Static token penalties pressure hard prompts too early. Adaptive group shaping uses prompt solve rate; current runs can penalize cost for wrong rollouts only when the group has some correctness signal |
+| Max-turn finalization penalty | Bare repeated answers at the turn cap were sometimes rewarded by judge fallback; missing formal final at max turn now forces correctness to zero |
+| NCCL full-model broadcast | Full FT needs fast whole-weight sync from trainer to vLLM. NCCL avoids writing/reloading a 4B checkpoint every step |
 
 ## Useful Commands
 
@@ -398,6 +536,27 @@ Run environment tests:
 
 ```bash
 uv run --project environments/rlm_rlvr --group dev pytest environments/rlm_rlvr/tests -q
+```
+
+Run the current full-FT RLVR config from a Prime pod:
+
+```bash
+cd /home/ubuntu/prime_run/prime-rl
+set -a
+source ../.env
+set +a
+export GOOGLE_APPLICATION_CREDENTIALS=/home/ubuntu/.config/gcloud/vertex.json
+export GOOGLE_CLOUD_PROJECT=ambient-empire-492113-d7
+export WANDB_PROJECT=rlm-rlvr
+uv run rl @ ../configs/rlm_rlvr/full_ft/qwen3_4b_instruct_sanjaya_depth1_llmonly_fullft_lr5e-6_s150_8xa10080_bal35f40v1_ncclfixed_allrollouts.toml
+```
+
+Monitor a live pod run:
+
+```bash
+tail -f outputs/<run>/run_default/logs/orchestrator.log
+tail -f outputs/<run>/logs/trainer/rank_0.log
+nvidia-smi dmon -s pucm
 ```
 
 Run trace generation:
@@ -475,19 +634,37 @@ The most important empirical observations so far:
 - For RLVR, cost pressure should be solve-rate aware. A global token penalty can
   discourage hard-prompt exploration, while all-correct groups are good places to
   optimize cost.
+- SFT was not enough in this setup. It taught some formatting/protocol but did
+  not reliably improve deployed RLM behavior, even when exported per root turn.
+  RL is now treated as the main mechanism for learning when to delegate, when to
+  stop, and how much computation to spend.
+- LoRA rank/LR sweeps showed real failure modes: high-LR LoRA can collapse into
+  one useless subcall, while other runs learn long local REPL loops. Reward
+  shaping and observability were updated specifically to make these behaviors
+  visible and worse than ordinary wrong answers.
+- Full-parameter RL has a different bottleneck from LoRA. Adapter sync is cheap;
+  full-weight sync is not. NCCL broadcast and independent vLLM servers are
+  required for practical no-LoRA RL on the current 8x A100 pods.
+- Attempt timing must distinguish worker runtime from scheduler consumption lag.
+  Earlier 600-second p99 attempt metrics were often completed rollouts waiting
+  to be consumed, not true 600-second worker executions.
 
 ## Known Limitations
 
 - Remote/sandboxed REPL backends are not implemented; the environment currently
   supports only the local REPL.
 - The current adaptive cost basis supports `total_tokens` only.
-- Prime-RL difficulty filtering still uses shaped reward averages; when using
-  adaptive shaped rewards, interpret easy/hard filtering carefully.
+- Online difficulty filtering should be interpreted through binary correctness,
+  not shaped reward. All-zero groups are filtered/cooled down; all-correct groups
+  are kept in current runs so adaptive cost compression still has signal.
 - Some output directories contain local experiment artifacts and W&B metadata;
   treat them as research logs, not polished release assets.
-- The current SFT trace corpus is still small for robustly teaching agentic
-  behavior. The expanded 1000-example split and automatic retry driver are meant
-  to improve coverage.
+- The SFT trace corpus is still useful as an analysis/distillation asset, but
+  the first two SFT attempts were not strong enough to use as the main training
+  path.
+- Full-FT configs are still experimental. The current `5e-6` run was chosen
+  because `1e-6` under-moved the policy; if KL spikes or entropy collapses, the
+  next conservative fallback is `3e-6` or stronger KL.
 
 ## Detailed Docs
 
