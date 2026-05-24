@@ -8,8 +8,8 @@ set -euo pipefail
 # weights are expected to be uploaded to Hugging Face before pod termination; the
 # copied local artifacts are the pieces useful for thesis/debug provenance.
 
-POD_HOST="${POD_HOST:-ubuntu@216.81.248.132}"
-POD_ID="${POD_ID:-b805f622186545068c7c06b45193dfd0}"
+POD_HOST="${POD_HOST:?set POD_HOST, e.g. ubuntu@<pod-ip>}"
+POD_ID="${POD_ID:-}"
 REMOTE_OUTPUT_DIR="${REMOTE_OUTPUT_DIR:-/home/ubuntu/prime_run/outputs/rlm-rlvr-sft-curated-v2-qwen3-4b-instruct-8xrtx6000ada-cat-cp4}"
 REMOTE_LOG="${REMOTE_LOG:-/home/ubuntu/prime_run/outputs/run_logs/sft_curated_v2_cat_cp4_full.log}"
 REMOTE_CONFIG="${REMOTE_CONFIG:-/home/ubuntu/prime_run/configs/rlm_sft/local_8xrtx6000ada_48gb_qwen3_4b_instruct_curated_v2.toml}"

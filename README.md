@@ -288,7 +288,8 @@ Required environment/auth:
 - `HF_TOKEN` when pushing datasets/checkpoints to Hugging Face
 - `WANDB_API_KEY` for W&B logging
 
-The current pod setup uses a service-account JSON copied to:
+The current pod setup uses a service-account JSON copied to a pod-local path,
+for example:
 
 ```text
 /home/ubuntu/.config/gcloud/vertex.json
@@ -298,7 +299,7 @@ and exports:
 
 ```bash
 export GOOGLE_APPLICATION_CREDENTIALS=/home/ubuntu/.config/gcloud/vertex.json
-export GOOGLE_CLOUD_PROJECT=ambient-empire-492113-d7
+export GOOGLE_CLOUD_PROJECT=<your-gcp-project-id>
 ```
 
 This is preferred over user ADC because it does not expire mid-run. If a service
@@ -364,7 +365,7 @@ set -a
 source ../.env
 set +a
 export GOOGLE_APPLICATION_CREDENTIALS=/home/ubuntu/.config/gcloud/vertex.json
-export GOOGLE_CLOUD_PROJECT=ambient-empire-492113-d7
+export GOOGLE_CLOUD_PROJECT=<your-gcp-project-id>
 export WANDB_PROJECT=rlm-rlvr
 uv run rl @ ../configs/rlm_rlvr/full_ft/qwen3_4b_instruct_sanjaya_depth1_llmonly_fullft_lr5e-6_s150_8xa10080_bal35f40v1_ncclfixed_allrollouts.toml
 ```
@@ -546,7 +547,7 @@ set -a
 source ../.env
 set +a
 export GOOGLE_APPLICATION_CREDENTIALS=/home/ubuntu/.config/gcloud/vertex.json
-export GOOGLE_CLOUD_PROJECT=ambient-empire-492113-d7
+export GOOGLE_CLOUD_PROJECT=<your-gcp-project-id>
 export WANDB_PROJECT=rlm-rlvr
 uv run rl @ ../configs/rlm_rlvr/full_ft/qwen3_4b_instruct_sanjaya_depth1_llmonly_fullft_lr5e-6_s150_8xa10080_bal35f40v1_ncclfixed_allrollouts.toml
 ```
