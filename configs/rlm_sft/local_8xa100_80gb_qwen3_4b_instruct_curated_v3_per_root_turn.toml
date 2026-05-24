@@ -1,0 +1,103 @@
+# Full-SFT warmup for paper-style per-root-turn RLM trace rows.
+#
+# Export/push first:
+#
+#   uv run --project environments/rlm_rlvr python pipelines/rlm_traces/export_sft.py \
+#     --format per_root_turn \
+#     --output-dir outputs/rlm_traces/combined-good-sft-traces-v2/sft_dataset_v3_per_root_turn \
+#     --dataset-id lsteno/rlm-rlvr-sft-v3-per-root-turn \
+#     --validate-tokenization
+#
+# Run from prime-rl:
+#
+#   HF_MODEL_REPO_ID=lsteno/Qwen3-4B-Instruct-2507-RLM-SFT-v3-per-root-turn \
+#   ../scripts/rlm_sft/run_curated_v2_with_upload.sh \
+#     ../configs/rlm_sft/local_8xa100_80gb_qwen3_4b_instruct_curated_v3_per_root_turn.toml \
+#     ../outputs/rlm-rlvr-sft-curated-v3-per-root-turn-qwen3-4b-instruct-8xa100 \
+#     lsteno/Qwen3-4B-Instruct-2507-RLM-SFT-v3-per-root-turn
+
+output_dir = "../outputs/rlm-rlvr-sft-curated-v3-per-root-turn-qwen3-4b-instruct-8xa100"
+max_steps = 60
+loss_impl = "liger_fused"
+dist_timeout_seconds = 1800
+
+[deployment]
+type = "single_node"
+gpus_per_node = 8
+num_gpus = 8
+
+[wandb]
+project = "rlm-rlvr"
+name = "rlm-rlvr-sft-v3-per-root-turn-qwen3-4b-instruct-8xa100"
+offline = false
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+seq_len = 32768
+impl = "hf"
+attn = "flash_attention_2"
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+# 8x A100 80GB OOMs at 32k with cp=1/cp=2. cp=4 is the stable long-context
+# shape while still using all 8 GPUs.
+cp = 4
+tp = 1
+dp_replicate = 1
+
+[tokenizer]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+trust_remote_code = true
+
+[data]
+type = "sft"
+name = "lsteno/rlm-rlvr-sft-v3-per-root-turn"
+splits = ["train"]
+batch_size = 32
+micro_batch_size = 1
+seq_len = 32768
+pack_function = "cat"
+shuffle = true
+seed = 42
+
+[data.loss_mask]
+system = false
+user = false
+assistant = true
+tool = false
+train_on_prompt = false
+
+[val]
+interval = 10
+eval_on_start = true
+
+[val.data]
+type = "sft"
+name = "lsteno/rlm-rlvr-sft-v3-per-root-turn"
+splits = ["eval"]
+batch_size = 32
+micro_batch_size = 1
+seq_len = 32768
+pack_function = "cat"
+shuffle = false
+seed = 42
+
+[val.data.loss_mask]
+system = false
+user = false
+assistant = true
+tool = false
+train_on_prompt = false
+
+[optim]
+lr = 5e-6
+weight_decay = 0.01
+max_norm = 1.0
+
+[scheduler]
+type = "cosine"
+warmup_steps = 5
+min_lr = 5e-7
+
+[ckpt]
+interval = 25
+keep_last = 3

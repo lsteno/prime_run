@@ -42,13 +42,34 @@ def extract_code_blocks(text: str) -> list[str]:
     return [match.strip() for match in find_code_blocks(text or "") if match.strip()]
 
 
-def extract_final_answer(text: str) -> str | None:
+def extract_final_answer(text: str, environment: Any | None = None) -> str | None:
     if not text:
         return None
-    result = find_final_answer(text)
+    result = find_final_answer(text, environment=environment)
+    if result is None:
+        result = _find_markdown_wrapped_final_answer(text, environment=environment)
     if result is None:
         return None
     return str(result).strip().strip("\"'") or None
+
+
+def _find_markdown_wrapped_final_answer(text: str, environment: Any | None = None) -> str | None:
+    """Accept common markdown wrapping around otherwise valid FINAL calls."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        unwrapped = stripped
+        if unwrapped.startswith("`") and unwrapped.endswith("`"):
+            unwrapped = unwrapped.strip("`").strip()
+        elif unwrapped.startswith("**") and unwrapped.endswith("**"):
+            unwrapped = unwrapped.strip("*").strip()
+        if unwrapped == stripped:
+            continue
+        result = find_final_answer(unwrapped, environment=environment)
+        if result is not None:
+            return str(result)
+    return None
 
 
 def render_execution_output(stdout: str, stderr: str, final_answer: str | None) -> str:

@@ -1,0 +1,60 @@
+output_dir = "../outputs/rlm-rlvr-sft-local-qwen3-4b"
+max_steps = 400
+
+[deployment]
+gpus_per_node = 8
+num_gpus = 8
+
+[wandb]
+project = "rlm-rlvr"
+name = "rlm-rlvr-sft-local-qwen3-4b"
+offline = true
+
+[model]
+name = "Qwen/Qwen3-4B-Thinking-2507"
+impl = "custom"
+attn = "flash_attention_3"
+optimization_dtype = "bfloat16"
+
+[model.ac]
+freq = 1
+
+[tokenizer]
+name = "Qwen/Qwen3-4B-Thinking-2507"
+
+[data]
+type = "sft"
+name = "lsteno/rlm-rlvr-sft"
+splits = ["train"]
+batch_size = 256
+micro-batch-size = 1
+seq_len = 16384
+pack_function = "stack"
+shuffle = true
+
+[val]
+interval = 25
+eval_on_start = true
+
+[val.data]
+type = "sft"
+name = "lsteno/rlm-rlvr-sft"
+splits = ["eval"]
+batch_size = 64
+micro-batch-size = 1
+seq_len = 16384
+pack_function = "stack"
+shuffle = false
+
+[optim]
+lr = 1e-5
+weight_decay = 0.01
+
+[scheduler]
+type = "cosine"
+warmup_steps = 20
+min_lr = 1e-6
+
+[ckpt]
+interval = 50
+keep_last = 3

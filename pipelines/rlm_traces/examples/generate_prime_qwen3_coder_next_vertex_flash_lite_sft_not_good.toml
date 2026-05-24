@@ -1,0 +1,115 @@
+run_name = "prime-qwen3-coder-next-vertex-flash-lite-sft-not-good"
+output_dir = "/Users/lsteno/Developer/GitHub/prime_run/outputs/rlm_traces"
+endpoints_path = "configs/endpoints.toml"
+resume = true
+max_workers = 6
+worker_backend = "process"
+
+[model]
+model = "qwen/qwen3-coder-next"
+url = "https://api.pinference.ai/api/v1"
+api_key_env = "PRIME_API_KEY"
+
+[model.extra_body.reasoning]
+enabled = false
+
+[llm_subcall]
+provider = "vertex"
+model = "gemini-3.1-flash-lite"
+vertex_project_env = "GOOGLE_CLOUD_PROJECT"
+vertex_location = "global"
+thinking_level = "medium"
+
+[dataset]
+dataset_id = "lsteno/BEEG-agents"
+split = "sft_traces"
+seed = 42
+source_ids = [
+  "CU_DFA-0272-9858310",
+  "CU_DFA-0055-9635247",
+  "frames-0499",
+  "DRA_T1-0293-2124735",
+  "CU_DFA-0130-9325354",
+  "oolong-001325",
+  "DRA_T1-0253-5803756",
+  "frames-0025",
+  "oolong-000462",
+  "oolong-000559",
+  "frames-0637",
+  "CU_DFA-0218-9057713",
+  "frames-0627",
+  "frames-0440",
+  "DRA_T1-0205-1911185",
+  "CU_P-0227-5236795",
+  "oolong-000419",
+  "frames-0010",
+  "oolong-000903",
+  "oolong-000524",
+  "DRA_T1-0137-1437603",
+  "frames-0256",
+  "DRA_T1-0000-7882317",
+  "oolong-000691",
+  "oolong-001351",
+  "CU_DFA-0073-4201191",
+  "CU_P-0293-7457375",
+  "frames-0668",
+  "CU_DFA-0093-9993913",
+  "frames-0534",
+  "frames-0814",
+  "DRA_T1-0166-2348806",
+  "frames-0790",
+  "frames-0104",
+  "frames-0640",
+  "oolong-000789",
+  "CU_DFA-0176-4146179",
+  "frames-0230",
+  "oolong-001382",
+  "frames-0751",
+  "frames-0100",
+  "CU_P-0222-9111126",
+  "CU_DFA-0016-8150623",
+  "oolong-000699",
+  "CU_DFA-0096-6711876",
+  "frames-0135",
+  "oolong-001047",
+  "oolong-000971",
+  "frames-0187",
+  "CU_DFA-0227-6698018",
+  "frames-0115",
+  "oolong-000868",
+  "oolong-000632",
+  "frames-0490",
+  "frames-0294",
+  "frames-0742",
+  "oolong-001308",
+  "frames-0367",
+  "CU_DFA-0081-6962767",
+  "CU_DFA-0296-1799519",
+  "frames-0493",
+  "frames-0424"
+]
+
+[rollout]
+prompt_variants = ["sanjaya_text_depth1_llm_only_v1"]
+max_iterations = 15
+max_depth = 1
+disable_recursive_subcalls = true
+turn_max_tokens = 4096
+subcall_max_tokens = 4096
+max_prompt_tokens = 2000000
+temperature = 0.7
+top_p = 1.0
+repl_backend = "local"
+subcall_budget_enabled = true
+max_total_subcalls = 80
+max_batched_subcalls = 80
+include_budget_reminder = false
+tokenizer_name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[judge]
+enabled = true
+provider = "vertex"
+model = "gemini-3-flash-preview"
+vertex_project_env = "GOOGLE_CLOUD_PROJECT"
+vertex_location = "global"
+thinking_level = "medium"

@@ -1,0 +1,73 @@
+output_dir = "/Users/lsteno/Developer/GitHub/prime_run/outputs/rlm_traces"
+endpoints_path = "configs/endpoints.toml"
+resume = true
+max_workers = 6
+worker_backend = "process"
+
+[driver]
+primary_run_name = "prime-gpt54-vertex-flash-lite-sft-missing-v1"
+retry_run_name = "prime-gpt55-vertex-flash-lite-sft-missing-v1-retry-failed-gpt54"
+manifest_run_name = "prime-gpt54-gpt55-sft-missing-auto-retry-v1"
+
+[previous]
+record_paths = [
+  "outputs/rlm_traces/prime-gpt54-vertex-flash-lite-sft-full/sanjaya_text_depth1_llm_only_v1/records.jsonl",
+  "outputs/rlm_traces/prime-gpt55-vertex-flash-lite-sft-rejected-gpt54/sanjaya_text_depth1_llm_only_v1/records.jsonl",
+  "outputs/rlm_traces/prime-qwen3-coder-next-vertex-flash-lite-sft-not-good/sanjaya_text_depth1_llm_only_v1/records.jsonl",
+]
+
+[primary_model]
+model = "openai/gpt-5.4"
+url = "https://api.pinference.ai/api/v1"
+api_key_env = "PRIME_API_KEY"
+
+[primary_model.extra_body.reasoning]
+enabled = false
+
+[retry_model]
+model = "openai/gpt-5.5"
+url = "https://api.pinference.ai/api/v1"
+api_key_env = "PRIME_API_KEY"
+
+[retry_model.extra_body.reasoning]
+enabled = false
+
+[llm_subcall]
+provider = "vertex"
+model = "gemini-3.1-flash-lite"
+vertex_project_env = "GOOGLE_CLOUD_PROJECT"
+vertex_location = "global"
+thinking_level = "medium"
+empty_response_max_attempts = 3
+empty_response_base_retry_seconds = 1.0
+empty_response_max_retry_seconds = 30.0
+
+[dataset]
+dataset_id = "lsteno/BEEG-agents"
+split = "sft_traces"
+seed = 42
+
+[rollout]
+prompt_variants = ["sanjaya_text_depth1_llm_only_v1"]
+max_iterations = 15
+max_depth = 1
+disable_recursive_subcalls = true
+turn_max_tokens = 4096
+subcall_max_tokens = 4096
+max_prompt_tokens = 2000000
+temperature = 0.7
+top_p = 1.0
+repl_backend = "local"
+subcall_budget_enabled = true
+max_total_subcalls = 80
+max_batched_subcalls = 80
+include_budget_reminder = false
+tokenizer_name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[judge]
+enabled = true
+provider = "vertex"
+model = "gemini-3-flash-preview"
+vertex_project_env = "GOOGLE_CLOUD_PROJECT"
+vertex_location = "global"
+thinking_level = "medium"

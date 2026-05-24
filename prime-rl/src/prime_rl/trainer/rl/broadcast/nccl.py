@@ -162,11 +162,12 @@ class NCCLWeightBroadcast(WeightBroadcast):
         """Broadcast the state dict of a model into the inference pool using NCCL and notifies the orchestrator."""
         self.logger.debug("Starting broadcasting weights to inference engine via NCCL")
         start_time = time.perf_counter()
-        notified_runs: list[tuple[int, Path]] = []
-        if self.world.is_master:
-            notified_runs = self._notify_orchestrator()
-            # Wait for inference workers to signal readiness before starting NCCL broadcast
-            self._wait_for_nccl_ready(notified_runs)
+        notified_runs = self._notify_orchestrator()
+        # All trainer ranks must wait before materializing DTensor shards below.
+        # Materialization can use trainer-process collectives, so letting
+        # non-master ranks enter it while rank 0 waits for inference NCCL
+        # readiness can deadlock the trainer process group.
+        self._wait_for_nccl_ready(notified_runs)
         self.nccl_broadcast_sender.broadcast_weights(model, step)
         self.logger.debug(f"Weights broadcasted in {time.perf_counter() - start_time:.2f}s")
 
@@ -177,26 +178,31 @@ class NCCLWeightBroadcast(WeightBroadcast):
             List of (run_idx, save_dir) tuples for runs that were notified.
         """
         notified_runs: list[tuple[int, Path]] = []
-        if self.world.is_master:
-            for idx in self.multi_run_manager.used_idxs:
-                if not self.multi_run_manager.ready_to_update[idx]:
-                    continue
+        for idx in self.multi_run_manager.used_idxs:
+            if not self.multi_run_manager.ready_to_update[idx]:
+                continue
 
-                try:
-                    save_dir = get_step_path(
-                        get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
-                        self.multi_run_manager.progress[idx].step,
-                    )
+            try:
+                save_dir = get_step_path(
+                    get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
+                    self.multi_run_manager.progress[idx].step,
+                )
+                notified_runs.append((idx, save_dir))
+
+                if self.world.is_master:
                     save_dir.mkdir(parents=True, exist_ok=True)
 
                     stable_file = save_dir / "STABLE"
                     stable_file.touch()
-                    notified_runs.append((idx, save_dir))
-                except FileNotFoundError:
+
+            except FileNotFoundError:
+                if self.world.is_master:
                     self.logger.warning(f"Run {idx} is deleted, skipping")
-                except Exception as e:
+            except Exception as e:
+                if self.world.is_master:
                     self.logger.error(f"Error broadcasting weights for run {idx}: {e}")
-                finally:
+            finally:
+                if self.world.is_master:
                     self.multi_run_manager.ready_to_update[idx] = False
         return notified_runs
 

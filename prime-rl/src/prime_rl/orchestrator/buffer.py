@@ -19,6 +19,7 @@ class Buffer:
     """A buffer for storing rollouts and metadata."""
 
     POOLS = ["easy", "normal", "hard"]
+    HARD_RELEASE_STEPS_FILENAME = "hard_example_release_steps.json"
 
     def __init__(
         self,
@@ -71,6 +72,7 @@ class Buffer:
         # Initialize buffers for easy/ hard examples
         self.easy_examples: list[dict] = []
         self.hard_examples: list[dict] = []
+        self.hard_example_release_steps: dict[str, int] = {}
 
         # Initialize rollout buffer (flat list of rollouts)
         self.rollout_buffer: list[vf.RolloutOutput] = []
@@ -95,6 +97,8 @@ class Buffer:
         write_jsonl(self.easy_examples, path / "easy_examples.jsonl")
         write_jsonl(self.hard_examples, path / "hard_examples.jsonl")
         write_jsonl(self.rollout_buffer, path / "rollout_buffer.jsonl")
+        with open(path / self.HARD_RELEASE_STEPS_FILENAME, "w") as f:
+            json.dump(self.hard_example_release_steps, f)
 
     def load(self, path: Path) -> None:
         """Loads pool assignments and rollouts."""
@@ -106,6 +110,12 @@ class Buffer:
         saved_easy_examples = read_jsonl(path / "easy_examples.jsonl")
         saved_hard_examples = read_jsonl(path / "hard_examples.jsonl")
         saved_rollout_buffer = cast(list[vf.RolloutOutput], read_jsonl(path / "rollout_buffer.jsonl"))
+        release_steps_path = path / self.HARD_RELEASE_STEPS_FILENAME
+        if release_steps_path.exists():
+            with open(release_steps_path, "r") as f:
+                saved_hard_release_steps = {str(k): int(v) for k, v in json.load(f).items()}
+        else:
+            saved_hard_release_steps = {}
 
         if any(saved_easy_examples) or any(saved_hard_examples) or any(saved_rollout_buffer):
             # Build hash lookup for example buffer (env -> (example_hash -> example_id))
@@ -132,6 +142,10 @@ class Buffer:
                             example = self.example_buffer[env].pop(example_id, None)
                             if example is not None:
                                 target_pool.append(example)
+                                if target_pool is self.hard_examples and self.config.hard_cooldown_steps is not None:
+                                    self.hard_example_release_steps[example_hash] = saved_hard_release_steps.get(
+                                        example_hash, 0
+                                    )
                                 num_moved += 1
                                 break
                 return num_moved
@@ -179,6 +193,8 @@ class Buffer:
                     env_name = example["task"]
                     example_id = example["example_id"]
                     examples.remove(example)
+                    if examples is self.hard_examples:
+                        self.hard_example_release_steps.pop(self.get_example_hash(example), None)
                     self.example_buffer[env_name][example_id] = example
                 return num_moved
 
@@ -207,7 +223,59 @@ class Buffer:
 
         return sampled_examples
 
-    def update(self, rollouts: list[vf.RolloutOutput]):
+    def release_due_hard_examples(self, step: int) -> int:
+        """Moves cooldown-expired hard examples back to the normal sampling pool."""
+        if self.config.hard_cooldown_steps is None or not self.hard_examples:
+            return 0
+
+        kept_hard_examples = []
+        num_released = 0
+        for example in self.hard_examples:
+            example_hash = self.get_example_hash(example)
+            release_step = self.hard_example_release_steps.get(example_hash, 0)
+            if release_step <= step:
+                self.example_buffer[example["task"]][example["example_id"]] = example
+                self.hard_example_release_steps.pop(example_hash, None)
+                num_released += 1
+            else:
+                kept_hard_examples.append(example)
+        self.hard_examples = kept_hard_examples
+
+        if num_released:
+            self.logger.debug(f"Released {num_released} hard example(s) back to normal pool at step {step}.")
+        return num_released
+
+    def put_example_on_hard_cooldown(self, example: dict, step: int, cooldown_steps: int) -> bool:
+        """Temporarily removes an example from normal sampling after scheduler-level failure."""
+        env_name = example["task"]
+        example_id = example["example_id"]
+        if example_id not in self.example_buffer.get(env_name, {}):
+            return False
+        removed_example = self.example_buffer[env_name].pop(example_id)
+        self.hard_examples.append(removed_example)
+        self.hard_example_release_steps[self.get_example_hash(removed_example)] = step + cooldown_steps
+        self.num_examples_per_step[env_name]["hard"] += 1
+        return True
+
+    @staticmethod
+    def _difficulty_score(example_rollouts: list[vf.RolloutOutput]) -> float:
+        """Use binary correctness for difficulty filtering when available.
+
+        Shaped rewards may be negative after cost penalties, but hard/easy filtering
+        should still reflect whether the policy solved the prompt.
+        """
+        correctness_values: list[float] = []
+        for rollout in example_rollouts:
+            metrics = rollout.get("metrics") or {}
+            if "correctness_metric" not in metrics:
+                return mean([r["reward"] for r in example_rollouts])
+            try:
+                correctness_values.append(float(metrics["correctness_metric"]))
+            except (TypeError, ValueError):
+                return mean([r["reward"] for r in example_rollouts])
+        return mean(correctness_values)
+
+    def update(self, rollouts: list[vf.RolloutOutput], step: int | None = None):
         """Updates the buffer state with completed rollouts."""
 
         rollouts_by_example = defaultdict(list)
@@ -215,12 +283,12 @@ class Buffer:
             rollouts_by_example[rollout["example_id"]].append(rollout)
 
         for example_id, example_rollouts in rollouts_by_example.items():
-            avg_reward = mean([r["reward"] for r in example_rollouts])
+            difficulty_score = self._difficulty_score(example_rollouts)
             env_name = example_rollouts[0]["task"]
 
-            if self.config.easy_threshold is not None and avg_reward >= self.config.easy_threshold:
+            if self.config.easy_threshold is not None and difficulty_score >= self.config.easy_threshold:
                 pool = "easy"
-            elif self.config.hard_threshold is not None and avg_reward <= self.config.hard_threshold:
+            elif self.config.hard_threshold is not None and difficulty_score <= self.config.hard_threshold:
                 pool = "hard"
             else:
                 pool = "normal"
@@ -229,15 +297,24 @@ class Buffer:
                 example = self.example_buffer[env_name].pop(example_id)
                 target_pool = self.easy_examples if pool == "easy" else self.hard_examples
                 target_pool.append(example)
+                if pool == "hard" and self.config.hard_cooldown_steps is not None:
+                    release_base_step = 0 if step is None else step
+                    release_step = release_base_step + self.config.hard_cooldown_steps
+                    self.hard_example_release_steps[self.get_example_hash(example)] = release_step
+                elif pool == "hard":
+                    self.hard_example_release_steps.pop(self.get_example_hash(example), None)
 
             self.num_examples_per_step[env_name][pool] += 1
             if self.config.online_difficulty_filtering:
-                if avg_reward == 0.0:
+                if difficulty_score == 0.0 and self.config.online_filter_hard:
                     self.num_rollouts_per_step[env_name]["hard"] += len(example_rollouts)
+                    self.filtered_hard_groups_per_step += 1
                     continue
-                elif avg_reward == 1.0:
+                elif difficulty_score == 1.0 and self.config.online_filter_easy:
                     self.num_rollouts_per_step[env_name]["easy"] += len(example_rollouts)
                     continue
+                elif difficulty_score == 1.0:
+                    self.kept_easy_groups_per_step += 1
 
             self.num_rollouts_per_step[env_name]["normal"] += len(example_rollouts)
             self.rollout_buffer.extend(example_rollouts)
@@ -256,11 +333,16 @@ class Buffer:
         self.num_examples_per_step = {env: zero_per_pool() for env in self.env_names}
         # num rollouts per env per step per pool (env_name -> (pool -> num_rollouts))
         self.num_rollouts_per_step = {env: zero_per_pool() for env in self.env_names}
+        self.filtered_hard_groups_per_step = 0
+        self.kept_easy_groups_per_step = 0
 
     def get_metrics(self) -> dict[str, float]:
         """Returns the buffer metrics for the current step."""
 
-        metrics = {}
+        metrics = {
+            "buffer/filtered_hard_groups": self.filtered_hard_groups_per_step,
+            "buffer/kept_easy_groups": self.kept_easy_groups_per_step,
+        }
 
         # sum over envs (e.g. log globally)
         num_examples_per_step_per_pool = {

@@ -1,0 +1,26 @@
+run_name = "generate-traces-gpt5"
+output_dir = "outputs/rlm_traces"
+endpoints_path = "configs/endpoints.toml"
+
+[model]
+endpoint_id = "gpt-5"
+
+[dataset]
+dataset_id = "lsteno/BEEG-agents"
+split = "train"
+max_examples = 50
+seed = 42
+
+[rollout]
+prompt_variants = ["sanjaya_text_v1"]
+max_iterations = 19
+max_depth = 2
+turn_max_tokens = 512
+subcall_max_tokens = 384
+temperature = 0.7
+top_p = 1.0
+repl_backend = "local"
+
+[judge]
+enabled = true
+endpoint_id = "glm-4.7"

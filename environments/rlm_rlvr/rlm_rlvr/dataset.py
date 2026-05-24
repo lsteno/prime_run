@@ -73,6 +73,18 @@ def _parse_answers(value: object) -> list[str]:
     return [text] if text else []
 
 
+def _parse_metadata(value: object) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 def _rows_to_dataset(rows: list[dict], *, dataset_name: str) -> Dataset:
     records: list[dict] = []
     skipped_missing_prompt = 0
@@ -120,6 +132,7 @@ def _rows_to_dataset(rows: list[dict], *, dataset_name: str) -> Dataset:
         source_task = _stringify(_pick_first(row, ["task", "category", "dataset", "subset"])) or prompt_text
         source_id = _stringify(_pick_first(row, ["id", "uuid", "example_id", "row_id"]))
         row_dataset = _stringify(_pick_first(row, ["dataset", "dataset_name", "source"])) or dataset_name
+        metadata = _parse_metadata(_pick_first(row, ["metadata"]))
 
         info = {
             "context": context_text,
@@ -128,6 +141,9 @@ def _rows_to_dataset(rows: list[dict], *, dataset_name: str) -> Dataset:
             "source_task": source_task,
             "source_id": source_id,
             "question": prompt_text,
+            "answer_type": _stringify(_pick_first(row, ["answer_type"])),
+            "context_token_count": _pick_first(row, ["context_token_count"]),
+            "metadata": metadata,
         }
         records.append(
             {

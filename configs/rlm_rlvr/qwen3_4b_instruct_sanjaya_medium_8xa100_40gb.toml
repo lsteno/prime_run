@@ -1,0 +1,199 @@
+# Medium local RLVR run for Qwen3 4B Instruct on a single 8x A100 40GB node.
+#
+# Layout:
+# - GPUs 0-3: vLLM inference, four data-parallel replicas for rollout throughput.
+# - GPUs 4-7: LoRA trainer, context-parallel over a reduced 262k flattened RLM trajectory.
+#
+# Run from prime-rl:
+#   cd prime-rl
+#   uv run rl @ ../configs/rlm_rlvr/qwen3_4b_instruct_sanjaya_medium_8xa100_40gb.toml
+
+output_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-8xa100-40gb"
+max_steps = 100
+max_async_level = 1
+seq_len = 262144
+
+[deployment]
+type = "single_node"
+gpus_per_node = 8
+num_infer_gpus = 4
+num_train_gpus = 4
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[wandb]
+project = "rlm-rlvr"
+name = "qwen3-4b-instruct-sanjaya-medium-8xa100-40gb"
+
+[ckpt]
+interval = 25
+keep_last = 2
+keep_interval = 100
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+weight_decay = 0.0
+max_norm = 1.0
+
+[trainer.scheduler]
+type = "constant"
+
+[trainer.model]
+seq_len = 262144
+attn = "flash_attention_2"
+cp = 4
+tp = 1
+dp_replicate = 1
+optimization_dtype = "float32"
+reduce_dtype = "float32"
+fused_lm_head_token_chunk_size = "auto"
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.model.lora]
+rank = 64
+alpha = 128
+dropout = 0.0
+target_modules = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]
+
+[trainer.tokenizer]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+trust_remote_code = true
+
+[trainer.loss]
+type = "default"
+kl_tau = 1e-3
+teacher_tau = 0.0
+
+[orchestrator]
+batch_size = 64
+rollouts_per_example = 4
+oversampling_factor = 2.0
+max_concurrent = 64
+seq_len = 262144
+use_token_client = false
+max_off_policy_steps = 8
+
+[orchestrator.sampling]
+temperature = 0.7
+max_tokens = 2048
+extra_body = { return_token_ids = true, top_k = -1, min_p = 0.0 }
+
+[orchestrator.buffer]
+online_difficulty_filtering = true
+easy_threshold = 1.0
+hard_threshold = 0.0
+hard_cooldown_steps = 5
+seed = 42
+
+[orchestrator.trace_export]
+enabled = true
+include_segments = true
+include_metrics = true
+
+[orchestrator.wandb.log_extras]
+samples = true
+distributions = true
+interval = 1
+
+[[orchestrator.env]]
+id = "rlm_rlvr"
+
+[orchestrator.env.args]
+dataset_id = "lsteno/BEEG-agents"
+dataset_train_split = "train"
+dataset_eval_split = "eval"
+seed = 42
+max_examples = 4096
+max_eval_examples = 256
+prompt_variant = "sanjaya_text_v1"
+max_iterations = 8
+max_depth = 2
+turn_max_tokens = 2048
+subcall_max_tokens = 2048
+max_prompt_tokens = 61440
+subcall_prompt_limit_ratio = 0.85
+tokenizer_name = "Qwen/Qwen3-4B-Instruct-2507"
+inference_mode = "local"
+inference_base_url = "http://localhost:8000/v1"
+inference_api_key = "local-vllm"
+repl_backend = "local"
+judge_model = "z-ai/glm-5"
+live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-8xa100-40gb/live_traces"
+
+[orchestrator.eval]
+interval = 25
+num_examples = 64
+rollouts_per_example = 1
+eval_base_model = false
+cancel_inflight_rollouts_on_eval = true
+
+[orchestrator.eval.sampling]
+temperature = 0.7
+max_tokens = 2048
+top_p = 1.0
+extra_body = { return_token_ids = true, top_k = -1, min_p = 0.0 }
+
+[[orchestrator.eval.env]]
+id = "rlm_rlvr"
+name = "rlm_rlvr_eval"
+num_examples = 64
+rollouts_per_example = 1
+
+[orchestrator.eval.env.args]
+dataset_id = "lsteno/BEEG-agents"
+dataset_train_split = "train"
+dataset_eval_split = "eval"
+seed = 42
+max_examples = 4096
+max_eval_examples = 256
+prompt_variant = "sanjaya_text_v1"
+max_iterations = 8
+max_depth = 2
+turn_max_tokens = 2048
+subcall_max_tokens = 2048
+max_prompt_tokens = 61440
+subcall_prompt_limit_ratio = 0.85
+tokenizer_name = "Qwen/Qwen3-4B-Instruct-2507"
+inference_mode = "local"
+inference_base_url = "http://localhost:8000/v1"
+inference_api_key = "local-vllm"
+repl_backend = "local"
+judge_model = "z-ai/glm-5"
+live_trace_dir = "../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-8xa100-40gb/live_traces_eval"
+
+[inference]
+gpu_memory_utilization = 0.90
+enable_prefix_caching = true
+max_loras = 8
+max_cpu_loras = 16
+api_server_count = 1
+
+[inference.server]
+host = "0.0.0.0"
+port = 8000
+
+[inference.model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+max_model_len = 65536
+enforce_eager = false
+trust_remote_code = true
+
+[inference.parallel]
+tp = 1
+dp = 4
+
+[inference.deployment]
+type = "single_node"
+gpus_per_node = 4

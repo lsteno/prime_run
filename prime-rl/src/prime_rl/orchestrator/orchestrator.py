@@ -34,6 +34,11 @@ from prime_rl.orchestrator.buffer import Buffer
 from prime_rl.orchestrator.ckpt import Progress, setup_ckpt_manager
 from prime_rl.orchestrator.eval_utils import evaluate_env
 from prime_rl.orchestrator.filters import apply_filters, setup_filters
+from prime_rl.orchestrator.logging_metrics import (
+    rlm_cost_subcall_metrics,
+    rlm_protocol_metrics,
+    stable_stop_condition_metrics,
+)
 from prime_rl.orchestrator.scheduler import Scheduler
 from prime_rl.orchestrator.trace_export import export_rollout_traces
 from prime_rl.orchestrator.utils import (
@@ -44,6 +49,9 @@ from prime_rl.orchestrator.utils import (
     set_semaphore,
 )
 from prime_rl.orchestrator.vf_utils import (
+    EnvWorkerHandle,
+    EnvWorkerSpec,
+    ManagedEnvClientPool,
     generate,
     get_completion_len,
     get_seq_len,
@@ -194,32 +202,80 @@ async def orchestrate(config: OrchestratorConfig):
             "Rollouts run individually and are scored once each group completes."
         )
 
-    train_env_addresses = []
+    train_env_clients = []
     env_processes: list[mp.Process] = []
     for env_id, env, env_name in zip(env_ids, config.env, train_env_names):
+        worker_clients = []
+        worker_handles = []
+        worker_count = env.worker_count
         if env.address is None:
-            address, process = spawn_env_server(
-                env_id=env_id,
-                env_args=env.args,
-                extra_env_kwargs=env.extra_env_kwargs,
-                log_level="CRITICAL",
-                log_file=(get_log_dir(config.output_dir) / "train" / f"{env_name}.log").as_posix(),
-                log_file_level=config.log.vf_level,
-                json_logging=config.log.json_logging,
-            )
-            env_processes.append(process)
+            worker_addresses = []
+            for worker_idx in range(worker_count):
+                worker_name = env_name if worker_count == 1 else f"{env_name}_w{worker_idx}"
+                log_name = f"{env_name}.log" if worker_count == 1 else f"{env_name}_w{worker_idx}.log"
+                log_file = (get_log_dir(config.output_dir) / "train" / log_name).as_posix()
+                address, process = spawn_env_server(
+                    env_id=env_id,
+                    env_args=env.args,
+                    extra_env_kwargs=env.extra_env_kwargs,
+                    log_level="CRITICAL",
+                    log_file=log_file,
+                    log_file_level=config.log.vf_level,
+                    json_logging=config.log.json_logging,
+                )
+                env_processes.append(process)
+                worker_addresses.append(address)
+                worker_client = setup_env_client(address=address, name=worker_name)
+                worker_clients.append(worker_client)
+                worker_handles.append(
+                    EnvWorkerHandle(
+                        worker_id=worker_idx,
+                        worker_name=worker_name,
+                        address=address,
+                        process=process,
+                        client=worker_client,
+                        spec=EnvWorkerSpec(
+                            env_id=env_id,
+                            env_args=env.args,
+                            extra_env_kwargs=env.extra_env_kwargs,
+                            log_level="CRITICAL",
+                            log_file=log_file,
+                            log_file_level=config.log.vf_level,
+                            json_logging=config.log.json_logging,
+                        ),
+                    )
+                )
         else:
             if env_name in train_env_deferred_group_scoring_tasks:
                 logger.warning(
                     f"Training env {env_name} uses external server at {env.address}. "
                     "Ensure that server was started with score_rollouts=False."
                 )
-            address = env.address
-        logger.info(f"Connecting train environment {env_name} to server at {address}")
-        train_env_addresses.append(address)
-    train_env_clients = [
-        setup_env_client(address=address, name=name) for name, address in zip(train_env_names, train_env_addresses)
-    ]
+            worker_addresses = [env.address]
+            worker_clients.append(setup_env_client(address=env.address, name=env_name))
+        if worker_handles:
+            env_client = ManagedEnvClientPool(worker_handles, name=env_name)
+        elif len(worker_clients) == 1:
+            env_client = worker_clients[0]
+        else:
+            env_client = ManagedEnvClientPool(
+                [
+                    EnvWorkerHandle(
+                        worker_id=worker_idx,
+                        worker_name=f"{env_name}_w{worker_idx}",
+                        address=client.address,
+                        process=None,
+                        client=client,
+                    )
+                    for worker_idx, client in enumerate(worker_clients)
+                ],
+                name=env_name,
+            )
+        logger.info(
+            f"Connecting train environment {env_name} to {len(worker_clients)} worker(s): "
+            f"{', '.join(worker_addresses)}"
+        )
+        train_env_clients.append(env_client)
 
     logger.info("Waiting for train environment servers to be ready")
     await wait_for_env_servers(train_env_clients)
@@ -230,33 +286,82 @@ async def orchestrate(config: OrchestratorConfig):
     for env, env_client in zip(train_env_group.envs, train_env_clients):
         env.env_client = env_client
 
+    eval_env_clients = []
     if config.eval:
         env_ids = [strip_env_version(env.id) for env in config.eval.env]
         eval_envs = [vf.load_environment(env_id, **env.args) for env_id, env in zip(env_ids, config.eval.env)]
         eval_env_names = [env.name or env_id for env_id, env in zip(env_ids, config.eval.env)]
         eval_sampling_args = get_eval_sampling_args(config.eval.sampling)
-        eval_env_addresses = []
 
         for env_id, env, eval_env_name in zip(env_ids, config.eval.env, eval_env_names):
+            worker_clients = []
+            worker_handles = []
+            worker_count = env.worker_count
             if env.address is None:
-                address, process = spawn_env_server(
-                    env_id=env_id,
-                    env_args=env.args,
-                    extra_env_kwargs=env.extra_env_kwargs,
-                    log_level="CRITICAL",
-                    log_file=(get_log_dir(config.output_dir) / "eval" / f"{eval_env_name}.log").as_posix(),
-                    log_file_level=config.log.vf_level,
-                    json_logging=config.log.json_logging,
-                )
-                env_processes.append(process)
+                worker_addresses = []
+                for worker_idx in range(worker_count):
+                    worker_name = eval_env_name if worker_count == 1 else f"{eval_env_name}_w{worker_idx}"
+                    log_name = (
+                        f"{eval_env_name}.log" if worker_count == 1 else f"{eval_env_name}_w{worker_idx}.log"
+                    )
+                    log_file = (get_log_dir(config.output_dir) / "eval" / log_name).as_posix()
+                    address, process = spawn_env_server(
+                        env_id=env_id,
+                        env_args=env.args,
+                        extra_env_kwargs=env.extra_env_kwargs,
+                        log_level="CRITICAL",
+                        log_file=log_file,
+                        log_file_level=config.log.vf_level,
+                        json_logging=config.log.json_logging,
+                    )
+                    env_processes.append(process)
+                    worker_addresses.append(address)
+                    worker_client = setup_env_client(address=address, name=worker_name)
+                    worker_clients.append(worker_client)
+                    worker_handles.append(
+                        EnvWorkerHandle(
+                            worker_id=worker_idx,
+                            worker_name=worker_name,
+                            address=address,
+                            process=process,
+                            client=worker_client,
+                            spec=EnvWorkerSpec(
+                                env_id=env_id,
+                                env_args=env.args,
+                                extra_env_kwargs=env.extra_env_kwargs,
+                                log_level="CRITICAL",
+                                log_file=log_file,
+                                log_file_level=config.log.vf_level,
+                                json_logging=config.log.json_logging,
+                            ),
+                        )
+                    )
             else:
-                address = env.address
-            logger.info(f"Connecting eval environment {eval_env_name} to server at {address}")
-            eval_env_addresses.append(address)
-
-        eval_env_clients = [
-            setup_env_client(address=address, name=name) for name, address in zip(eval_env_names, eval_env_addresses)
-        ]
+                worker_addresses = [env.address]
+                worker_clients.append(setup_env_client(address=env.address, name=eval_env_name))
+            if worker_handles:
+                eval_env_client = ManagedEnvClientPool(worker_handles, name=eval_env_name)
+            elif len(worker_clients) == 1:
+                eval_env_client = worker_clients[0]
+            else:
+                eval_env_client = ManagedEnvClientPool(
+                    [
+                        EnvWorkerHandle(
+                            worker_id=worker_idx,
+                            worker_name=f"{eval_env_name}_w{worker_idx}",
+                            address=client.address,
+                            process=None,
+                            client=client,
+                        )
+                        for worker_idx, client in enumerate(worker_clients)
+                    ],
+                    name=eval_env_name,
+                )
+            logger.info(
+                f"Connecting eval environment {eval_env_name} to {len(worker_clients)} worker(s): "
+                f"{', '.join(worker_addresses)}"
+            )
+            eval_env_clients.append(eval_env_client)
 
         logger.info("Waiting for eval environment servers to be ready")
         await wait_for_env_servers(eval_env_clients)
@@ -449,6 +554,7 @@ async def orchestrate(config: OrchestratorConfig):
                         max_retries=eval_env_config.max_retries,
                         ckpt_step=ckpt_step,
                         step=progress.step,
+                        rollout_timeout_seconds=config.rollout_timeout_seconds,
                     )
                     for eval_env, eval_env_name, eval_env_config in zip(eval_envs, eval_env_names, config.eval.env)
                 ]
@@ -479,6 +585,7 @@ async def orchestrate(config: OrchestratorConfig):
                     sampling_args=sampling_args,
                     clients=inference_pool.clients,
                     pbar_description="Generating rollouts (val)",
+                    rollout_timeout_seconds=config.rollout_timeout_seconds,
                 )
             )
         else:
@@ -648,17 +755,21 @@ async def orchestrate(config: OrchestratorConfig):
         progress.total_problems += num_unique_examples
         throughput = num_tokens / generate_completions_time
 
-        def compute_solve_rates(df):
+        def compute_solve_rates(df, metric_df: pd.DataFrame | None = None):
             """Compute solve_none, solve_all, effective_batch_size for a set of rollouts."""
-            reward_per_problem = df.groupby("example_id").reward.sum()
-            solve_none = (reward_per_problem == 0).mean()
-            solve_all = (reward_per_problem == config.rollouts_per_example).mean()
+            if metric_df is not None and not metric_df.empty and "correctness_metric" in metric_df.columns:
+                correctness = pd.to_numeric(metric_df["correctness_metric"], errors="coerce").reindex(df.index)
+                score_per_problem = correctness.fillna(0.0).groupby(df["example_id"]).sum()
+            else:
+                score_per_problem = df.groupby("example_id").reward.sum()
+            solve_none = (score_per_problem <= 0.0).mean()
+            solve_all = (score_per_problem >= config.rollouts_per_example).mean()
             return solve_none, solve_all, 1 - solve_none - solve_all
 
         # Group by example_id to average across rollouts within each problem
         by_example = results_df.groupby("example_id")
 
-        solve_none, solve_all, effective_batch_size = compute_solve_rates(results_df)
+        solve_none, solve_all, effective_batch_size = compute_solve_rates(results_df, metrics_df)
         to_log = {
             # Progress metrics
             "progress/tokens": num_tokens,
@@ -683,13 +794,13 @@ async def orchestrate(config: OrchestratorConfig):
             "is_truncated/all/mean": by_example.is_truncated.mean().mean(),
             "is_truncated/all/max": by_example.is_truncated.mean().max(),
             "is_truncated/all/min": by_example.is_truncated.mean().min(),
-            "stop_condition/all/generation_truncated": (
-                results_df.is_truncated & (results_df.stop_condition != "prompt_too_long")
-            ).mean(),
+            **stable_stop_condition_metrics(results_df, prefix="all"),
             **{
                 f"stop_condition/all/{sc}": rate
                 for sc, rate in results_df.stop_condition.dropna().value_counts(normalize=True).items()
             },
+            **rlm_protocol_metrics(results_df, metrics_df, prefix="all"),
+            **rlm_cost_subcall_metrics(results_df, metrics_df, prefix="all"),
             "samples_per_rollout/all/mean": by_example.samples_per_rollout.mean().mean(),
             "samples_per_rollout/all/max": by_example.samples_per_rollout.mean().max(),
             "samples_per_rollout/all/min": by_example.samples_per_rollout.mean().min(),
@@ -753,16 +864,16 @@ async def orchestrate(config: OrchestratorConfig):
             to_log[f"reward/{env}/mean"] = env_by_example.reward.mean().mean()
             to_log[f"reward/{env}/max"] = env_by_example.reward.mean().max()
             to_log[f"reward/{env}/min"] = env_by_example.reward.mean().min()
-            solve_none, solve_all, effective_batch_size = compute_solve_rates(env_df)
+            env_metrics_df = metrics_df.loc[env_df.index]
+            solve_none, solve_all, effective_batch_size = compute_solve_rates(env_df, env_metrics_df)
             to_log[f"solve_none/{env}"] = solve_none
             to_log[f"solve_all/{env}"] = solve_all
             to_log[f"effective_batch_size/{env}"] = effective_batch_size
-            to_log[f"stop_condition/{env}/generation_truncated"] = (
-                env_df.is_truncated & (env_df.stop_condition != "prompt_too_long")
-            ).mean()
+            to_log.update(stable_stop_condition_metrics(env_df, prefix=env))
+            to_log.update(rlm_protocol_metrics(env_df, env_metrics_df, prefix=env))
+            to_log.update(rlm_cost_subcall_metrics(env_df, env_metrics_df, prefix=env))
             for sc, rate in env_df.stop_condition.dropna().value_counts(normalize=True).items():
                 to_log[f"stop_condition/{env}/{sc}"] = rate
-            env_metrics_df = metrics_df.loc[env_df.index]
             for metric in metrics_df.columns:
                 to_log[f"metrics/{env}/{metric}"] = env_metrics_df.groupby(env_df["example_id"])[metric].mean().mean()
 
@@ -830,6 +941,7 @@ async def orchestrate(config: OrchestratorConfig):
                     max_retries=eval_env_config.max_retries,
                     ckpt_step=ckpt_step,
                     step=progress.step,
+                    rollout_timeout_seconds=config.rollout_timeout_seconds,
                 )
                 for eval_env, eval_env_name, eval_env_config in zip(eval_envs, eval_env_names, config.eval.env)
             ]
@@ -861,6 +973,12 @@ async def orchestrate(config: OrchestratorConfig):
 
     # Cancel event loop lag monitor task
     event_loop_lag_monitor_task.cancel()
+
+    # Close environment clients before terminating their worker processes.
+    await asyncio.gather(
+        *(env_client.close() for env_client in [*train_env_clients, *eval_env_clients]),
+        return_exceptions=True,
+    )
 
     # Shutdown env processes
     for process in env_processes:

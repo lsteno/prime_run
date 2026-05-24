@@ -1,0 +1,22 @@
+output_dir = "outputs/rlm-prompt-qwen3-4b-inference"
+gpu_memory_utilization = 0.9
+enable_prefix_caching = true
+api_server_count = 1
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[model]
+name = "Qwen/Qwen3-4B-Thinking-2507"
+max_model_len = 262144
+enforce_eager = false
+trust_remote_code = true
+
+[parallel]
+tp = 8
+dp = 1
+
+[deployment]
+type = "single_node"
+gpus_per_node = 8

@@ -26,15 +26,31 @@ def _json_safe(value: Any) -> Any:
 
 def _segment_summary(segment: dict[str, Any]) -> dict[str, Any]:
     completion_mask = [bool(value) for value in segment.get("completion_mask", [])]
+    is_trainable = bool(segment.get("is_trainable_rlm_turn", False))
+    prompt_token_count = segment.get("prompt_token_count")
+    completion_token_count = segment.get("completion_token_count")
     return {
         "order": int(segment.get("order", 0)),
+        "call_id": segment.get("call_id"),
+        "parent_call_id": segment.get("parent_call_id"),
         "depth": int(segment.get("depth", 0)),
+        "turn_index": segment.get("turn_index"),
         "kind": segment.get("kind"),
+        "train_scope": segment.get("train_scope"),
+        "is_trainable_rlm_turn": bool(segment.get("is_trainable_rlm_turn", False)),
+        "response_source": segment.get("response_source"),
+        "prompt_fingerprint": segment.get("prompt_fingerprint"),
+        "prompt_message_count": segment.get("prompt_message_count"),
+        "prompt_char_count": segment.get("prompt_char_count"),
         "temperature": segment.get("temperature"),
         "response_text": segment.get("response_text"),
-        "prompt_token_count": len(segment.get("prompt_ids", [])),
-        "completion_token_count": len(segment.get("completion_ids", [])),
-        "trainable_token_count": sum(completion_mask),
+        "prompt_token_count": int(prompt_token_count)
+        if prompt_token_count not in (None, "")
+        else len(segment.get("prompt_ids", [])),
+        "completion_token_count": int(completion_token_count)
+        if completion_token_count not in (None, "")
+        else len(segment.get("completion_ids", [])),
+        "trainable_token_count": sum(completion_mask) if is_trainable else 0,
     }
 
 
@@ -65,6 +81,7 @@ def _rollout_debug(rollout: vf.RolloutOutput) -> dict[str, Any]:
 
 def _rollout_record(rollout: vf.RolloutOutput, include_segments: bool, include_metrics: bool) -> dict[str, Any]:
     debug = _rollout_debug(rollout)
+    sample_metadata = debug.get("sample_metadata") or {}
     trace = rollout.get("rlm_trace")
     if not trace:
         trace = debug.get("trace") or []
@@ -78,6 +95,12 @@ def _rollout_record(rollout: vf.RolloutOutput, include_segments: bool, include_m
         "task": rollout.get("task"),
         "answer": _json_safe(rollout.get("answer")),
         "expected_answers": _json_safe(debug.get("expected_answers")),
+        "source_id": _json_safe(sample_metadata.get("source_id")),
+        "dataset_name": _json_safe(sample_metadata.get("dataset_name")),
+        "source_task": _json_safe(sample_metadata.get("source_task")),
+        "answer_type": _json_safe(sample_metadata.get("answer_type")),
+        "context_token_count": _json_safe(sample_metadata.get("context_token_count")),
+        "sample_metadata": _json_safe(sample_metadata.get("metadata") or {}),
         "rlm_answer": _json_safe(_rollout_answer(rollout)),
         "judge_score": _json_safe(debug.get("judge_score")),
         "judge_raw_response": _json_safe(debug.get("judge_raw_response")),

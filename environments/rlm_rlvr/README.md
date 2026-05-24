@@ -2,7 +2,7 @@
 
 ### Overview
 - **Environment ID**: `rlm_rlvr`
-- **Short description**: Prime-native recursive RLVR environment that trains a single local model across root turns and recursive subcalls.
+- **Short description**: Prime-native recursive RLVR environment that trains a single local model on root and recursive RLM turns, while keeping plain LLM subcalls trace-only.
 - **Tags**: `rlvr`, `recursive`, `prime-rl`, `multi-turn`
 
 ### Datasets
@@ -13,7 +13,7 @@
 ### Task
 - **Type**: multi-turn
 - **Output format expectations (optional)**: assistant text with optional ```repl``` blocks and a final `FINAL(...)` or `FINAL_VAR(...)` answer.
-- **Rubric overview**: binary semantic correctness from an LLM judge, with monitor metrics for recursion usage and depth.
+- **Rubric overview**: exact match plus semantic correctness from an LLM judge, with either backward-compatible static token-cost shaping or adaptive GRPO-group cost shaping. Monitor metrics track recursion, subcalls, depth, token cost, and adaptive penalty state.
 
 ### Quickstart
 Run an evaluation with default settings:
@@ -36,12 +36,15 @@ prime eval run rlm_rlvr -a '{"dataset_id": "lsteno/BEEG-agents", "max_examples":
 
 Notes:
 - Use `-a` / `--env-args` to pass environment-specific configuration as a JSON object.
-- This environment reuses the published `rlms` package for prompt construction, parsing, and REPL execution backends.
+- This environment reuses the published `rlms` package for prompt construction, parsing, and local REPL execution.
 - Install with Prime CLI (`prime env install rlm_rlvr -p /home/coder/prime_run/environments`) to ensure dependencies are available.
-- Set `OPENROUTER_API_KEY` so the semantic judge can score outputs. For managed hosted training, add it via `env_file`. For self-managed `prime-rl` runs on Prime Intellect on-demand GPUs, export it directly in the pod shell.
-- For `repl_backend = "prime"`, set `PRIME_API_KEY` in your environment.
+- For Vertex-backed semantic judging and plain subcalls, set `GOOGLE_CLOUD_PROJECT`, use Application Default Credentials, and keep Gemini 3 configs on the `global` location. OpenAI-compatible providers still use `OPENROUTER_API_KEY` or the configured API-key variable.
+- `repl_backend` currently supports only `"local"`; remote REPL backends are future work.
+- The default prompt is `sanjaya_text_v1`. `prompt_variant="default"` is kept as a compatibility alias for the same prompt.
 - Local parquet mode is opt-in: pass `data_paths` explicitly. If `eval_data_paths` is omitted, eval defaults to a deterministic 10% holdout from `data_paths`.
 - `inference_mode = "hosted"` is for managed hosted training. `inference_mode = "local"` is the standard setting for self-managed `prime-rl` runs on on-demand GPUs.
+- Active self-managed configs keep root and recursive RLM generations on local vLLM/Prime GPUs, while routing only non-trainable plain `llm_query*` subcalls to Vertex Gemini Flash-Lite.
+- `llm_query_batched` remains concurrent for external API fanout. `rlm_query_batched` executes recursive child RLM calls serially by default because child calls can run local REPL code and the local REPL mutates process-global cwd/stdout/stderr.
 - In the standard self-managed `prime-rl` path, the launcher handles the local inference base URL and API wiring. You do not need to set `RLM_LOCAL_INFERENCE_BASE_URL` or `RLM_LOCAL_INFERENCE_API_KEY` unless you are overriding the default local server.
 
 ### Environment Arguments
@@ -58,40 +61,92 @@ Notes:
 | `seed` | `int` | `42` | Dataset shuffle seed |
 | `max_examples` | `int` | `-1` | Limit training examples after splitting |
 | `max_eval_examples` | `int` | `-1` | Limit eval examples |
-| `max_iterations` | `int` | `4` | Recursive reasoning turns per call before forcing a final answer |
+| `max_iterations` | `int` | `15` | Recursive reasoning turns per call before forcing a final answer |
 | `max_depth` | `int` | `2` | Maximum recursion depth |
 | `turn_max_tokens` | `int` | `192` | Max assistant tokens for each recursive reasoning turn |
 | `subcall_max_tokens` | `int` | `128` | Max assistant tokens for leaf/plain subcalls |
 | `temperature` | `float` | `1.0` | Root and recursive sampling temperature |
 | `top_p` | `float` | `1.0` | Root and recursive nucleus sampling |
 | `tokenizer_name` | `str \| null` | `null` | Optional tokenizer override; defaults to the rollout model name |
-| `efficiency_penalty_coef` | `float` | `0.02` | Legacy arg kept for config compatibility; it no longer changes the binary reward |
+| `prompt_variant` | `str` | `"sanjaya_text_v1"` | System prompt variant. Supported values: `sanjaya_text_v1`, `default` where `default` is a compatibility alias |
+| `live_trace_dir` | `str \| null` | `"outputs/rlm_rlvr/live_traces"` | Directory for compact per-sample live traces updated after root and recursive steps. Set to `null` to disable |
+| `subcall_prompt_limit_ratio` | `float` | `0.85` | Blocks `llm_query*` and `rlm_query*` prompts whose estimated character size exceeds this fraction of the configured subcall context window, returning a REPL-visible error instead of truncating context |
+| `efficiency_penalty_mode` | `str` | `"static_per_1k"` | Reward shaping mode. Use `"static_per_1k"` for backward-compatible per-1k-token penalty or `"adaptive_group"` for solve-rate-aware group scoring |
+| `efficiency_penalty_coef` | `float` | `0.02` | Static-mode cost-aware shaping coefficient applied only to correct answers. Incorrect/no-answer rollouts receive `0`; correct rollouts receive `max(0, 1 - efficiency_penalty_coef * total_tokens / 1000)` |
+| `adaptive_efficiency_beta_max` | `float` | `0.05` | Maximum adaptive cost coefficient in group mode |
+| `adaptive_efficiency_gamma` | `float` | `2.0` | Exponent for the solve-rate ramp in group mode |
+| `adaptive_efficiency_solve_rate_floor` | `float` | `0.25` | No adaptive cost pressure is applied when group solve rate is at or below this floor |
+| `adaptive_efficiency_cost_basis` | `str` | `"total_tokens"` | Token-cost basis for adaptive group penalty. Currently supports total rollout tokens |
+| `efficiency_penalty_applies_to` | `str` | `"correct_only"` | Scope for cost shaping. Use `"correct_only"` for backward-compatible behavior or `"all_rollouts"` to make expensive wrong rollouts negative when adaptive beta is active |
+| `reward_clip_min` | `float` | `0.0` | Lower bound for shaped reward. Active cost-only negative-penalty sweeps set this to `-0.5` |
+| `reward_clip_max` | `float` | `1.0` | Upper bound for shaped reward |
 | `inference_mode` | `str` | `"hosted"` | Inference routing mode. Use `hosted` for managed hosted training and `local` for self-managed `prime-rl` on local or on-demand GPUs |
 | `inference_base_url` | `str \| null` | `null` | Override the OpenAI-compatible inference endpoint. Usually unset for self-managed `prime-rl`, which wires the local inference server automatically |
 | `inference_api_key` | `str \| null` | `null` | Override API key for the inference endpoint. Usually unset for self-managed `prime-rl` local inference |
-| `judge_model` | `str` | `"z-ai/glm-4.7-flash"` | OpenRouter model used for binary semantic judging |
-| `judge_base_url` | `str` | `"https://openrouter.ai/api/v1"` | Judge provider base URL |
-| `judge_api_key_var` | `str` | `"OPENROUTER_API_KEY"` | Environment variable that stores the judge API key |
-| `judge_http_referer` | `str \| null` | `null` | Optional OpenRouter `HTTP-Referer` header |
-| `judge_app_title` | `str \| null` | `null` | Optional OpenRouter `X-Title` header |
-| `repl_backend` | `str` | `"local"` | RLM REPL backend (`local`, `prime`, `docker`, `modal`, `daytona`, `e2b`) |
-| `repl_backend_kwargs` | `dict \| null` | `null` | Backend-specific kwargs passed to the selected REPL backend |
+| `llm_subcall_provider` | `str` | `"openai_compatible"` | Provider for plain non-trainable `llm_query*` calls. Use `"vertex"` for Vertex AI Gemini |
+| `llm_subcall_model` | `str \| null` | `null` | Optional separate model for plain `llm_query*` calls; `null` reuses the rollout endpoint |
+| `llm_subcall_vertex_project_env` | `str` | `"GOOGLE_CLOUD_PROJECT"` | Environment variable that stores the Vertex project for plain subcalls |
+| `llm_subcall_vertex_location` | `str \| null` | `"global"` | Vertex location for plain subcalls. Active Gemini 3 configs use `global` |
+| `llm_subcall_thinking_level` | `str \| null` | `"medium"` | Gemini thinking level for plain Vertex subcalls |
+| `llm_subcall_empty_response_max_attempts` | `int` | `1` | Number of attempts for retrying empty Vertex plain-subcall responses |
+| `llm_subcall_empty_response_base_retry_seconds` | `float` | `1.0` | Base exponential-backoff delay for empty plain-subcall retries |
+| `llm_subcall_empty_response_max_retry_seconds` | `float` | `30.0` | Maximum backoff delay for empty plain-subcall retries |
+| `llm_subcall_base_url` | `str \| null` | `null` | OpenAI-compatible plain subcall provider base URL |
+| `llm_subcall_api_key_var` | `str` | `"OPENROUTER_API_KEY"` | Environment variable for OpenAI-compatible plain subcalls |
+| `judge_provider` | `str` | `"openai_compatible"` | Provider for binary semantic judging. Use `"vertex"` for Vertex AI Gemini |
+| `judge_model` | `str` | `"z-ai/glm-5"` | Model used for binary semantic judging. Active Vertex configs use `gemini-3-flash-preview` |
+| `judge_vertex_project_env` | `str` | `"GOOGLE_CLOUD_PROJECT"` | Environment variable that stores the Vertex project for judging |
+| `judge_vertex_location` | `str \| null` | `"global"` | Vertex location for judging. Gemini 3 Flash requires `global` |
+| `judge_thinking_level` | `str \| null` | `"medium"` | Gemini thinking level for Vertex judging |
+| `judge_base_url` | `str` | `"https://openrouter.ai/api/v1"` | OpenAI-compatible judge provider base URL |
+| `judge_api_key_var` | `str` | `"OPENROUTER_API_KEY"` | Environment variable that stores the OpenAI-compatible judge API key |
+| `judge_http_referer` | `str \| null` | `null` | Optional OpenAI-compatible `HTTP-Referer` header |
+| `judge_app_title` | `str \| null` | `null` | Optional OpenAI-compatible `X-Title` header |
+| `repl_backend` | `str` | `"local"` | RLM REPL backend. Only `local` is currently supported |
+| `repl_backend_kwargs` | `dict \| null` | `null` | Reserved for future backend-specific kwargs |
+| `repl_timeout_seconds` | `float \| null` | `null` | Optional wall-clock timeout for generated REPL code blocks that call `llm_query*` or `rlm_query*` helpers |
+| `repl_fast_timeout_seconds` | `float \| null` | `null` | Optional shorter wall-clock timeout for generated REPL code blocks with no LLM/RLM subcalls |
+| `recursive_rlm_batch_mode` | `str` | `"serial"` | Execution mode for `rlm_query_batched`. Default `"serial"` avoids local REPL thread-safety hazards; `"thread"` is an explicit advanced override |
 
 ### Metrics
 Summarize key metrics your rubric emits and how they’re interpreted.
 
 | Metric | Meaning |
 | ------ | ------- |
-| `reward` | Binary semantic correctness from the judge (`0` or `1`) |
-| `correctness` | Same binary judge score exposed as a metric |
+| `reward` | Correctness minus optional static/adaptive token-cost penalty and max-turn penalty, clipped by `reward_clip_min` / `reward_clip_max` |
+| `correctness` | Raw binary judge score before cost shaping |
 | `judge_score` | Binary judge score for observability |
+| `efficiency_penalty` | Static or adaptive token-cost penalty subtracted from reward |
+| `incorrect_cost_penalty` | Portion of the cost penalty applied to incorrect rollouts when `efficiency_penalty_applies_to = "all_rollouts"` |
+| `cost_prompt_tokens` | Total prompt tokens consumed across all root turns, recursive turns, and subcalls |
+| `cost_completion_tokens` | Total completion tokens consumed across all root turns, recursive turns, and subcalls |
+| `cost_total_tokens` | Sum of prompt and completion tokens used for cost shaping |
+| `cost_trainable_tokens` | Token count from trainable root/recursive/finalize RLM turns |
+| `cost_plain_subcall_tokens` | Token count from non-trainable plain `llm_query*` subcalls |
+| `adaptive_group_solve_rate` | Within-prompt group correctness rate used by adaptive group mode |
+| `adaptive_beta` | Solve-rate-dependent adaptive cost coefficient |
+| `adaptive_normalized_cost` | Min-max normalized cost among correct rollouts in the group |
+| `adaptive_cost_penalty` | Adaptive cost penalty applied to this rollout |
 | `used_repl` | Fraction of rollouts that executed at least one REPL block |
-| `used_recursion` | Fraction of rollouts that invoked `rlm_query(...)` |
-| `num_subcalls` | Number of recursive subcalls executed in the rollout |
-| `max_depth_reached` | Deepest recursive call depth reached |
+| `used_recursion` | Fraction of rollouts that invoked any `llm_query(...)` or `rlm_query(...)` subcall |
+| `used_llm_subcalls` | Fraction of rollouts that used at least one plain `llm_query(...)` subcall |
+| `used_rlm_subcalls` | Fraction of rollouts that used at least one recursive `rlm_query(...)` subcall |
+| `num_subcalls` | Total number of LLM plus RLM subcalls executed in the rollout |
+| `num_llm_subcalls` | Number of plain `llm_query(...)` subcalls executed in the rollout |
+| `num_rlm_subcalls` | Number of recursive `rlm_query(...)` subcalls executed in the rollout |
+| `max_depth_reached` | Deepest aggregate recursion depth reached, with plain LLM subcalls counted as depth 1 |
 
 ### Prime-RL Notes
-- The environment emits flattened recursive segments in `rlm_segments` so Prime-RL can train both root turns and recursive subcalls.
-- For Prime Intellect on-demand pods, start with `/home/coder/prime_run/configs/rlm_rlvr/ondemand_smoke_qwen3_4b.toml`, which keeps `orchestrator.use_token_client = false` and `inference_mode = "local"` for a lower-risk bring-up path.
-- After the pod path is stable, use `/home/coder/prime_run/configs/rlm_rlvr/ondemand_long_deep_qwen35_9b.toml` for the longer Qwen 3.5 9B run.
-- If you need exact token IDs and logprobs from the same local inference server for recursive subcalls, enable `orchestrator.use_token_client = true` in a follow-up config after the on-demand smoke path is stable.
+- The environment emits flattened recursive segments in `rlm_segments` with explicit call provenance. Prime-RL trains only segments marked as RLM-owned turns (`root_turn`, `recursive_turn`, `finalize_turn`) and skips plain `llm_query(...)` subcalls.
+- With `prime eval run -s`, completed rollout rows are written incrementally to `environments/rlm_rlvr/outputs/evals/<env>--<model>/<run_id>/results.jsonl`.
+- Long in-flight rollouts also update compact live trace files under `outputs/rlm_rlvr/live_traces/<prompt_variant>/<source_id>.json`. These include assistant text, executed code blocks, REPL feedback, final answer state, subcall counters, and compact segment token counts without duplicating full token id arrays.
+- Keep `orchestrator.use_token_client = false` for this environment. Recursive rollouts use message-based chat completions; the token-in/token-out endpoint is for linear TITO and prefill flows.
+- For local SFT warmup on an 8xH100 node, see `/home/coder/prime_run/configs/rlm_sft/README.md` and `/home/coder/prime_run/configs/rlm_sft/local_h100x8_qwen3_4b.toml`.
+
+### Development
+
+Run the environment tests with uv:
+
+```bash
+uv run --project environments/rlm_rlvr --group dev pytest environments/rlm_rlvr/tests -q
+```

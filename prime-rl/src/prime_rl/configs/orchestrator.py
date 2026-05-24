@@ -294,6 +294,16 @@ class EnvConfig(BaseConfig):
             description="Maximum number of times the environment will retry a rollout before returning an error.",
         ),
     ] = 0
+    worker_count: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Number of environment server worker processes to spawn for this logical environment. "
+                "The dataset/task remains a single logical env; rollout requests are routed across workers."
+            ),
+        ),
+    ] = 1
 
     @property
     def resolved_name(self) -> str:
@@ -304,6 +314,11 @@ class EnvConfig(BaseConfig):
         if self.resolved_name == "all":
             raise ValueError(
                 'Environment name "all" is reserved for global metric aggregation. Use a different name or id.'
+            )
+        if self.address is not None and self.worker_count > 1:
+            raise ValueError(
+                "worker_count > 1 requires Prime-RL to spawn local environment servers; "
+                "use worker_count = 1 when connecting to an explicit env address."
             )
         return self
 
@@ -503,12 +518,44 @@ class BufferConfig(BaseConfig):
         ),
     ] = 0.0
 
+    hard_cooldown_steps: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "If set, hard examples are held out for this many orchestrator steps before returning to "
+                "the normal sampling pool. If None, hard examples stay in the hard pool until converted by "
+                "hard_fraction on checkpoint load, preserving upstream behavior."
+            ),
+        ),
+    ] = None
+
     online_difficulty_filtering: Annotated[
         bool,
         Field(
             description="Whether to filter rollouts based on difficulty. If True, rollouts with average reward 0.0 or 1.0 are not added to the buffer.",
         ),
     ] = False
+
+    online_filter_hard: Annotated[
+        bool,
+        Field(
+            description=(
+                "When online_difficulty_filtering is enabled, filter all-zero groups out of the current "
+                "update. This keeps the standard GRPO hard-prompt filtering behavior."
+            ),
+        ),
+    ] = True
+
+    online_filter_easy: Annotated[
+        bool,
+        Field(
+            description=(
+                "When online_difficulty_filtering is enabled, filter all-one groups out of the current "
+                "update. Disable this when the reward includes relative cost signal for all-correct groups."
+            ),
+        ),
+    ] = True
 
     hash_keys: Annotated[
         list[str],
@@ -687,6 +734,193 @@ class TraceExportConfig(BaseConfig):
     ] = True
 
 
+class EnvWorkerRecoveryConfig(BaseConfig):
+    """Configures recovery for locally spawned environment worker processes."""
+
+    enabled: Annotated[
+        bool,
+        Field(description="Whether to restart locally spawned env workers after stuck rollout attempts."),
+    ] = False
+
+    cancel_grace_seconds: Annotated[
+        float,
+        Field(
+            ge=0,
+            description="Seconds to wait after cancelling a timed-out rollout before restarting the worker.",
+        ),
+    ] = 5.0
+
+    max_rollout_attempts_per_slot: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Maximum rollout attempts for one group slot before dropping the entire group.",
+        ),
+    ] = 4
+
+    max_attempts_cooldown_steps: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "When a group is dropped after exhausting attempts, hold its prompt out of normal sampling "
+                "for this many orchestrator steps."
+            ),
+        ),
+    ] = 5
+
+    drop_group_on_first_timeout: Annotated[
+        bool,
+        Field(
+            description=(
+                "Whether a rollout timeout should drop the whole training group immediately instead of "
+                "retrying the timed-out slot until max_rollout_attempts_per_slot."
+            ),
+        ),
+    ] = False
+
+    first_timeout_cooldown_steps: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "When drop_group_on_first_timeout is enabled, hold the timed-out prompt out of normal "
+                "training sampling for this many orchestrator steps."
+            ),
+        ),
+    ] = 5
+
+    restart_on_rollout_timeout: Annotated[
+        bool,
+        Field(description="Whether a rollout timeout should trigger a worker restart for local worker pools."),
+    ] = True
+
+    restart_on_worker_health_failure: Annotated[
+        bool,
+        Field(description="Whether failed worker health checks should trigger worker restart."),
+    ] = True
+
+
+class AttemptLoggingConfig(BaseConfig):
+    """Configures append-only rollout attempt logging."""
+
+    enabled: Annotated[
+        bool,
+        Field(description="Whether to write per-rollout attempt JSONL logs."),
+    ] = False
+
+
+class AsyncSchedulingConfig(BaseConfig):
+    """Controls speculative rollout scheduling across orchestrator batches."""
+
+    prefetch_next_batch: Annotated[
+        bool,
+        Field(
+            description=(
+                "Whether to fill in-flight rollouts again after the current batch target is reached. "
+                "Disable for expensive environments where speculative cross-step work is wasteful."
+            ),
+        ),
+    ] = True
+
+    inflight_completion_cushion: Annotated[
+        int | None,
+        Field(
+            ge=0,
+            description=(
+                "If set, fill only up to remaining_needed + this cushion instead of max_inflight_rollouts. "
+                "This bounds near-end overscheduling while keeping async overlap."
+            ),
+        ),
+    ] = None
+
+    max_requests_per_env_worker: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Maximum scheduler-reserved rollout requests per managed env worker. If all workers are "
+                "at this cap, rollout filling stops until one finishes instead of queueing inside workers."
+            ),
+        ),
+    ] = None
+
+    max_cross_step_carryover: Annotated[
+        int | None,
+        Field(
+            ge=0,
+            description=(
+                "Maximum number of live rollout attempts to keep after a batch completes. None preserves "
+                "legacy unbounded carryover."
+            ),
+        ),
+    ] = None
+
+    max_carryover_steps: Annotated[
+        int,
+        Field(
+            ge=0,
+            description="Maximum number of later steps in which a carried-over rollout may still be accepted.",
+        ),
+    ] = 1
+
+    cancel_stale_carryover: Annotated[
+        bool,
+        Field(description="Whether to cancel in-flight carryover attempts that are older than max_carryover_steps."),
+    ] = False
+
+    restart_workers_for_stale_cancel: Annotated[
+        bool,
+        Field(
+            description=(
+                "Whether to restart locally spawned env worker generations when stale or excess carryover "
+                "is cancelled and no kept attempt remains on that worker generation."
+            ),
+        ),
+    ] = False
+
+    batch_complete_cancel_grace_seconds: Annotated[
+        float,
+        Field(
+            ge=0,
+            description="Grace period used when restarting a worker after stale/excess batch-complete cancellation.",
+        ),
+    ] = 2.0
+
+
+class GroupScoringConfig(BaseConfig):
+    """Controls deferred group reward scoring concurrency."""
+
+    enabled: Annotated[
+        bool,
+        Field(
+            description=(
+                "Whether deferred group reward scoring may run in background tasks instead of blocking "
+                "the rollout scheduler hot path."
+            ),
+        ),
+    ] = False
+
+    max_concurrency: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Maximum number of completed rollout groups to score concurrently.",
+        ),
+    ] = 8
+
+    max_pending_groups: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Maximum number of completed groups waiting for or actively running reward scoring. "
+                "Rollout scheduling pauses at this cap to avoid unbounded unscored work."
+            ),
+        ),
+    ] = 64
+
+
 class OrchestratorConfig(BaseConfig):
     """Configures the orchestrator for RL training."""
 
@@ -736,6 +970,18 @@ class OrchestratorConfig(BaseConfig):
     # Human-readable trace export configuration
     trace_export: TraceExportConfig | None = None
 
+    # Worker recovery for spawned env workers
+    env_worker_recovery: EnvWorkerRecoveryConfig = EnvWorkerRecoveryConfig()
+
+    # Per-rollout attempt logs
+    attempt_logging: AttemptLoggingConfig = AttemptLoggingConfig()
+
+    # Bounded async rollout scheduling
+    async_scheduling: AsyncSchedulingConfig = AsyncSchedulingConfig()
+
+    # Deferred group scoring concurrency
+    group_scoring: GroupScoringConfig = GroupScoringConfig()
+
     # The wandb configuration
     wandb: WandbWithExtrasConfig | None = None
 
@@ -766,6 +1012,17 @@ class OrchestratorConfig(BaseConfig):
         int | None,
         Field(
             description="Maximum number of concurrent rollouts to generate and score per-environment. If None, will not limit concurrency.",
+        ),
+    ] = None
+
+    rollout_timeout_seconds: Annotated[
+        float | None,
+        Field(
+            gt=0,
+            description=(
+                "Wall-clock timeout in seconds for each rollout request. If None, rollouts use the "
+                "environment client's default timeout behavior."
+            ),
         ),
     ] = None
 
@@ -903,8 +1160,8 @@ class OrchestratorConfig(BaseConfig):
     @model_validator(mode="after")
     def nccl_max_async_level(self):
         if self.weight_broadcast.type == "nccl":
-            if not self.max_async_level == 1:
-                raise ValueError("max_async_level must be 1 for NCCL broadcast")
+            if self.max_async_level > 2:
+                raise ValueError("max_async_level must be <= 2 for NCCL broadcast")
         return self
 
     @model_validator(mode="after")

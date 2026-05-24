@@ -269,6 +269,28 @@ class LogExtrasConfig(BaseConfig):
         ),
     ] = 10
 
+    sample_max_chars: Annotated[
+        int,
+        Field(
+            ge=0,
+            description="Maximum decoded characters to store for each W&B sample row. Set 0 to disable truncation.",
+        ),
+    ] = 8000
+
+    sample_include_input_ids: Annotated[
+        bool,
+        Field(
+            description="Whether to include raw prompt+completion token IDs in W&B sample rows.",
+        ),
+    ] = False
+
+    final_samples: Annotated[
+        bool,
+        Field(
+            description="Whether to log an additional final W&B samples table at process shutdown.",
+        ),
+    ] = False
+
 
 class WandbConfig(BaseConfig):
     """Configures logging to Weights and Biases."""

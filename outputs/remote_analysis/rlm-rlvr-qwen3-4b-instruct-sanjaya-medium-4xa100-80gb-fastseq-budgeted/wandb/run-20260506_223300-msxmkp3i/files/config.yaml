@@ -1,0 +1,204 @@
+_wandb:
+    value:
+        cli_version: 0.24.2
+        e:
+            lh01biic2n3jebzai6u17w6bazpddggw:
+                args:
+                    - '@'
+                    - ../configs/rlm_rlvr/qwen3_4b_instruct_sanjaya_medium_4xa100_80gb_budgeted.toml
+                cpu_count: 60
+                cpu_count_logical: 60
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "3245455560704"
+                        used: "60653015040"
+                email: lorenzo.steno19@gmail.com
+                executable: /home/ubuntu/prime_run/prime-rl/.venv/bin/python
+                gpu: NVIDIA A100 80GB PCIe
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100 80GB PCIe
+                      uuid: GPU-b997047e-e22e-1ccd-471d-3eb9e132e1f4
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100 80GB PCIe
+                      uuid: GPU-6ffa2df2-0a14-74e8-7c67-e905e6623e76
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100 80GB PCIe
+                      uuid: GPU-556319a2-35fd-d1d8-4f13-6976c5bc1000
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100 80GB PCIe
+                      uuid: GPU-400cc493-07fc-df98-5465-4e91ce25cce3
+                host: 0040-dsm2-gba100-prxmx70028
+                memory:
+                    total: "316946391040"
+                os: Linux-6.8.0-90-generic-x86_64-with-glibc2.35
+                program: uv run rl
+                python: CPython 3.12.13
+                root: ../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-4xa100-80gb-fastseq-budgeted
+                startedAt: "2026-05-06T22:33:00.214629Z"
+                writerId: lh01biic2n3jebzai6u17w6bazpddggw
+        m: []
+        python_version: 3.12.13
+        t:
+            "1":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 51
+                - 95
+                - 97
+            "2":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 51
+                - 95
+                - 97
+            "3":
+                - 2
+                - 13
+                - 16
+                - 61
+            "4": 3.12.13
+            "5": 0.24.2
+            "6": 5.3.0.dev0
+            "12": 0.24.2
+            "13": linux-x86_64
+bench:
+    value: null
+ckpt:
+    value:
+        interval: 25
+        keep_interval: 100
+        keep_last: 2
+        output_dir: null
+        resume_step: null
+        skip_dataloader: false
+        skip_progress: false
+        skip_scheduler: false
+        weights:
+            save_adapter_separately: false
+            save_format: safetensors
+            save_sharded: true
+data:
+    value:
+        fake: null
+dist_timeout_seconds:
+    value: 600
+enable_router_replay:
+    value: false
+heartbeat:
+    value: null
+log:
+    value:
+        env_worker_logs: false
+        file: true
+        json_logging: false
+        level: info
+        log_data: false
+        vf_level: info
+loss:
+    value:
+        adv_tau: 1
+        ipo_mask_high: 0.2
+        ipo_mask_low: 0.2
+        kl_tau: 0.001
+        teacher_tau: 0
+        type: default
+max_async_level:
+    value: 4
+max_concurrent_runs:
+    value: 1
+max_steps:
+    value: 100
+memory_profiler_path:
+    value: null
+metrics_server:
+    value: null
+model:
+    value:
+        ac:
+            freq: 1
+        ac_offloading: null
+        attn: flash_attention_2
+        compile: null
+        cp: 1
+        debug:
+            num_layers: null
+            random_init: false
+        dp_replicate: 1
+        ep: 1
+        freeze_moe_router: false
+        fsdp_cpu_offload: false
+        fused_lm_head_token_chunk_size: 8192
+        impl: auto
+        lora:
+            alpha: 128
+            dropout: 0
+            modules_to_save: []
+            rank: 64
+            target_modules:
+                - q_proj
+                - k_proj
+                - v_proj
+                - o_proj
+                - gate_proj
+                - up_proj
+                - down_proj
+        moe_use_grouped_mm: true
+        name: Qwen/Qwen3-4B-Instruct-2507
+        optim_cpu_offload: false
+        optimization_dtype: float32
+        reduce_dtype: float32
+        reshard_after_forward: true
+        seq_len: 65536
+        tp: 1
+        trust_remote_code: false
+optim:
+    value:
+        betas1: 0.9
+        betas2: 0.999
+        lr: 1e-06
+        max_norm: 1
+        type: adamw
+        weight_decay: 0
+output_dir:
+    value: ../outputs/rlm-rlvr-qwen3-4b-instruct-sanjaya-medium-4xa100-80gb-fastseq-budgeted
+rollout_transport:
+    value:
+        type: filesystem
+scheduler:
+    value:
+        type: constant
+tensorboard:
+    value: null
+tokenizer:
+    value:
+        chat_template: null
+        name: Qwen/Qwen3-4B-Instruct-2507
+        trust_remote_code: true
+trace_path:
+    value: null
+wandb:
+    value:
+        id: null
+        name: qwen3-4b-instruct-sanjaya-medium-4xa100-80gb-fastseq-budgeted-trainer
+        offline: false
+        project: rlm-rlvr
+weight_broadcast:
+    value:
+        save_format: safetensors
+        save_sharded: true
+        type: filesystem

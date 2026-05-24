@@ -6,6 +6,12 @@ from prime_rl.orchestrator.trajectories import interleave_rollout
 from prime_rl.transport import TrainingSample
 
 
+def _segment_is_trainable(segment: dict) -> bool:
+    if "is_trainable_rlm_turn" in segment:
+        return bool(segment.get("is_trainable_rlm_turn", False))
+    return True
+
+
 def rollout_to_training_samples(
     output: vf.RolloutOutput,
     vlm_cache=None,
@@ -21,6 +27,8 @@ def rollout_to_training_samples(
 
     samples: list[TrainingSample] = []
     for segment in ordered_segments:
+        if not _segment_is_trainable(segment):
+            continue
         completion_ids = list(segment["completion_ids"])
         completion_mask = [bool(value) for value in segment.get("completion_mask", [True] * len(completion_ids))]
         if has_error:
