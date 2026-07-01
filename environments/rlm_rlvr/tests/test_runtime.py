@@ -1489,6 +1489,11 @@ def test_load_environment_rejects_non_local_backend_before_key_checks() -> None:
         load_environment(repl_backend="docker")
 
 
+def test_load_environment_rejects_unknown_recursive_cap_prompt_variant() -> None:
+    with pytest.raises(ValueError, match="recursive_cap_prompt_variant"):
+        load_environment(recursive_cap_prompt_variant="missing")
+
+
 def test_extract_final_answer_accepts_markdown_wrapped_final() -> None:
     from rlm_rlvr.parsing import extract_final_answer
 
@@ -1595,6 +1600,45 @@ def test_recursive_query_segments_capture_exact_prompt_context() -> None:
     assert segment["prompt_char_count"] == expected_chars
     assert isinstance(segment["prompt_fingerprint"], str)
     assert len(segment["prompt_fingerprint"]) == 40
+
+
+def test_recursive_query_at_depth_cap_uses_llm_only_child_prompt() -> None:
+    class _CapturingSession:
+        model_name = "fake-model"
+
+        def __init__(self) -> None:
+            self.calls: list[list[dict[str, str]]] = []
+
+        def generate(self, *, messages, max_tokens: int, temperature: float, top_p: float):
+            del max_tokens, temperature, top_p
+            self.calls.append([{"role": str(item["role"]), "content": str(item["content"])} for item in messages])
+            return (
+                "FINAL(42)",
+                TokenPayload(
+                    prompt_ids=[11, 12],
+                    completion_ids=[21, 22],
+                    completion_logprobs=[0.0, 0.0],
+                    completion_mask=[True, True],
+                ),
+            )
+
+    session = _CapturingSession()
+    runtime = RecursiveRuntime(
+        _runtime_state(_sync_session=session, current_branch_max_depth=1),
+        RuntimeConfig(
+            max_depth=1,
+            max_iterations=1,
+            prompt_variant=DEFAULT_PROMPT_VARIANT,
+            recursive_cap_prompt_variant="sanjaya_text_depth1_llm_only_v1",
+            live_trace_dir=None,
+        ),
+    )
+
+    runtime._recursive_query("solve it")
+
+    system_prompt = session.calls[0][0]["content"]
+    assert "`llm_query(prompt, model=None)`" in system_prompt
+    assert "rlm_query" not in system_prompt
 
 
 def test_plain_query_counts_as_depth_one_llm_subcall() -> None:

@@ -190,6 +190,86 @@ def _format_expected_answers(answers: list[str]) -> str:
     return "\n".join(f"- {answer}" for answer in answers)
 
 
+_PAIR_PATTERN = re.compile(r"\(\s*([0-9]+)\s*,\s*([0-9]+)\s*\)")
+
+
+def _extract_pair_set(value: Any) -> set[tuple[str, str]]:
+    if value is None:
+        return set()
+    if isinstance(value, list):
+        texts = [_normalize_text(item) for item in value]
+    else:
+        text = _normalize_text(value)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            texts = [_normalize_text(item) for item in parsed]
+        else:
+            texts = [text]
+
+    pairs: set[tuple[str, str]] = set()
+    for text in texts:
+        for left, right in _PAIR_PATTERN.findall(text):
+            first, second = sorted((left, right), key=lambda item: int(item))
+            pairs.add((first, second))
+    return pairs
+
+
+def _is_oolong_pairs_task(info: dict[str, Any] | None) -> bool:
+    if not info:
+        return False
+    dataset_name = str(info.get("dataset_name") or "")
+    answer_type = str(info.get("answer_type") or "")
+    metadata = info.get("metadata") if isinstance(info.get("metadata"), dict) else {}
+    origin = str(metadata.get("benchmark_origin") or metadata.get("original_benchmark") or "")
+    return (
+        dataset_name == "oolong_pairs"
+        or origin == "oolong_pairs"
+        or "oolong_pairs" in str(info.get("source_task") or "")
+        or answer_type == "list_of_answers"
+    )
+
+
+def _score_oolong_pairs(predicted_answer: str, expected_answers: list[str]) -> tuple[float, str, dict[str, float]]:
+    predicted_pairs = _extract_pair_set(predicted_answer)
+    expected_pairs: set[tuple[str, str]] = set()
+    for answer in expected_answers:
+        expected_pairs |= _extract_pair_set(answer)
+    if not expected_pairs:
+        score = 1.0 if not predicted_pairs else 0.0
+        stats = {
+            "precision": score,
+            "recall": score,
+            "f1": score,
+            "predicted_pairs": float(len(predicted_pairs)),
+            "expected_pairs": 0.0,
+        }
+        return score, "[oolong_pairs_empty_gold]", stats
+
+    true_positive = len(predicted_pairs & expected_pairs)
+    precision = true_positive / len(predicted_pairs) if predicted_pairs else 0.0
+    recall = true_positive / len(expected_pairs)
+    f1 = (2.0 * precision * recall / (precision + recall)) if precision + recall > 0.0 else 0.0
+    stats = {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "predicted_pairs": float(len(predicted_pairs)),
+        "expected_pairs": float(len(expected_pairs)),
+    }
+    return f1, "[oolong_pairs_f1]", stats
+
+
+def _record_oolong_pairs_metrics(state: vf.State, stats: dict[str, float]) -> None:
+    state["oolong_pairs_precision"] = stats["precision"]
+    state["oolong_pairs_recall"] = stats["recall"]
+    state["oolong_pairs_f1"] = stats["f1"]
+    state["oolong_pairs_predicted_count"] = stats["predicted_pairs"]
+    state["oolong_pairs_expected_count"] = stats["expected_pairs"]
+
+
 def _extract_message_text(message: Any) -> str:
     content = getattr(message, "content", None)
     if isinstance(content, str) and content.strip():
@@ -661,6 +741,26 @@ async def _score_correctness(
         )
         return result
 
+    if _is_oolong_pairs_task(info):
+        score, raw_response, stats = _score_oolong_pairs(predicted_answer, expected_answers)
+        _record_oolong_pairs_metrics(state, stats)
+        result = CorrectnessResult(
+            predicted_answer=predicted_answer,
+            expected_answers=expected_answers,
+            score=score,
+            raw_response=raw_response,
+            parse_error=None,
+        )
+        _record_judge_payload(
+            state,
+            predicted_answer=result.predicted_answer,
+            expected_answers=result.expected_answers,
+            score=result.score,
+            raw_response=result.raw_response,
+            parse_error=result.parse_error,
+        )
+        return result
+
     if _is_exact_match(predicted_answer, expected_answers):
         result = CorrectnessResult(
             predicted_answer=predicted_answer,
@@ -969,6 +1069,18 @@ async def judge_score_metric(state: vf.State) -> float:
     return float(state.get("judge_score", 0.0))
 
 
+async def oolong_pairs_precision_metric(state: vf.State) -> float:
+    return float(state.get("oolong_pairs_precision", 0.0))
+
+
+async def oolong_pairs_recall_metric(state: vf.State) -> float:
+    return float(state.get("oolong_pairs_recall", 0.0))
+
+
+async def oolong_pairs_f1_metric(state: vf.State) -> float:
+    return float(state.get("oolong_pairs_f1", 0.0))
+
+
 async def efficiency_penalty_metric(state: vf.State) -> float:
     return float(state.get("reward_efficiency_penalty", 0.0))
 
@@ -1072,6 +1184,9 @@ async def finalized_on_forced_prompt_metric(state: vf.State) -> float:
 def add_metrics(rubric: vf.Rubric) -> vf.Rubric:
     rubric.add_metric(correctness_metric)
     rubric.add_metric(judge_score_metric)
+    rubric.add_metric(oolong_pairs_precision_metric)
+    rubric.add_metric(oolong_pairs_recall_metric)
+    rubric.add_metric(oolong_pairs_f1_metric)
     rubric.add_metric(efficiency_penalty_metric)
     rubric.add_metric(incorrect_cost_penalty_metric)
     rubric.add_metric(max_turn_penalty_metric)

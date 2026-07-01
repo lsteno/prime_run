@@ -61,6 +61,7 @@ class RuntimeConfig:
     capture_prompt_messages: bool = False
     include_budget_reminder: bool = True
     recursive_rlm_batch_mode: str = "serial"
+    recursive_cap_prompt_variant: str | None = None
 
     def __post_init__(self) -> None:
         self.recursive_rlm_batch_mode = self.recursive_rlm_batch_mode.lower()
@@ -703,13 +704,19 @@ class RecursiveRuntime:
     ) -> list[dict[str, str]]:
         repl_context = prompt if context_payload is None else context_payload
         context_metadata = QueryMetadata(repl_context)
+        prompt_variant = self.config.prompt_variant
+        if (
+            self.config.recursive_cap_prompt_variant is not None
+            and depth >= max_depth
+        ):
+            prompt_variant = self.config.recursive_cap_prompt_variant
         return [
             {
                 "role": "system",
                 "content": build_system_prompt(
                     depth=depth,
                     max_depth=max_depth,
-                    prompt_variant=self.config.prompt_variant,
+                    prompt_variant=prompt_variant,
                     max_prompt_tokens=self.config.max_prompt_tokens,
                     turn_max_tokens=self.config.turn_max_tokens,
                     subcall_max_tokens=self.config.subcall_max_tokens,

@@ -201,6 +201,7 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             subcall_budget_enabled=self.runtime_config.subcall_budget_enabled,
             max_total_subcalls=self.runtime_config.max_total_subcalls,
             max_batched_subcalls=self.runtime_config.max_batched_subcalls,
+            include_budget_reminder=self.runtime_config.include_budget_reminder,
         )
         write_live_trace(state, event="setup_state")
         state["_root_repl"] = create_repl(
@@ -417,6 +418,7 @@ def load_environment(
     repl_timeout_seconds: float | None = None,
     repl_fast_timeout_seconds: float | None = None,
     recursive_rlm_batch_mode: str = "serial",
+    recursive_cap_prompt_variant: str | None = None,
 ) -> vf.Environment:
     if max_iterations < 1:
         raise ValueError("max_iterations must be >= 1")
@@ -448,6 +450,8 @@ def load_environment(
         raise ValueError("temperature must be >= 0.0")
     if prompt_variant not in PROMPT_VARIANTS:
         raise ValueError(f"prompt_variant must be one of {sorted(PROMPT_VARIANTS)}")
+    if recursive_cap_prompt_variant is not None and recursive_cap_prompt_variant not in PROMPT_VARIANTS:
+        raise ValueError(f"recursive_cap_prompt_variant must be one of {sorted(PROMPT_VARIANTS)}")
     valid_efficiency_penalty_modes = {"static_per_1k", "adaptive_group"}
     if efficiency_penalty_mode not in valid_efficiency_penalty_modes:
         raise ValueError(f"efficiency_penalty_mode must be one of {sorted(valid_efficiency_penalty_modes)}")
@@ -580,6 +584,7 @@ def load_environment(
         max_batched_subcalls=max_batched_subcalls,
         include_budget_reminder=include_budget_reminder,
         recursive_rlm_batch_mode=recursive_rlm_batch_mode,
+        recursive_cap_prompt_variant=recursive_cap_prompt_variant,
     )
     system_prompt = build_system_prompt(
         depth=0,

@@ -1,6 +1,11 @@
 import torch
 import torch.distributed as dist
-from ring_flash_attn import update_ring_flash_attn_params
+
+
+def _update_ring_flash_attn_params(cu_seqlens: torch.Tensor, cp_group: dist.ProcessGroup) -> None:
+    from ring_flash_attn import update_ring_flash_attn_params
+
+    update_ring_flash_attn_params(cu_seqlens, cp_group)
 
 
 def shard_for_cp(t: torch.Tensor, cp_rank: int, cp_world_size: int) -> torch.Tensor:
@@ -83,7 +88,7 @@ def setup_cp_params(
     input_ids = shard_for_cp(input_ids, cp_rank=cp_rank, cp_world_size=cp_world_size)
 
     cu_seqlens = _get_cu_seqlens_for_cp(position_ids)
-    update_ring_flash_attn_params(cu_seqlens, cp_group)
+    _update_ring_flash_attn_params(cu_seqlens, cp_group)
     position_ids = shard_for_cp(position_ids, cp_rank=cp_rank, cp_world_size=cp_world_size)
     return (
         input_ids,

@@ -1,13 +1,62 @@
 from __future__ import annotations
 
+import ast
+import re
 from typing import Any
 
 from rlm.core.types import CodeBlock, QueryMetadata, RLMChatCompletion, RLMIteration, UsageSummary
 from rlm.environments.local_repl import LocalREPL
-from rlm.utils.parsing import find_code_blocks, find_final_answer, format_iteration
+from rlm.utils.parsing import find_code_blocks, format_iteration
 from rlm.utils.prompts import build_rlm_system_prompt, build_user_prompt
 
 from .prompt_variants import DEFAULT_PROMPT_VARIANT, get_system_prompt_template
+
+_FINAL_CALL_RE = re.compile(r"FINAL\((.*?)\)", re.DOTALL)
+_FINAL_VAR_CALL_RE = re.compile(r"FINAL_VAR\((.*?)\)", re.DOTALL)
+
+
+def _literal_final_value(raw: str) -> str:
+    raw = raw.strip()
+    if not raw:
+        return ""
+    try:
+        value = ast.literal_eval(raw)
+    except (SyntaxError, ValueError):
+        return raw.strip().strip("\"'")
+    return str(value)
+
+
+def _lookup_repl_var(environment: Any, name: str) -> Any | None:
+    for attr in ("locals", "globals", "vars", "variables", "state"):
+        namespace = getattr(environment, attr, None)
+        if isinstance(namespace, dict) and name in namespace:
+            return namespace[name]
+    repl = getattr(environment, "repl", None)
+    if repl is not None and repl is not environment:
+        return _lookup_repl_var(repl, name)
+    return None
+
+
+def find_final_answer(text: str, environment: Any | None = None) -> str | None:
+    """Compatibility parser for rlms versions without find_final_answer."""
+    if not text:
+        return None
+    var_matches = list(_FINAL_VAR_CALL_RE.finditer(text))
+    if var_matches:
+        raw_name = var_matches[-1].group(1).strip()
+        try:
+            name = ast.literal_eval(raw_name)
+        except (SyntaxError, ValueError):
+            name = raw_name.strip().strip("\"'")
+        if isinstance(name, str) and name and environment is not None:
+            value = _lookup_repl_var(environment, name)
+            if value is not None:
+                return str(value)
+        return None
+    matches = list(_FINAL_CALL_RE.finditer(text))
+    if not matches:
+        return None
+    return _literal_final_value(matches[-1].group(1))
 
 
 def append_budget_reminder(

@@ -223,6 +223,21 @@ def _mean(series: pd.Series) -> float:
     return float(values.mean()) if len(values) else math.nan
 
 
+def _pass_at_k(values: list[float], k: int) -> float:
+    n = len(values)
+    if n <= 0:
+        return math.nan
+    correct = sum(1 for value in values if value > 0)
+    if k <= 1:
+        return correct / n
+    if correct <= 0:
+        return 0.0
+    incorrect = n - correct
+    if incorrect < k:
+        return 1.0
+    return 1.0 - math.comb(incorrect, k) / math.comb(n, k)
+
+
 def _summaries(frame: pd.DataFrame, group_cols: list[str], rollouts_per_example: int) -> pd.DataFrame:
     rows = []
     for key, group in frame.groupby(group_cols, dropna=False):
@@ -233,7 +248,7 @@ def _summaries(frame: pd.DataFrame, group_cols: list[str], rollouts_per_example:
         row = dict(zip(group_cols, key, strict=False))
         pass_values = {}
         for k in (1, 5, rollouts_per_example):
-            pass_values[f"pass@{k}"] = float(per_example.map(lambda values, kk=k: any(v > 0 for v in values[:kk])).mean())
+            pass_values[f"pass@{k}"] = float(per_example.map(lambda values, kk=k: _pass_at_k(values, kk)).mean())
         complete = per_example.map(lambda values: len(values) >= rollouts_per_example)
         row.update(
             {

@@ -237,9 +237,16 @@ def rl_local(config: RLConfig):
         # Optionally, start inference process(es)
         if config.inference:
             inference_config_paths = [Path(INFERENCE_TOML), *extra_inference_config_paths]
-            tp = config.inference.parallel.tp
+            if len(infer_gpu_ids) % len(inference_config_paths) != 0:
+                raise RuntimeError(
+                    f"Cannot evenly assign inference GPUs {infer_gpu_ids} across "
+                    f"{len(inference_config_paths)} inference server config(s)."
+                )
+            gpus_per_inference_server = len(infer_gpu_ids) // len(inference_config_paths)
             for server_idx, inference_config_path in enumerate(inference_config_paths):
-                server_gpu_ids = infer_gpu_ids[server_idx * tp : (server_idx + 1) * tp]
+                server_gpu_ids = infer_gpu_ids[
+                    server_idx * gpus_per_inference_server : (server_idx + 1) * gpus_per_inference_server
+                ]
                 if not server_gpu_ids:
                     raise RuntimeError(
                         f"No GPU IDs available for inference server {server_idx}; "

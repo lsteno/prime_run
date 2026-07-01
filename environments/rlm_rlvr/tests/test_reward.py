@@ -8,8 +8,10 @@ from rlm_rlvr.reward import (
     _adaptive_beta_for_solve_rate,
     _efficiency_penalty_from_state,
     _extract_message_text,
+    _extract_pair_set,
     _is_exact_match,
     _parse_binary_judge_score,
+    _score_oolong_pairs,
     _segment_rollout_token_breakdown,
     _segment_rollout_token_totals,
     build_rubric,
@@ -23,6 +25,60 @@ def test_is_exact_match_handles_numeric_normalization() -> None:
 
 def test_is_exact_match_handles_json_normalization() -> None:
     assert _is_exact_match('{"b": 2, "a": 1}', ['{"a":1,"b":2}'])
+
+
+def test_oolong_pairs_scoring_uses_set_f1() -> None:
+    gold = ['["(1, 2)","(3, 4)","(5, 6)"]']
+    score, raw, stats = _score_oolong_pairs("FINAL('(2, 1), (3, 4), (9, 10)')", gold)
+
+    assert raw == "[oolong_pairs_f1]"
+    assert _extract_pair_set("(2, 1)") == {("1", "2")}
+    assert score == 2 / 3
+    assert stats["precision"] == 2 / 3
+    assert stats["recall"] == 2 / 3
+
+
+def test_oolong_pairs_rubric_skips_llm_judge(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    async def _judge_should_not_run(*args, **kwargs):
+        raise AssertionError("Oolong-Pairs should use deterministic pair F1")
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    monkeypatch.setattr(reward_module, "_call_binary_judge", _judge_should_not_run)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+    )
+    reward_fn = rubric.funcs[0]
+    state = {
+        "final_answer": "(1, 2), (3, 4)",
+        "efficiency_penalty_coef": 0.0,
+        "rlm_segments": [],
+        "trajectory": [],
+    }
+
+    score = asyncio.run(
+        reward_fn(
+            state,
+            [],
+            '["(1, 2)","(3, 4)","(5, 6)"]',
+            {
+                "question": "List pairs.",
+                "dataset_name": "oolong_pairs",
+                "answer_type": "list_of_answers",
+                "acceptable_answers": ['["(1, 2)","(3, 4)","(5, 6)"]'],
+            },
+        )
+    )
+
+    assert score == 0.8
+    assert state["reward_correctness"] == 0.8
+    assert state["judge_raw_response"] == "[oolong_pairs_f1]"
+    assert state["oolong_pairs_f1"] == 0.8
 
 
 def test_extract_message_text_falls_back_to_reasoning() -> None:

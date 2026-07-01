@@ -24,10 +24,10 @@ MODEL_LABELS = {
     "lora_r4_lr1em4": "LoRA r4, lr 1e-4",
     "lora_r16_lr1em4": "LoRA r16, lr 1e-4",
     "lora_r64_lr1em5": "LoRA r64, lr 1e-5",
-    "fullft": "Full fine-tune, lr 5e-6",
+    "fullft": "Full fine-tune, lr 1e-5",
 }
 DATASET_LABELS = {
-    "frames": "Deep search",
+    "frames": "Deep research",
     "oolong": "Aggregation",
     "longcodeu": "Long code understanding",
 }
@@ -103,6 +103,19 @@ def mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else math.nan
 
 
+def pass_at_k(correct_count: int, total_count: int, k: int) -> float:
+    if total_count <= 0:
+        return math.nan
+    if k <= 1:
+        return correct_count / total_count
+    if correct_count <= 0:
+        return 0.0
+    incorrect_count = total_count - correct_count
+    if incorrect_count < k:
+        return 1.0
+    return 1.0 - math.comb(incorrect_count, k) / math.comb(total_count, k)
+
+
 def load_rows(path: Path) -> dict[str, dict[str, list[dict[str, Any]]]]:
     rows: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     with path.open(newline="", encoding="utf-8") as handle:
@@ -154,13 +167,14 @@ def build_example_metrics(
         for source_id, rollouts in by_source.items():
             ordered = sorted(rollouts, key=lambda item: (item["rollout_index"], item["row_order"]))
             correctness = [float(item["correct"]) for item in ordered]
+            correct_count = sum(1 for value in correctness[:rollouts_per_example] if value > 0)
             tokens = [float(item["cost_total_tokens"]) for item in ordered]
             llm_calls = [float(item["num_llm_subcalls"]) for item in ordered]
             per_model[model][source_id] = {
                 "dataset": ordered[0]["dataset"],
-                "pass@1": 1.0 if any(value > 0 for value in correctness[:1]) else 0.0,
-                "pass@5": 1.0 if any(value > 0 for value in correctness[: min(5, rollouts_per_example)]) else 0.0,
-                "pass@10": 1.0 if any(value > 0 for value in correctness[:rollouts_per_example]) else 0.0,
+                "pass@1": pass_at_k(correct_count, rollouts_per_example, 1),
+                "pass@5": pass_at_k(correct_count, rollouts_per_example, 5),
+                "pass@10": pass_at_k(correct_count, rollouts_per_example, rollouts_per_example),
                 "avg_correct": mean(correctness[:rollouts_per_example]),
                 "mean_tokens": mean(tokens),
                 "mean_llm_calls": mean(llm_calls),
