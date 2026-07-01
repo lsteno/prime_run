@@ -61,6 +61,7 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             "num_subcalls": int(state.get("num_subcalls", 0)),
             "num_llm_subcalls": int(state.get("num_llm_subcalls", 0)),
             "num_rlm_subcalls": int(state.get("num_rlm_subcalls", 0)),
+            "llm_subcall_session_source": state.get("llm_subcall_session_source"),
             "subcall_budget_enabled": bool(state.get("subcall_budget_enabled", False)),
             "subcall_budget_total": int(state.get("subcall_budget_total", 0)),
             "subcall_budget_remaining": int(state.get("subcall_budget_remaining", 0)),
@@ -154,6 +155,7 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             enable_vllm_extra_body=self.runtime_config.inference_mode == "local",
         )
         if self.runtime_config.llm_subcall_model is not None:
+            state["llm_subcall_session_source"] = self.runtime_config.llm_subcall_provider
             if self.runtime_config.llm_subcall_provider == "vertex":
                 if not self.runtime_config.llm_subcall_vertex_project:
                     raise ValueError("llm_subcall_vertex_project is required when llm_subcall_provider='vertex'")
@@ -182,6 +184,7 @@ class RLMRLVREnv(vf.MultiTurnEnv):
                 )
         else:
             state["_plain_llm_session"] = state["_sync_session"]
+            state["llm_subcall_session_source"] = "root_policy"
         state["_runtime"] = RecursiveRuntime(state, self.runtime_config)
         info = state.get("info") or {}
         state["_root_context"] = info.get("context", "")
@@ -376,6 +379,7 @@ def load_environment(
     subcall_budget_enabled: bool = False,
     max_total_subcalls: int = 80,
     max_batched_subcalls: int = 80,
+    subcall_batch_max_workers: int | None = None,
     include_budget_reminder: bool = True,
     efficiency_penalty_coef: float = 0.02,
     inference_mode: str = "hosted",
@@ -434,6 +438,8 @@ def load_environment(
         raise ValueError("max_total_subcalls must be >= 1")
     if max_batched_subcalls < 1:
         raise ValueError("max_batched_subcalls must be >= 1")
+    if subcall_batch_max_workers is not None and subcall_batch_max_workers < 1:
+        raise ValueError("subcall_batch_max_workers must be >= 1 when set")
     if llm_subcall_empty_response_max_attempts < 1:
         raise ValueError("llm_subcall_empty_response_max_attempts must be >= 1")
     if llm_subcall_empty_response_base_retry_seconds < 0:
@@ -582,6 +588,7 @@ def load_environment(
         subcall_budget_enabled=subcall_budget_enabled,
         max_total_subcalls=max_total_subcalls,
         max_batched_subcalls=max_batched_subcalls,
+        subcall_batch_max_workers=subcall_batch_max_workers,
         include_budget_reminder=include_budget_reminder,
         recursive_rlm_batch_mode=recursive_rlm_batch_mode,
         recursive_cap_prompt_variant=recursive_cap_prompt_variant,

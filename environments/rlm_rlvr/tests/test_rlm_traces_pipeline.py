@@ -175,7 +175,7 @@ def test_trace_pipeline_creates_separate_vertex_plain_subcall_session(monkeypatc
     )
     subcall_config = trace_run.PlainSubcallConfig(
         provider="vertex",
-        model="gemini-3.1-flash-lite",
+        model="gemini-3-flash-preview",
         vertex_project="test-project",
         vertex_location="global",
         thinking_level="medium",
@@ -189,7 +189,7 @@ def test_trace_pipeline_creates_separate_vertex_plain_subcall_session(monkeypatc
     )
 
     assert captured == {
-        "model_name": "gemini-3.1-flash-lite",
+        "model_name": "gemini-3-flash-preview",
         "project": "test-project",
         "location": "global",
         "tokenizer_name": "Qwen/Qwen3-4B-Instruct-2507",
@@ -199,8 +199,77 @@ def test_trace_pipeline_creates_separate_vertex_plain_subcall_session(monkeypatc
         "empty_response_base_retry_seconds": 1.0,
         "empty_response_max_retry_seconds": 30.0,
     }
-    assert state["_plain_llm_session"].model_name == "gemini-3.1-flash-lite"
+    assert state["_plain_llm_session"].model_name == "gemini-3-flash-preview"
     assert state["_sync_session"].model_name == "openai/gpt-5.4"
+
+
+def test_trace_pipeline_reuses_root_policy_when_plain_subcall_config_is_absent(monkeypatch) -> None:
+    vertex_calls: list[dict[str, object]] = []
+
+    class _FakeSession:
+        def __init__(self, **kwargs) -> None:
+            self.model_name = kwargs["model_name"]
+
+    class _FakeVertexSession:
+        def __init__(self, **kwargs) -> None:
+            vertex_calls.append(kwargs)
+            self.model_name = kwargs["model_name"]
+
+    class _FakeRuntime:
+        def __init__(self, state, config) -> None:
+            self.state = state
+            self.config = config
+
+        def _plain_query(self, *args, **kwargs):
+            return {}
+
+        def _recursive_query(self, *args, **kwargs):
+            return {}
+
+        def run_plain_query_batch(self, prompts, **kwargs):
+            return []
+
+        def run_recursive_query_batch(self, prompts, **kwargs):
+            return []
+
+    fake_modules = {
+        "SyncInferenceSession": _FakeSession,
+        "VertexGeminiSession": _FakeVertexSession,
+        "RecursiveRuntime": _FakeRuntime,
+        "create_repl": lambda **kwargs: SimpleNamespace(kwargs=kwargs),
+    }
+    monkeypatch.setattr(trace_run, "load_rlm_modules", lambda: fake_modules)
+
+    runtime_config = SimpleNamespace(
+        max_depth=0,
+        temperature=0.7,
+        tokenizer_name="Qwen/Qwen3-4B-Instruct-2507",
+        max_prompt_tokens=200000,
+        repl_backend="local",
+        repl_backend_kwargs=None,
+        subcall_budget_enabled=True,
+        max_total_subcalls=60,
+        max_batched_subcalls=60,
+    )
+    endpoint = trace_run.EndpointConfig(
+        endpoint_id=None,
+        model="openai/gpt-5.4",
+        url="https://api.pinference.ai/api/v1",
+        api_key_env="PRIME_API_KEY",
+        api_key="prime-test-key",
+    )
+
+    state, *_ = trace_run.init_state(
+        endpoint=endpoint,
+        runtime_config=runtime_config,
+        plain_subcall_config=None,
+        disable_recursive_subcalls=True,
+    )
+
+    assert vertex_calls == []
+    assert state["_plain_llm_session"] is state["_sync_session"]
+    assert state["_plain_llm_session"].model_name == "openai/gpt-5.4"
+    assert state["llm_subcall_session_source"] == "root_policy"
 
 
 def test_load_examples_can_pin_source_ids(monkeypatch) -> None:
@@ -990,7 +1059,7 @@ def test_missing_trace_driver_renders_gpt54_vertex_config(tmp_path) -> None:
         },
         llm_subcall_cfg={
             "provider": "vertex",
-            "model": "gemini-3.1-flash-lite",
+            "model": "gemini-3-flash-preview",
             "vertex_project_env": "GOOGLE_CLOUD_PROJECT",
             "vertex_location": "global",
             "thinking_level": "medium",
@@ -1035,6 +1104,55 @@ def test_missing_trace_driver_renders_gpt54_vertex_config(tmp_path) -> None:
     assert parsed["judge"]["model"] == "gemini-3-flash-preview"
     assert parsed["max_workers"] == 6
     assert parsed["worker_backend"] == "process"
+
+
+def test_missing_trace_driver_omits_llm_subcall_section_for_same_root_mode(tmp_path) -> None:
+    rendered = run_missing_with_retry.render_trace_config(
+        run_name="run-a",
+        output_dir=tmp_path,
+        endpoints_path="configs/endpoints.toml",
+        model_cfg={
+            "model": "openai/gpt-5.4",
+            "url": "https://api.pinference.ai/api/v1",
+            "api_key_env": "PRIME_API_KEY",
+            "extra_body": {"reasoning": {"enabled": False}},
+        },
+        llm_subcall_cfg=None,
+        dataset_cfg={"dataset_id": "lsteno/BEEG-agents", "split": "sft_traces", "seed": 42},
+        rollout_cfg={
+            "prompt_variants": ["sanjaya_text_depth1_llm_only_v1"],
+            "max_iterations": 15,
+            "max_depth": 1,
+            "disable_recursive_subcalls": True,
+            "turn_max_tokens": 4096,
+            "subcall_max_tokens": 4096,
+            "max_prompt_tokens": 2000000,
+            "max_total_subcalls": 80,
+            "max_batched_subcalls": 80,
+            "subcall_batch_max_workers": 2,
+            "include_budget_reminder": False,
+            "tokenizer_name": "Qwen/Qwen3-4B-Instruct-2507",
+        },
+        judge_cfg={
+            "enabled": True,
+            "provider": "vertex",
+            "model": "gemini-3-flash-preview",
+            "vertex_project_env": "GOOGLE_CLOUD_PROJECT",
+            "vertex_location": "global",
+            "thinking_level": "medium",
+        },
+        source_ids=["source-a"],
+        max_workers=2,
+        worker_backend="process",
+        resume=True,
+    )
+    parsed_path = tmp_path / "config.toml"
+    parsed_path.write_text(rendered)
+    parsed = trace_run.load_toml(parsed_path)
+
+    assert "llm_subcall" not in parsed
+    assert parsed["rollout"]["subcall_batch_max_workers"] == 2
+    assert parsed["judge"]["provider"] == "vertex"
 
 
 def test_worker_error_record_does_not_mark_success() -> None:
@@ -1089,7 +1207,7 @@ def test_run_rollout_worker_is_spawn_picklable() -> None:
     )
     plain_subcall = trace_run.PlainSubcallConfig(
         provider="vertex",
-        model="gemini-3.1-flash-lite",
+        model="gemini-3-flash-preview",
         vertex_project=None,
     )
     runtime_payload = {

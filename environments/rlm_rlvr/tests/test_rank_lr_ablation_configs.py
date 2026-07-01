@@ -118,9 +118,7 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert row["cp"] == "2"
         assert row["max_total_subcalls"] == "50"
         assert row["max_batched_subcalls"] == "50"
-        assert row["llm_subcall_empty_response_max_attempts"] == "3"
-        assert row["llm_subcall_empty_response_base_retry_seconds"] == "1.0"
-        assert row["llm_subcall_empty_response_max_retry_seconds"] == "10.0"
+        assert row["subcall_batch_max_workers"] == "2"
         assert row["adaptive_efficiency_beta_max"] == "0.15"
         assert row["adaptive_efficiency_gamma"] == "1.0"
         assert row["adaptive_efficiency_solve_rate_floor"] == "0.25"
@@ -159,12 +157,16 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert config["orchestrator"]["env"][0]["args"]["max_batched_subcalls"] == 50
         assert config["orchestrator"]["eval"]["env"][0]["args"]["max_total_subcalls"] == 50
         assert config["orchestrator"]["eval"]["env"][0]["args"]["max_batched_subcalls"] == 50
-        assert config["orchestrator"]["env"][0]["args"]["llm_subcall_empty_response_max_attempts"] == 3
-        assert config["orchestrator"]["env"][0]["args"]["llm_subcall_empty_response_base_retry_seconds"] == 1.0
-        assert config["orchestrator"]["env"][0]["args"]["llm_subcall_empty_response_max_retry_seconds"] == 10.0
-        assert config["orchestrator"]["eval"]["env"][0]["args"]["llm_subcall_empty_response_max_attempts"] == 3
-        assert config["orchestrator"]["eval"]["env"][0]["args"]["llm_subcall_empty_response_base_retry_seconds"] == 1.0
-        assert config["orchestrator"]["eval"]["env"][0]["args"]["llm_subcall_empty_response_max_retry_seconds"] == 10.0
+        for args in (config["orchestrator"]["env"][0]["args"], config["orchestrator"]["eval"]["env"][0]["args"]):
+            assert args["subcall_batch_max_workers"] == 2
+            assert "llm_subcall_provider" not in args
+            assert "llm_subcall_model" not in args
+            assert "llm_subcall_vertex_project_env" not in args
+            assert "llm_subcall_vertex_location" not in args
+            assert "llm_subcall_thinking_level" not in args
+            assert "llm_subcall_empty_response_max_attempts" not in args
+            assert "llm_subcall_empty_response_base_retry_seconds" not in args
+            assert "llm_subcall_empty_response_max_retry_seconds" not in args
         assert config["orchestrator"]["env"][0]["args"]["max_turn_penalty_enabled"] is True
         assert config["orchestrator"]["env"][0]["args"]["max_turn_penalty"] == 0.25
         assert config["orchestrator"]["env"][0]["args"]["missing_final_at_max_turn_zero_reward"] is True
@@ -225,6 +227,11 @@ def test_full_ft_pilot_config_removes_lora_and_uses_nccl_broadcast() -> None:
     assert train_args["max_turn_penalty_enabled"] is True
     assert train_args["missing_final_at_max_turn_zero_reward"] is True
     assert eval_args["efficiency_penalty_applies_to"] == "correct_only"
+    for args in (train_args, eval_args):
+        assert args["subcall_batch_max_workers"] == 2
+        assert "llm_subcall_provider" not in args
+        assert "llm_subcall_model" not in args
+        assert "llm_subcall_vertex_project_env" not in args
 
     inference = config["inference"]
     assert "max_loras" not in inference

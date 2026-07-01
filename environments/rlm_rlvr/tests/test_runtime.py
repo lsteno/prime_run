@@ -373,7 +373,7 @@ def test_vertex_generate_uses_usage_metadata_and_includes_thinking_tokens(monkey
             )
 
     session = object.__new__(VertexGeminiSession)
-    session.model_name = "gemini-3.1-flash-lite"
+    session.model_name = "gemini-3-flash-preview"
     session.client = SimpleNamespace(models=_FakeModels())
     session.tokenizer = _FakeTokenizer()
     session.thinking_level = "medium"
@@ -392,7 +392,7 @@ def test_vertex_generate_uses_usage_metadata_and_includes_thinking_tokens(monkey
     assert payload.prompt_token_count == 17
     assert payload.completion_token_count == 14
     call = session.client.models.calls[0]
-    assert call["model"] == "gemini-3.1-flash-lite"
+    assert call["model"] == "gemini-3-flash-preview"
     assert call["config"].kwargs["thinking_config"].thinking_level == "medium"
 
 
@@ -439,7 +439,7 @@ def test_vertex_plain_subcall_retries_transient_errors(monkeypatch) -> None:
             )
 
     session = object.__new__(VertexGeminiSession)
-    session.model_name = "gemini-3.1-flash-lite"
+    session.model_name = "gemini-3-flash-preview"
     session.client = SimpleNamespace(models=_FakeModels())
     session.tokenizer = _FakeTokenizer()
     session.thinking_level = "medium"
@@ -487,7 +487,7 @@ def test_vertex_generate_falls_back_to_tokenizer_counts_when_usage_is_missing(mo
             return SimpleNamespace(text="ok")
 
     session = object.__new__(VertexGeminiSession)
-    session.model_name = "gemini-3.1-flash-lite"
+    session.model_name = "gemini-3-flash-preview"
     session.client = SimpleNamespace(models=_FakeModels())
     session.tokenizer = _FakeTokenizer()
     session.thinking_level = "medium"
@@ -540,7 +540,7 @@ def test_vertex_generate_retries_empty_responses(monkeypatch) -> None:
             return SimpleNamespace(text="ok", usage_metadata=SimpleNamespace(prompt_token_count=6, total_token_count=10))
 
     session = object.__new__(VertexGeminiSession)
-    session.model_name = "gemini-3.1-flash-lite"
+    session.model_name = "gemini-3-flash-preview"
     session.client = SimpleNamespace(models=_FakeModels())
     session.tokenizer = _FakeTokenizer()
     session.thinking_level = "medium"
@@ -601,7 +601,7 @@ def test_vertex_generate_marks_empty_response_exhaustion(monkeypatch) -> None:
             return SimpleNamespace(text="")
 
     session = object.__new__(VertexGeminiSession)
-    session.model_name = "gemini-3.1-flash-lite"
+    session.model_name = "gemini-3-flash-preview"
     session.client = SimpleNamespace(models=_FakeModels())
     session.tokenizer = _FakeTokenizer()
     session.thinking_level = "medium"
@@ -666,7 +666,7 @@ def test_setup_state_creates_separate_vertex_plain_llm_session(monkeypatch) -> N
     environment.runtime_config = RuntimeConfig(
         prompt_variant=DEFAULT_PROMPT_VARIANT,
         llm_subcall_provider="vertex",
-        llm_subcall_model="gemini-3.1-flash-lite",
+        llm_subcall_model="gemini-3-flash-preview",
         llm_subcall_vertex_project="test-project",
         llm_subcall_vertex_location="global",
         llm_subcall_thinking_level="medium",
@@ -690,11 +690,40 @@ def test_setup_state_creates_separate_vertex_plain_llm_session(monkeypatch) -> N
     assert plain_session is not local_session
     assert local_session.kwargs["model_name"] == "local-training-model"
     assert local_session.kwargs["enable_vllm_extra_body"] is False
-    assert plain_session.kwargs["model_name"] == "gemini-3.1-flash-lite"
+    assert plain_session.kwargs["model_name"] == "gemini-3-flash-preview"
     assert plain_session.kwargs["project"] == "test-project"
     assert plain_session.kwargs["location"] == "global"
     assert plain_session.kwargs["thinking_level"] == "medium"
     assert plain_session.kwargs["empty_response_max_attempts"] == 3
+
+
+def test_setup_state_reuses_root_policy_for_plain_llm_subcalls_by_default(monkeypatch) -> None:
+    import rlm_rlvr.env as env_module
+
+    monkeypatch.setattr(env_module, "SyncInferenceSession", _FakeSyncInferenceSession)
+    monkeypatch.setattr(env_module, "VertexGeminiSession", _FakeVertexGeminiSession)
+    environment = object.__new__(RLMRLVREnv)
+    environment.runtime_config = RuntimeConfig(
+        prompt_variant=DEFAULT_PROMPT_VARIANT,
+        llm_subcall_provider="vertex",
+        llm_subcall_model=None,
+    )
+    environment.efficiency_penalty_coef = 0.02
+    state = {
+        "client": AsyncOpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY"),
+        "model": "local-training-model",
+        "info": {
+            "context": "alpha beta gamma",
+            "question": "What is in the context?",
+        },
+        "sampling_args": {},
+    }
+
+    updated = asyncio.run(environment.setup_state(state))
+
+    assert updated["_plain_llm_session"] is updated["_sync_session"]
+    assert updated["_plain_llm_session"].kwargs["model_name"] == "local-training-model"
+    assert updated["llm_subcall_session_source"] == "root_policy"
 
 
 def test_setup_state_enables_retries_for_openai_compatible_plain_llm_session(monkeypatch) -> None:
@@ -1073,6 +1102,17 @@ def test_plain_query_batch_runs_in_parallel() -> None:
         "response:gamma",
     ]
     assert elapsed < 0.13
+
+
+def test_subcall_batch_max_workers_caps_requested_parallelism() -> None:
+    runtime = RecursiveRuntime(
+        _runtime_state(_sync_session=SimpleNamespace(model_name="fake-model")),
+        RuntimeConfig(max_prompt_tokens=4096, live_trace_dir=None, subcall_batch_max_workers=2),
+    )
+
+    assert runtime.batch_max_workers(8) == 2
+    assert runtime.batch_max_workers(8, requested_max_workers=6) == 2
+    assert runtime.batch_max_workers(1, requested_max_workers=6) == 1
 
 
 def test_recursive_query_batch_runs_serially_by_default() -> None:
@@ -1706,7 +1746,7 @@ def test_plain_query_uses_vertex_session_and_recursive_query_uses_local_session(
             )
 
     local_session = _LabeledSession("local-training-model", "FINAL(local)")
-    vertex_session = _LabeledSession("gemini-3.1-flash-lite", "plain answer")
+    vertex_session = _LabeledSession("gemini-3-flash-preview", "plain answer")
     state = _runtime_state(
         _sync_session=local_session,
         _plain_llm_session=vertex_session,
@@ -1727,7 +1767,7 @@ def test_plain_query_uses_vertex_session_and_recursive_query_uses_local_session(
     plain_result = runtime._plain_query("solve directly")
     recursive_result = runtime._recursive_query("solve recursively")
 
-    assert plain_result["model"] == "gemini-3.1-flash-lite"
+    assert plain_result["model"] == "gemini-3-flash-preview"
     assert recursive_result["model"] == "local-training-model"
     assert vertex_session.calls == 1
     assert local_session.calls == 1

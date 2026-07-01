@@ -71,6 +71,7 @@ Notes:
 | `prompt_variant` | `str` | `"sanjaya_text_v1"` | System prompt variant. Supported values: `sanjaya_text_v1`, `default` where `default` is a compatibility alias |
 | `live_trace_dir` | `str \| null` | `"outputs/rlm_rlvr/live_traces"` | Directory for compact per-sample live traces updated after root and recursive steps. Set to `null` to disable |
 | `subcall_prompt_limit_ratio` | `float` | `0.85` | Blocks `llm_query*` and `rlm_query*` prompts whose estimated character size exceeds this fraction of the configured subcall context window, returning a REPL-visible error instead of truncating context |
+| `subcall_batch_max_workers` | `int \| null` | `null` | Optional cap for concurrent `llm_query_batched` and threaded recursive subcalls. Same-root local RL configs set this low, usually `2`, to protect the rollout inference server |
 | `efficiency_penalty_mode` | `str` | `"static_per_1k"` | Reward shaping mode. Use `"static_per_1k"` for backward-compatible per-1k-token penalty or `"adaptive_group"` for solve-rate-aware group scoring |
 | `efficiency_penalty_coef` | `float` | `0.02` | Static-mode cost-aware shaping coefficient applied only to correct answers. Incorrect/no-answer rollouts receive `0`; correct rollouts receive `max(0, 1 - efficiency_penalty_coef * total_tokens / 1000)` |
 | `adaptive_efficiency_beta_max` | `float` | `0.05` | Maximum adaptive cost coefficient in group mode |
@@ -83,8 +84,8 @@ Notes:
 | `inference_mode` | `str` | `"hosted"` | Inference routing mode. Use `hosted` for managed hosted training and `local` for self-managed `prime-rl` on local or on-demand GPUs |
 | `inference_base_url` | `str \| null` | `null` | Override the OpenAI-compatible inference endpoint. Usually unset for self-managed `prime-rl`, which wires the local inference server automatically |
 | `inference_api_key` | `str \| null` | `null` | Override API key for the inference endpoint. Usually unset for self-managed `prime-rl` local inference |
-| `llm_subcall_provider` | `str` | `"openai_compatible"` | Provider for plain non-trainable `llm_query*` calls. Use `"vertex"` for Vertex AI Gemini |
-| `llm_subcall_model` | `str \| null` | `null` | Optional separate model for plain `llm_query*` calls; `null` reuses the rollout endpoint |
+| `llm_subcall_provider` | `str` | `"openai_compatible"` | Provider for optional separate plain non-trainable `llm_query*` calls. Ignored when `llm_subcall_model` is `null` |
+| `llm_subcall_model` | `str \| null` | `null` | Optional separate model for plain `llm_query*` calls. `null` is the intended default and reuses the root rollout policy endpoint |
 | `llm_subcall_vertex_project_env` | `str` | `"GOOGLE_CLOUD_PROJECT"` | Environment variable that stores the Vertex project for plain subcalls |
 | `llm_subcall_vertex_location` | `str \| null` | `"global"` | Vertex location for plain subcalls. Active Gemini 3 configs use `global` |
 | `llm_subcall_thinking_level` | `str \| null` | `"medium"` | Gemini thinking level for plain Vertex subcalls |

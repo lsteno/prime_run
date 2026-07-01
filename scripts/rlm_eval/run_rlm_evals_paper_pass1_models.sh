@@ -209,7 +209,7 @@ PY
 import os
 from google import genai
 client = genai.Client(vertexai=True, project=os.environ["GOOGLE_CLOUD_PROJECT"], location="global")
-resp = client.models.generate_content(model="gemini-3.1-flash-lite", contents="Return OK.")
+resp = client.models.generate_content(model="gemini-3-flash-preview", contents="Return OK.")
 text = getattr(resp, "text", "") or ""
 if not text.strip():
     raise SystemExit("empty Vertex response")
@@ -338,18 +338,11 @@ payload = {
     "subcall_budget_enabled": True,
     "max_total_subcalls": 50,
     "max_batched_subcalls": 50,
+    "subcall_batch_max_workers": 2,
     "tokenizer_name": "Qwen/Qwen3-4B-Instruct-2507",
     "inference_mode": "local",
     "inference_base_url": f"http://localhost:{port}/v1",
     "inference_api_key": "local-vllm",
-    "llm_subcall_provider": "vertex",
-    "llm_subcall_model": "gemini-3.1-flash-lite",
-    "llm_subcall_vertex_project_env": "GOOGLE_CLOUD_PROJECT",
-    "llm_subcall_vertex_location": "global",
-    "llm_subcall_thinking_level": "medium",
-    "llm_subcall_empty_response_max_attempts": 3,
-    "llm_subcall_empty_response_base_retry_seconds": 1.0,
-    "llm_subcall_empty_response_max_retry_seconds": 10.0,
     "repl_backend": "local",
     "repl_timeout_seconds": 300,
     "repl_fast_timeout_seconds": 30,

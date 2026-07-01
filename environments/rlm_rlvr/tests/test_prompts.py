@@ -201,7 +201,7 @@ def test_initial_messages_include_system_context_metadata_and_question() -> None
     assert "What is in the context?" in messages[2]["content"]
 
 
-def test_safer_8xa100_config_reduces_rollout_pressure_and_routes_api_calls_to_vertex() -> None:
+def test_safer_8xa100_config_reduces_rollout_pressure_and_uses_root_policy_subcalls() -> None:
     config_path = (
         Path(__file__).resolve().parents[3]
         / "configs"
@@ -216,20 +216,20 @@ def test_safer_8xa100_config_reduces_rollout_pressure_and_routes_api_calls_to_ve
     assert config["orchestrator"]["env"][0]["args"]["subcall_budget_enabled"] is True
     assert config["orchestrator"]["env"][0]["args"]["max_total_subcalls"] == 80
     assert config["orchestrator"]["env"][0]["args"]["max_batched_subcalls"] == 80
-    assert config["orchestrator"]["env"][0]["args"]["llm_subcall_provider"] == "vertex"
-    assert config["orchestrator"]["env"][0]["args"]["llm_subcall_model"] == "gemini-3.1-flash-lite"
-    assert config["orchestrator"]["env"][0]["args"]["llm_subcall_vertex_location"] == "global"
-    assert config["orchestrator"]["env"][0]["args"]["llm_subcall_thinking_level"] == "medium"
+    assert config["orchestrator"]["env"][0]["args"]["subcall_batch_max_workers"] == 2
+    assert "llm_subcall_provider" not in config["orchestrator"]["env"][0]["args"]
+    assert "llm_subcall_model" not in config["orchestrator"]["env"][0]["args"]
     assert config["orchestrator"]["env"][0]["args"]["judge_provider"] == "vertex"
     assert config["orchestrator"]["env"][0]["args"]["judge_model"] == "gemini-3-flash-preview"
     assert config["orchestrator"]["env"][0]["args"]["judge_vertex_location"] == "global"
     assert config["orchestrator"]["env"][0]["args"]["judge_thinking_level"] == "medium"
     assert config["orchestrator"]["eval"]["env"][0]["args"]["subcall_budget_enabled"] is True
-    assert config["orchestrator"]["eval"]["env"][0]["args"]["llm_subcall_provider"] == "vertex"
-    assert config["orchestrator"]["eval"]["env"][0]["args"]["llm_subcall_model"] == "gemini-3.1-flash-lite"
+    assert config["orchestrator"]["eval"]["env"][0]["args"]["subcall_batch_max_workers"] == 2
+    assert "llm_subcall_provider" not in config["orchestrator"]["eval"]["env"][0]["args"]
+    assert "llm_subcall_model" not in config["orchestrator"]["eval"]["env"][0]["args"]
 
 
-def test_budgeted_configs_route_plain_llm_subcalls_and_judge_to_vertex() -> None:
+def test_budgeted_configs_route_plain_llm_subcalls_to_root_policy_and_judge_to_vertex() -> None:
     config_names = [
         "qwen3_4b_instruct_sanjaya_medium_4xa100_80gb_budgeted.toml",
         "qwen3_4b_instruct_sanjaya_medium_8xa100_40gb_budgeted.toml",
@@ -253,11 +253,12 @@ def test_budgeted_configs_route_plain_llm_subcalls_and_judge_to_vertex() -> None
             assert args["inference_mode"] == "local"
             assert args["inference_base_url"] == "http://localhost:8000/v1"
             assert args["inference_api_key"] == "local-vllm"
-            assert args["llm_subcall_provider"] == "vertex"
-            assert args["llm_subcall_model"] == "gemini-3.1-flash-lite"
-            assert args["llm_subcall_vertex_project_env"] == "GOOGLE_CLOUD_PROJECT"
-            assert args["llm_subcall_vertex_location"] == "global"
-            assert args["llm_subcall_thinking_level"] == "medium"
+            assert args["subcall_batch_max_workers"] == 2
+            assert "llm_subcall_provider" not in args
+            assert "llm_subcall_model" not in args
+            assert "llm_subcall_vertex_project_env" not in args
+            assert "llm_subcall_vertex_location" not in args
+            assert "llm_subcall_thinking_level" not in args
             assert args["judge_provider"] == "vertex"
             assert args["judge_model"] == "gemini-3-flash-preview"
             assert args["judge_vertex_project_env"] == "GOOGLE_CLOUD_PROJECT"

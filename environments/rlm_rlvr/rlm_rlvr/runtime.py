@@ -58,12 +58,15 @@ class RuntimeConfig:
     subcall_budget_enabled: bool = False
     max_total_subcalls: int = 80
     max_batched_subcalls: int = 80
+    subcall_batch_max_workers: int | None = None
     capture_prompt_messages: bool = False
     include_budget_reminder: bool = True
     recursive_rlm_batch_mode: str = "serial"
     recursive_cap_prompt_variant: str | None = None
 
     def __post_init__(self) -> None:
+        if self.subcall_batch_max_workers is not None and self.subcall_batch_max_workers < 1:
+            raise ValueError("subcall_batch_max_workers must be >= 1 when set")
         self.recursive_rlm_batch_mode = self.recursive_rlm_batch_mode.lower()
         valid_recursive_rlm_batch_modes = {"serial", "thread"}
         if self.recursive_rlm_batch_mode not in valid_recursive_rlm_batch_modes:
@@ -959,8 +962,12 @@ class RecursiveRuntime:
         if prompt_count <= 0:
             return 1
         if requested_max_workers is not None:
-            return max(1, min(int(requested_max_workers), prompt_count))
-        return max(1, min(prompt_count, self._DEFAULT_BATCH_MAX_WORKERS))
+            workers = int(requested_max_workers)
+        else:
+            workers = self._DEFAULT_BATCH_MAX_WORKERS
+        if self.config.subcall_batch_max_workers is not None:
+            workers = min(workers, int(self.config.subcall_batch_max_workers))
+        return max(1, min(workers, prompt_count))
 
     def run_plain_query_batch(
         self,

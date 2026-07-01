@@ -179,14 +179,14 @@ If `prompt_variants` contains multiple entries, the run is also a prompt-compari
 
 The pipeline currently supports only `openai_chat_completions` endpoint aliases from `configs/endpoints.toml`.
 
-Set top-level `max_workers > 1` with `worker_backend = "process"` for local REPL trace generation. Rollout workers must be separate OS processes because the local REPL temporarily mutates process-global cwd and stdout/stderr during code execution. The parent process remains the only writer for JSONL/summary outputs. Batched `llm_query_batched` calls still use threads inside each rollout process, so API subcalls remain concurrent. Batched recursive `rlm_query_batched` child calls execute serially by default for local REPL safety; use `recursive_rlm_batch_mode = "thread"` only as an explicit advanced override.
+Set top-level `max_workers > 1` with `worker_backend = "process"` for local REPL trace generation. Rollout workers must be separate OS processes because the local REPL temporarily mutates process-global cwd and stdout/stderr during code execution. The parent process remains the only writer for JSONL/summary outputs. Batched `llm_query_batched` calls still use threads inside each rollout process; set `[rollout].subcall_batch_max_workers` to cap that fanout when plain subcalls reuse the root policy endpoint. Batched recursive `rlm_query_batched` child calls execute serially by default for local REPL safety; use `recursive_rlm_batch_mode = "thread"` only as an explicit advanced override.
 
-For Vertex-backed subcalls, configs may include:
+When `[llm_subcall]` is absent, plain `llm_query*` subcalls reuse the root model endpoint. For explicit Vertex-backed subcalls, configs may include:
 
 ```toml
 [llm_subcall]
 provider = "vertex"
-model = "gemini-3.1-flash-lite"
+model = "gemini-3-flash-preview"
 vertex_project_env = "GOOGLE_CLOUD_PROJECT"
 vertex_location = "global"
 thinking_level = "medium"

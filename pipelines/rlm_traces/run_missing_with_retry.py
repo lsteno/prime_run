@@ -127,7 +127,7 @@ def render_trace_config(
     output_dir: Path,
     endpoints_path: str,
     model_cfg: dict[str, Any],
-    llm_subcall_cfg: dict[str, Any],
+    llm_subcall_cfg: dict[str, Any] | None,
     dataset_cfg: dict[str, Any],
     rollout_cfg: dict[str, Any],
     judge_cfg: dict[str, Any],
@@ -138,6 +138,25 @@ def render_trace_config(
 ) -> str:
     reasoning_enabled = bool(model_cfg.get("extra_body", {}).get("reasoning", {}).get("enabled", False))
     prompt_variants = [str(item) for item in rollout_cfg.get("prompt_variants", [DEFAULT_VARIANT])]
+    llm_subcall_section = ""
+    if llm_subcall_cfg and str(llm_subcall_cfg.get("provider", "")).lower() not in {
+        "same_as_root",
+        "root_policy",
+        "root",
+    }:
+        if not llm_subcall_cfg.get("model"):
+            raise ValueError("llm_subcall_cfg requires an explicit model when separate subcalls are enabled.")
+        llm_subcall_section = f"""
+[llm_subcall]
+provider = {_toml_string(str(llm_subcall_cfg.get("provider", "vertex")))}
+model = {_toml_string(str(llm_subcall_cfg["model"]))}
+vertex_project_env = {_toml_string(str(llm_subcall_cfg.get("vertex_project_env", "GOOGLE_CLOUD_PROJECT")))}
+vertex_location = {_toml_string(str(llm_subcall_cfg.get("vertex_location", "global")))}
+thinking_level = {_toml_string(str(llm_subcall_cfg.get("thinking_level", "medium")))}
+empty_response_max_attempts = {int(llm_subcall_cfg.get("empty_response_max_attempts", 3))}
+empty_response_base_retry_seconds = {float(llm_subcall_cfg.get("empty_response_base_retry_seconds", 1.0))}
+empty_response_max_retry_seconds = {float(llm_subcall_cfg.get("empty_response_max_retry_seconds", 30.0))}
+"""
     return f"""run_name = {_toml_string(run_name)}
 output_dir = {_toml_string(str(output_dir))}
 endpoints_path = {_toml_string(endpoints_path)}
@@ -152,16 +171,7 @@ api_key_env = {_toml_string(str(model_cfg["api_key_env"]))}
 
 [model.extra_body.reasoning]
 enabled = {str(reasoning_enabled).lower()}
-
-[llm_subcall]
-provider = {_toml_string(str(llm_subcall_cfg.get("provider", "vertex")))}
-model = {_toml_string(str(llm_subcall_cfg.get("model", "gemini-3.1-flash-lite")))}
-vertex_project_env = {_toml_string(str(llm_subcall_cfg.get("vertex_project_env", "GOOGLE_CLOUD_PROJECT")))}
-vertex_location = {_toml_string(str(llm_subcall_cfg.get("vertex_location", "global")))}
-thinking_level = {_toml_string(str(llm_subcall_cfg.get("thinking_level", "medium")))}
-empty_response_max_attempts = {int(llm_subcall_cfg.get("empty_response_max_attempts", 3))}
-empty_response_base_retry_seconds = {float(llm_subcall_cfg.get("empty_response_base_retry_seconds", 1.0))}
-empty_response_max_retry_seconds = {float(llm_subcall_cfg.get("empty_response_max_retry_seconds", 30.0))}
+{llm_subcall_section}
 
 [dataset]
 dataset_id = {_toml_string(str(dataset_cfg["dataset_id"]))}
@@ -183,6 +193,7 @@ repl_backend = {_toml_string(str(rollout_cfg.get("repl_backend", "local")))}
 subcall_budget_enabled = {str(bool(rollout_cfg.get("subcall_budget_enabled", True))).lower()}
 max_total_subcalls = {int(rollout_cfg.get("max_total_subcalls", 80))}
 max_batched_subcalls = {int(rollout_cfg.get("max_batched_subcalls", 80))}
+subcall_batch_max_workers = {int(rollout_cfg["subcall_batch_max_workers"]) if rollout_cfg.get("subcall_batch_max_workers") is not None else 8}
 include_budget_reminder = {str(bool(rollout_cfg.get("include_budget_reminder", False))).lower()}
 tokenizer_name = {_toml_string(str(rollout_cfg.get("tokenizer_name", "Qwen/Qwen3-4B-Instruct-2507")))}
 
@@ -303,7 +314,7 @@ def main() -> None:
             output_dir=output_dir,
             endpoints_path=endpoints_path,
             model_cfg=config["primary_model"],
-            llm_subcall_cfg=config["llm_subcall"],
+            llm_subcall_cfg=config.get("llm_subcall"),
             dataset_cfg=config["dataset"],
             rollout_cfg=config["rollout"],
             judge_cfg=config["judge"],
@@ -329,7 +340,7 @@ def main() -> None:
             output_dir=output_dir,
             endpoints_path=endpoints_path,
             model_cfg=config["retry_model"],
-            llm_subcall_cfg=config["llm_subcall"],
+            llm_subcall_cfg=config.get("llm_subcall"),
             dataset_cfg=config["dataset"],
             rollout_cfg=config["rollout"],
             judge_cfg=config["judge"],

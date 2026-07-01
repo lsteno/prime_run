@@ -369,12 +369,16 @@ def resolve_plain_subcall(config: dict[str, Any], *, endpoints_path: Path) -> Pl
     if not subcall_cfg:
         return None
 
-    provider = str(subcall_cfg.get("provider", "openai_compatible"))
+    provider = str(subcall_cfg.get("provider", "openai_compatible")).lower()
+    if provider in {"same_as_root", "root_policy", "root"}:
+        return None
     if provider == "vertex":
+        if not subcall_cfg.get("model"):
+            raise ValueError("Vertex llm_subcall requires an explicit model.")
         project_env = str(subcall_cfg.get("vertex_project_env", "GOOGLE_CLOUD_PROJECT"))
         return PlainSubcallConfig(
             provider="vertex",
-            model=str(subcall_cfg.get("model", "gemini-3.1-flash-lite")),
+            model=str(subcall_cfg["model"]),
             vertex_project_env=project_env,
             vertex_project=os.environ.get(project_env),
             vertex_location=str(subcall_cfg.get("vertex_location", os.environ.get("GOOGLE_CLOUD_LOCATION", "global"))),
@@ -385,8 +389,10 @@ def resolve_plain_subcall(config: dict[str, Any], *, endpoints_path: Path) -> Pl
         )
 
     if provider != "openai_compatible":
-        raise ValueError("llm_subcall.provider must be either 'openai_compatible' or 'vertex'")
+        raise ValueError("llm_subcall.provider must be 'openai_compatible', 'vertex', or 'same_as_root'")
 
+    if not subcall_cfg.get("model") and not subcall_cfg.get("endpoint_id"):
+        raise ValueError("OpenAI-compatible llm_subcall requires an explicit model or endpoint_id.")
     endpoint = resolve_endpoint(subcall_cfg, endpoints_path=endpoints_path)
     return PlainSubcallConfig(provider="openai_compatible", model=endpoint.model, endpoint=endpoint)
 
@@ -769,6 +775,7 @@ def init_state(
     )
     state["_sync_session"] = session
     if plain_subcall_config is not None:
+        state["llm_subcall_session_source"] = plain_subcall_config.provider
         if plain_subcall_config.provider == "vertex":
             VertexGeminiSession = modules["VertexGeminiSession"]
             if not plain_subcall_config.vertex_project:
@@ -799,6 +806,9 @@ def init_state(
                 openai_extra_body=plain_subcall_config.endpoint.extra_body,
                 enable_token_accounting=False,
             )
+    else:
+        state["_plain_llm_session"] = state["_sync_session"]
+        state["llm_subcall_session_source"] = "root_policy"
     runtime = RecursiveRuntime(state, runtime_config)
     state["_runtime"] = runtime
     if disable_recursive_subcalls:
@@ -1333,6 +1343,11 @@ def main() -> None:
         subcall_budget_enabled=bool(rollout_cfg.get("subcall_budget_enabled", True)),
         max_total_subcalls=int(rollout_cfg.get("max_total_subcalls", 60)),
         max_batched_subcalls=int(rollout_cfg.get("max_batched_subcalls", rollout_cfg.get("max_total_subcalls", 60))),
+        subcall_batch_max_workers=(
+            int(rollout_cfg["subcall_batch_max_workers"])
+            if rollout_cfg.get("subcall_batch_max_workers") is not None
+            else None
+        ),
         capture_prompt_messages=True,
         include_budget_reminder=bool(rollout_cfg.get("include_budget_reminder", True)),
         recursive_rlm_batch_mode=str(rollout_cfg.get("recursive_rlm_batch_mode", "serial")),
