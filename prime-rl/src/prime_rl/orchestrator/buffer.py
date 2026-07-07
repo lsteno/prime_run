@@ -304,14 +304,22 @@ class Buffer:
                 elif pool == "hard":
                     self.hard_example_release_steps.pop(self.get_example_hash(example), None)
 
-            self.num_examples_per_step[env_name][pool] += 1
+            filtered_pool = None
             if self.config.online_difficulty_filtering:
                 if difficulty_score == 0.0 and self.config.online_filter_hard:
+                    filtered_pool = "hard"
+                elif difficulty_score == 1.0 and self.config.online_filter_easy:
+                    filtered_pool = "easy"
+
+            self.num_examples_per_step[env_name][filtered_pool or pool] += 1
+            if self.config.online_difficulty_filtering:
+                if filtered_pool == "hard":
                     self.num_rollouts_per_step[env_name]["hard"] += len(example_rollouts)
                     self.filtered_hard_groups_per_step += 1
                     continue
-                elif difficulty_score == 1.0 and self.config.online_filter_easy:
+                elif filtered_pool == "easy":
                     self.num_rollouts_per_step[env_name]["easy"] += len(example_rollouts)
+                    self.filtered_easy_groups_per_step += 1
                     continue
                 elif difficulty_score == 1.0:
                     self.kept_easy_groups_per_step += 1
@@ -334,6 +342,7 @@ class Buffer:
         # num rollouts per env per step per pool (env_name -> (pool -> num_rollouts))
         self.num_rollouts_per_step = {env: zero_per_pool() for env in self.env_names}
         self.filtered_hard_groups_per_step = 0
+        self.filtered_easy_groups_per_step = 0
         self.kept_easy_groups_per_step = 0
 
     def get_metrics(self) -> dict[str, float]:
@@ -341,6 +350,7 @@ class Buffer:
 
         metrics = {
             "buffer/filtered_hard_groups": self.filtered_hard_groups_per_step,
+            "buffer/filtered_easy_groups": self.filtered_easy_groups_per_step,
             "buffer/kept_easy_groups": self.kept_easy_groups_per_step,
         }
 

@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 ABLATION_DIR = ROOT / "configs/rlm_rlvr/ablation_rank_lr"
+DEPTH1_H100_LORA_DIR = ROOT / "configs/rlm_rlvr/ablation_depth1_h100_lora_same_root"
 FULL_FT_CONFIG = (
     ROOT
     / "configs/rlm_rlvr/full_ft/qwen3_4b_instruct_sanjaya_depth1_llmonly_fullft_lr1e-6_s150_8xa10080_bal35f40v1.toml"
@@ -15,6 +16,11 @@ FULL_FT_CONFIG = (
 
 def _load_manifest() -> list[dict[str, str]]:
     with (ABLATION_DIR / "manifest.csv").open(newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _load_depth1_h100_lora_manifest() -> list[dict[str, str]]:
+    with (DEPTH1_H100_LORA_DIR / "manifest.csv").open(newline="") as handle:
         return list(csv.DictReader(handle))
 
 
@@ -87,7 +93,7 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert config["orchestrator"]["buffer"]["hard_cooldown_steps"] == 5
         assert "easy_threshold" not in config["orchestrator"]["buffer"]
         assert config["orchestrator"]["buffer"]["online_filter_hard"] is True
-        assert config["orchestrator"]["buffer"]["online_filter_easy"] is False
+        assert config["orchestrator"]["buffer"]["online_filter_easy"] is True
         assert row["train_worker_count"] == "32"
         assert row["eval_worker_count"] == "16"
         assert row["rollout_timeout_seconds"] == "400"
@@ -180,6 +186,124 @@ def test_rank_lr_ablation_configs_match_manifest() -> None:
         assert eval_args["efficiency_penalty_applies_to"] == "all_rollouts"
         assert eval_args["reward_clip_min"] == -0.5
         assert eval_args["reward_clip_max"] == 1.0
+
+
+def test_depth1_h100_lora_sweep_manifest_has_expected_grid() -> None:
+    rows = _load_depth1_h100_lora_manifest()
+    assert len(rows) == 9
+    observed = {(int(row["rank"]), int(row["alpha"]), row["lr"]) for row in rows}
+    assert observed == {
+        (4, 8, "1e-6"),
+        (4, 8, "1e-5"),
+        (4, 8, "1e-4"),
+        (16, 32, "1e-6"),
+        (16, 32, "1e-5"),
+        (16, 32, "1e-4"),
+        (64, 128, "1e-6"),
+        (64, 128, "1e-5"),
+        (64, 128, "1e-4"),
+    }
+
+
+def test_depth1_h100_lora_sweep_configs_match_manifest() -> None:
+    for row in _load_depth1_h100_lora_manifest():
+        config_path = ROOT / row["config_path"]
+        config = tomllib.loads(config_path.read_text())
+
+        assert config["output_dir"] == f"../{row['output_dir']}"
+        assert config["max_steps"] == 150
+        assert config["max_async_level"] == 2
+        assert config["seq_len"] == 49152
+        assert config["deployment"]["gpus_per_node"] == 8
+        assert config["deployment"]["num_infer_gpus"] == 4
+        assert config["deployment"]["num_train_gpus"] == 4
+        assert config["model"]["name"] == "Qwen/Qwen3-4B-Instruct-2507"
+        assert config["wandb"]["project"] == "rlm-rlvr"
+        assert config["wandb"]["name"] == row["wandb_name"]
+        assert "weight_broadcast" not in config
+        assert config["ckpt"] == {"interval": 25, "keep_last": 2, "keep_interval": 100}
+
+        assert config["trainer"]["optim"]["lr"] == float(row["lr"])
+        assert config["trainer"]["model"]["seq_len"] == 49152
+        assert config["trainer"]["model"]["cp"] == 2
+        assert config["trainer"]["model"]["lora"]["rank"] == int(row["rank"])
+        assert config["trainer"]["model"]["lora"]["alpha"] == int(row["alpha"])
+        assert config["trainer"]["model"]["lora"]["dropout"] == 0.0
+
+        orchestrator = config["orchestrator"]
+        assert orchestrator["batch_size"] == 64
+        assert orchestrator["rollouts_per_example"] == 4
+        assert orchestrator["max_concurrent"] == 32
+        assert orchestrator["rollout_timeout_seconds"] == 400
+        assert orchestrator["seq_len"] == 49152
+        assert orchestrator["max_off_policy_steps"] == 4
+        assert orchestrator["client"]["base_url"] == ["http://localhost:8001/v1"]
+        assert orchestrator["async_scheduling"]["prefetch_next_batch"] is False
+        assert orchestrator["async_scheduling"]["inflight_completion_cushion"] == 32
+        assert orchestrator["async_scheduling"]["max_requests_per_env_worker"] == 1
+        assert orchestrator["async_scheduling"]["max_cross_step_carryover"] == 32
+        assert orchestrator["async_scheduling"]["max_carryover_steps"] == 1
+        assert orchestrator["async_scheduling"]["restart_workers_for_stale_cancel"] is True
+        assert orchestrator["group_scoring"]["enabled"] is True
+        assert orchestrator["group_scoring"]["max_concurrency"] == 8
+        assert orchestrator["group_scoring"]["max_pending_groups"] == 64
+        assert orchestrator["wandb"]["log_extras"]["interval"] == 10
+        assert orchestrator["wandb"]["log_extras"]["sample_max_chars"] == 8000
+
+        assert row["base_config"] == (
+            "configs/rlm_rlvr/local/"
+            "qwen3_4b_instruct_sanjaya_depth2_recursive_r064_a128_lr1e-5_s150_8xh100_bal35f40v1.toml"
+        )
+        assert row["max_steps"] == "150"
+        assert row["max_async_level"] == "2"
+        assert row["max_off_policy_steps"] == "4"
+        assert row["batch_size"] == "64"
+        assert row["rollouts_per_example"] == "4"
+        assert row["num_infer_gpus"] == "4"
+        assert row["num_train_gpus"] == "4"
+        assert row["inference_dp"] == "4"
+        assert row["train_worker_count"] == "32"
+        assert row["eval_worker_count"] == "16"
+        assert row["max_total_subcalls"] == "50"
+        assert row["max_batched_subcalls"] == "50"
+        assert row["subcall_batch_max_workers"] == "2"
+        assert row["experiment_depth"] == "1"
+        assert row["runtime_max_depth"] == "0"
+        assert row["prompt_variant"] == "sanjaya_text_depth1_llm_only_v1"
+        assert row["train_data_path"] == "../data/beeg_agents_balanced_35_40_25_frames40_v1/train.parquet"
+        assert row["eval_data_path"] == "../data/beeg_agents_balanced_35_40_25_frames40_v1/eval.parquet"
+
+        assert orchestrator["env"][0]["worker_count"] == 32
+        assert orchestrator["eval"]["env"][0]["worker_count"] == 16
+        expected_train_paths = ["../data/beeg_agents_balanced_35_40_25_frames40_v1/train.parquet"]
+        expected_eval_paths = ["../data/beeg_agents_balanced_35_40_25_frames40_v1/eval.parquet"]
+        for args in (orchestrator["env"][0]["args"], orchestrator["eval"]["env"][0]["args"]):
+            assert args["data_paths"] == expected_train_paths
+            assert args["eval_data_paths"] == expected_eval_paths
+            assert args["prompt_variant"] == "sanjaya_text_depth1_llm_only_v1"
+            assert args["max_depth"] == 0
+            assert "recursive_cap_prompt_variant" not in args
+            assert "recursive_rlm_batch_mode" not in args
+            assert args["subcall_budget_enabled"] is True
+            assert args["max_total_subcalls"] == 50
+            assert args["max_batched_subcalls"] == 50
+            assert args["subcall_batch_max_workers"] == 2
+            assert args["judge_provider"] == "vertex"
+            assert args["judge_model"] == "gemini-3-flash-preview"
+            assert args["inference_base_url"] == "http://localhost:8001/v1"
+            assert "llm_subcall_provider" not in args
+            assert "llm_subcall_model" not in args
+            assert "llm_subcall_vertex_project_env" not in args
+            assert "llm_subcall_vertex_location" not in args
+            assert "llm_subcall_thinking_level" not in args
+
+        inference = config["inference"]
+        assert inference["api_server_count"] == 1
+        assert inference["server"]["port"] == 8001
+        assert inference["model"]["max_model_len"] == 49152
+        assert inference["parallel"]["dp"] == 4
+        assert inference["parallel"]["tp"] == 1
+        assert inference["deployment"]["gpus_per_node"] == 4
 
 
 def test_full_ft_pilot_config_removes_lora_and_uses_nccl_broadcast() -> None:

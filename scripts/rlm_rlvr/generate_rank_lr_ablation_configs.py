@@ -270,7 +270,7 @@ def build_config(base: str, *, rank: int, alpha: int, lr: str, run_id: str) -> s
         "online_difficulty_filtering = true\n",
         "online_difficulty_filtering = true\n"
         "online_filter_hard = true\n"
-        "online_filter_easy = false\n",
+        "online_filter_easy = true\n",
     )
     text = replace_all(text, "repl_timeout_seconds = 900", f"repl_timeout_seconds = {REPL_TIMEOUT_SECONDS}")
     text = replace_all(text, "repl_fast_timeout_seconds = 30", f"repl_fast_timeout_seconds = {REPL_FAST_TIMEOUT_SECONDS}")

@@ -9,6 +9,9 @@ if [[ -f "$ROOT_DIR/.env" ]]; then
   source "$ROOT_DIR/.env"
   set +a
 fi
+if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -f "$ROOT_DIR/service_account.json" ]]; then
+  export GOOGLE_APPLICATION_CREDENTIALS="$ROOT_DIR/service_account.json"
+fi
 MANIFEST="${1:-$ROOT_DIR/configs/rlm_rlvr/ablation_rank_lr/manifest.csv}"
 START_INDEX="${START_INDEX:-1}"
 END_INDEX="${END_INDEX:-999}"
@@ -141,7 +144,7 @@ PY
         completed_by_files=1
       fi
       if [[ "$completed_by_log" == "1" && "$completed_by_files" == "1" ]]; then
-        echo "[$(timestamp)] Final trainer checkpoint and LoRA adapter are complete for $run_id; waiting ${TRAIN_FINISH_GRACE_SECONDS}s for Prime-RL cleanup" >> "$run_log"
+        echo "[$(timestamp)] Trainer finished and final LoRA adapter is complete for $run_id; waiting ${TRAIN_FINISH_GRACE_SECONDS}s for Prime-RL cleanup" >> "$run_log"
         sleep "$TRAIN_FINISH_GRACE_SECONDS"
         if kill -0 "$rl_pid" 2>/dev/null; then
           echo "[$(timestamp)] Prime-RL process still alive after completed training; terminating stale process group ${rl_pgid:-$rl_pid}" >> "$run_log"
@@ -173,7 +176,7 @@ PY
     wait "$tail_pid" 2>/dev/null || true
 
     if [[ "$completed_by_log" == "1" && "$completed_by_files" == "1" ]]; then
-      echo "[$(timestamp)] Treating $run_id as successful: final trainer checkpoint and adapter were verified" >> "$run_log"
+      echo "[$(timestamp)] Treating $run_id as successful: trainer completion and final adapter were verified" >> "$run_log"
       exit 0
     fi
     if [[ "$rl_status" != "0" ]]; then

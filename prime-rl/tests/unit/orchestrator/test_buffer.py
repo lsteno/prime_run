@@ -195,6 +195,37 @@ def test_buffer_online_difficulty_filtering_uses_correctness_not_shaped_reward(d
     assert metrics["buffer/kept_easy_groups"] == 1
 
 
+def test_buffer_online_difficulty_filtering_filters_easy_by_correctness_without_queue(
+    dummy_env_group, make_rollouts
+):
+    """All-correct groups are filtered using correctness even when shaped reward is below 1."""
+    dataset = dummy_env_group.get_dataset()
+    buffer = Buffer(
+        dataset,
+        dummy_env_group.env_names,
+        BufferConfig(online_difficulty_filtering=True),
+    )
+    buffer.update(
+        make_rollouts(
+            dataset.select(range(3)),
+            rewards=[-0.25, 0.40, 0.85],
+            correctness=[0.0, 0.5, 1.0],
+        )
+    )
+
+    # Only the mixed group is kept. All-wrong and all-correct groups are filtered.
+    assert len(buffer.rollout_buffer) == 2
+    assert len(buffer.easy_examples) == 0
+    metrics = buffer.get_metrics()
+    assert metrics["buffer/filtered_hard_groups"] == 1
+    assert metrics["buffer/filtered_easy_groups"] == 1
+    assert metrics["buffer/kept_easy_groups"] == 0
+    assert metrics["evicted_examples/hard"] == pytest.approx(1 / 3)
+    assert metrics["evicted_examples/easy"] == pytest.approx(1 / 3)
+    assert metrics["filtered_rollouts/hard"] == pytest.approx(1 / 3)
+    assert metrics["filtered_rollouts/easy"] == pytest.approx(1 / 3)
+
+
 def test_buffer_no_filtering_by_default(dummy_env_group, make_rollouts):
     """With online_difficulty_filtering=False (default), all rollouts are kept."""
     dataset = dummy_env_group.get_dataset()

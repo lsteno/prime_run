@@ -522,7 +522,7 @@ class VertexGeminiSession:
 class RecursiveRuntime:
     _MESSAGE_OVERHEAD_CHARS = 32
     _GENERATION_PROMPT_OVERHEAD_CHARS = 16
-    _CHARS_PER_TOKEN_ESTIMATE = 4.0
+    _CHARS_PER_TOKEN_ESTIMATE = 3.0
     _DEFAULT_BATCH_MAX_WORKERS = 8
 
     def __init__(self, state: dict[str, Any], config: RuntimeConfig):
@@ -969,6 +969,26 @@ class RecursiveRuntime:
             workers = min(workers, int(self.config.subcall_batch_max_workers))
         return max(1, min(workers, prompt_count))
 
+    def _run_threaded_subcalls(
+        self,
+        jobs: list[Callable[[], dict[str, Any]]],
+        *,
+        max_workers: int,
+    ) -> list[dict[str, Any]]:
+        pool = ThreadPoolExecutor(max_workers=max_workers)
+        futures = []
+        try:
+            futures = [pool.submit(job) for job in jobs]
+            payloads = [future.result() for future in futures]
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
+            return payloads
+
     def run_plain_query_batch(
         self,
         prompts: list[str],
@@ -985,9 +1005,11 @@ class RecursiveRuntime:
         payloads: list[dict[str, Any]] = []
         if scheduled_prompts:
             workers = self.batch_max_workers(len(scheduled_prompts), requested_max_workers=max_workers)
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(self._plain_query, prompt, model, False) for prompt in scheduled_prompts]
-                payloads.extend(future.result() for future in futures)
+            jobs = [
+                (lambda prompt=prompt: self._plain_query(prompt, model, False))
+                for prompt in scheduled_prompts
+            ]
+            payloads.extend(self._run_threaded_subcalls(jobs, max_workers=workers))
         payloads.extend(
             self._budget_error_payload(prompt=prompt, model=model, kind="plain_query")
             for prompt in skipped_prompts
@@ -1012,12 +1034,11 @@ class RecursiveRuntime:
         if scheduled_prompts:
             if self.config.recursive_rlm_batch_mode == "thread":
                 workers = self.batch_max_workers(len(scheduled_prompts), requested_max_workers=max_workers)
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = [
-                        pool.submit(self._recursive_query, prompt, model, max_depth, False)
-                        for prompt in scheduled_prompts
-                    ]
-                    payloads.extend(future.result() for future in futures)
+                jobs = [
+                    (lambda prompt=prompt: self._recursive_query(prompt, model, max_depth, False))
+                    for prompt in scheduled_prompts
+                ]
+                payloads.extend(self._run_threaded_subcalls(jobs, max_workers=workers))
             else:
                 payloads.extend(
                     self._recursive_query(prompt, model, max_depth, False)

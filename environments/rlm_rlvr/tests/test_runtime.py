@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
 import threading
 import time
 from types import SimpleNamespace
@@ -1104,6 +1105,56 @@ def test_plain_query_batch_runs_in_parallel() -> None:
     assert elapsed < 0.13
 
 
+def test_threaded_plain_query_batch_interrupt_does_not_wait_for_worker_shutdown() -> None:
+    class _BatchInterrupt(TimeoutError):
+        pass
+
+    runtime = RecursiveRuntime(
+        _runtime_state(_sync_session=SimpleNamespace(model_name="fake-model")),
+        RuntimeConfig(max_prompt_tokens=4096, live_trace_dir=None),
+    )
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+
+    def fake_plain_query(prompt: str, model: str | None = None, consume_budget: bool = True) -> dict[str, object]:
+        del model, consume_budget
+        worker_started.set()
+        release_worker.wait(timeout=0.6)
+        return {
+            "prompt": prompt,
+            "model": "fake-model",
+            "response": f"response:{prompt}",
+            "kind": "plain_query",
+            "depth": 1,
+            "execution_time": 0.01,
+        }
+
+    def raise_timeout(signum, frame):
+        del signum, frame
+        raise _BatchInterrupt("batch interrupted")
+
+    runtime._plain_query = fake_plain_query  # type: ignore[method-assign]
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    start = time.perf_counter()
+
+    try:
+        signal.signal(signal.SIGALRM, raise_timeout)
+        signal.setitimer(signal.ITIMER_REAL, 0.03)
+        with pytest.raises(_BatchInterrupt):
+            runtime.run_plain_query_batch(["alpha"], max_workers=1)
+        elapsed = time.perf_counter() - start
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+        release_worker.set()
+
+    assert worker_started.wait(timeout=0.1)
+    assert elapsed < 0.2
+
+
 def test_subcall_batch_max_workers_caps_requested_parallelism() -> None:
     runtime = RecursiveRuntime(
         _runtime_state(_sync_session=SimpleNamespace(model_name="fake-model")),
@@ -1472,6 +1523,35 @@ def test_oversized_llm_subcall_is_blocked_and_visible_in_repl() -> None:
     assert "answer" in result.locals
     assert "llm_query prompt is too large" in result.locals["answer"]
     assert repl._pending_llm_calls == []
+
+
+def test_oversized_llm_subcall_uses_conservative_char_budget() -> None:
+    class _BudgetSession:
+        model_name = "fake-model"
+
+        def generate(self, **kwargs):
+            del kwargs
+            raise AssertionError("oversized subcall should be blocked before model generation")
+
+    state = _runtime_state(_sync_session=_BudgetSession())
+    runtime = RecursiveRuntime(
+        state,
+        RuntimeConfig(
+            max_prompt_tokens=100,
+            subcall_prompt_limit_ratio=0.85,
+            live_trace_dir=None,
+        ),
+    )
+
+    with pytest.raises(SubcallPromptTooLargeError) as exc_info:
+        runtime._plain_query("x" * 230)
+
+    message = str(exc_info.value)
+    assert "llm_query prompt is too large" in message
+    assert "282 characters" in message
+    assert "255 chars ~= 85/100 tokens" in message
+    assert "approximate" in message
+    assert state["num_subcalls"] == 0
 
 
 def test_oversized_batched_llm_subcalls_raise_one_error() -> None:

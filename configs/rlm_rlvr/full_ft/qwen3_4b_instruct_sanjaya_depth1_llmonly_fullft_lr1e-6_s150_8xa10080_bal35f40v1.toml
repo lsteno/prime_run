@@ -121,7 +121,7 @@ extra_body = { return_token_ids = true, top_k = -1, min_p = 0.0 }
 [orchestrator.buffer]
 online_difficulty_filtering = true
 online_filter_hard = true
-online_filter_easy = false
+online_filter_easy = true
 hard_threshold = 0.0
 hard_cooldown_steps = 5
 seed = 42

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -9,6 +10,7 @@ from huggingface_hub import HfApi
 
 
 DEFAULT_REPO_PREFIX = "lsteno/qwen3-rlm-depth1"
+HF_REPO_ID_MAX_LENGTH = 96
 
 
 def step_number(path: Path) -> int | None:
@@ -37,15 +39,17 @@ def latest_adapter_step(output_dir: Path) -> Path:
 
 def repo_id_for_run(run_id: str, repo_prefix: str) -> str:
     match = re.fullmatch(
-        r"rlm-rlvr-qwen3-4b-depth1-llmonly-r(?P<rank>\d+)-a(?P<alpha>\d+)-lr(?P<lr>.+)-s(?P<steps>\d+)(?:-(?P<suffix>.+))?",
+        r"rlm-rlvr-qwen3-4b-depth1-llmonly(?:-[A-Za-z0-9_.-]+?)*-"
+        r"r(?P<rank>\d+)-a(?P<alpha>\d+)-lr(?P<lr>[^-]+(?:-[^-]+)?)-"
+        r"s(?P<steps>\d+)(?:-(?P<suffix>.+))?",
         run_id,
     )
     if match is None:
         safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id)
-        return f"{repo_prefix}-{safe_run_id}-lora"
+        return _limit_repo_id(f"{repo_prefix}-{safe_run_id}-lora")
     suffix = match.group("suffix")
     safe_suffix = f"-{re.sub(r'[^A-Za-z0-9_.-]+', '-', suffix)}" if suffix else ""
-    return (
+    return _limit_repo_id(
         f"{repo_prefix}-"
         f"r{int(match.group('rank'))}-"
         f"a{int(match.group('alpha'))}-"
@@ -53,6 +57,24 @@ def repo_id_for_run(run_id: str, repo_prefix: str) -> str:
         f"s{int(match.group('steps'))}"
         f"{safe_suffix}-lora"
     )
+
+
+def _limit_repo_id(repo_id: str) -> str:
+    if len(repo_id) <= HF_REPO_ID_MAX_LENGTH:
+        return repo_id
+    namespace, sep, name = repo_id.partition("/")
+    if not sep:
+        namespace = ""
+        name = repo_id
+    digest = hashlib.sha1(repo_id.encode("utf-8")).hexdigest()[:10]
+    suffix = f"-{digest}"
+    available_name_len = HF_REPO_ID_MAX_LENGTH - len(namespace) - len(sep) - len(suffix)
+    if available_name_len <= 0:
+        raise ValueError(f"Repo namespace leaves no room for a valid HF repo name: {repo_id}")
+    shortened_name = name[:available_name_len].rstrip("-.")
+    if not shortened_name:
+        raise ValueError(f"Could not shorten HF repo name safely: {repo_id}")
+    return f"{namespace}{sep}{shortened_name}{suffix}"
 
 
 def adapter_upload_files(adapter_path: Path) -> list[str]:
