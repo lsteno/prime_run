@@ -296,6 +296,8 @@ class WandbConfig(BaseConfig):
     """Configures logging to Weights and Biases."""
 
     # Shared configs (May be overwritten by WandbConfig from `rl.py`)
+    entity: Annotated[str | None, Field(description="The W&B entity/team to log to.")] = None
+
     project: Annotated[str, Field(description="The W&B project to log to.")] = "prime-rl"
 
     name: Annotated[

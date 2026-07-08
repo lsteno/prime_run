@@ -1109,6 +1109,18 @@ class OrchestratorConfig(BaseConfig):
         ),
     ] = 8
 
+    max_trainable_llm_subcalls_per_rollout: Annotated[
+        int | None,
+        Field(
+            ge=0,
+            description=(
+                "For RLM rollouts, cap how many trainable plain LLM subcall segments are converted into "
+                "trainer samples per rollout. None trains all eligible subcall segments; 0 trains root/non-LLM "
+                "segments only. This does not cap subcall generation."
+            ),
+        ),
+    ] = None
+
     max_async_level: Annotated[
         int,
         Field(

@@ -6,14 +6,17 @@ from types import SimpleNamespace
 import rlm_rlvr.reward as reward_module
 from rlm_rlvr.reward import (
     _adaptive_beta_for_solve_rate,
+    _adaptive_cost_value,
     _efficiency_penalty_from_state,
     _extract_message_text,
     _extract_pair_set,
     _is_exact_match,
+    _is_oversized_judge_exception,
     _parse_binary_judge_score,
     _score_oolong_pairs,
     _segment_rollout_token_breakdown,
     _segment_rollout_token_totals,
+    _weighted_turn_token_cost,
     build_rubric,
 )
 
@@ -157,7 +160,84 @@ def test_token_breakdown_separates_trainable_and_plain_subcall_tokens() -> None:
 
     assert breakdown.total_tokens == 200
     assert breakdown.trainable_tokens == 50
+    assert breakdown.rlm_turn_tokens == 50
     assert breakdown.plain_subcall_tokens == 150
+
+
+def test_token_breakdown_includes_all_root_turn_tokens_in_total_cost() -> None:
+    breakdown = _segment_rollout_token_breakdown(
+        {
+            "rlm_segments": [
+                {
+                    "kind": "root_turn",
+                    "train_scope": "root_turn",
+                    "is_trainable_rlm_turn": True,
+                    "prompt_token_count": 1000,
+                    "completion_token_count": 200,
+                    "prompt_ids": [],
+                    "completion_ids": [],
+                },
+                {
+                    "kind": "finalize_turn",
+                    "train_scope": "finalize_turn",
+                    "is_trainable_rlm_turn": True,
+                    "prompt_token_count": 300,
+                    "completion_token_count": 50,
+                    "prompt_ids": [],
+                    "completion_ids": [],
+                },
+                {
+                    "kind": "plain_query",
+                    "train_scope": "llm_subcall",
+                    "is_trainable_rlm_turn": False,
+                    "prompt_token_count": 400,
+                    "completion_token_count": 100,
+                    "prompt_ids": [],
+                    "completion_ids": [],
+                },
+            ],
+        }
+    )
+
+    assert breakdown.rlm_turn_tokens == 1550
+    assert breakdown.plain_subcall_tokens == 500
+    assert breakdown.total_tokens == 2050
+    assert breakdown.prompt_tokens == 1700
+    assert breakdown.completion_tokens == 350
+
+
+def test_weighted_turn_token_cost_weights_root_more_than_plain_subcalls() -> None:
+    state = {
+        "rlm_segments": [
+            {
+                "kind": "root_turn",
+                "train_scope": "root_turn",
+                "is_trainable_rlm_turn": True,
+                "prompt_token_count": 1000,
+                "completion_token_count": 200,
+            },
+            {
+                "kind": "plain_query",
+                "train_scope": "llm_subcall",
+                "is_trainable_rlm_turn": True,
+                "prompt_token_count": 400,
+                "completion_token_count": 100,
+            },
+        ],
+    }
+    breakdown = _segment_rollout_token_breakdown(state)
+
+    assert _weighted_turn_token_cost(
+        breakdown,
+        root_token_multiplier=8.0,
+        plain_subcall_token_multiplier=1.0,
+    ) == 8.0 * 1200 + 500
+    assert _adaptive_cost_value(
+        state,
+        cost_basis="weighted_turn_tokens",
+        root_token_multiplier=8.0,
+        plain_subcall_token_multiplier=1.0,
+    ) == 8.0 * 1200 + 500
 
 
 def test_adaptive_beta_ramps_after_solve_rate_floor() -> None:
@@ -208,6 +288,8 @@ def test_build_rubric_applies_cost_penalty_on_exact_match(monkeypatch) -> None:
     assert state["cost_prompt_tokens"] == 400.0
     assert state["cost_completion_tokens"] == 250.0
     assert state["cost_total_tokens"] == 650.0
+    assert state["cost_rlm_turn_tokens"] == 500.0
+    assert state["cost_plain_subcall_tokens"] == 150.0
 
 
 def test_build_rubric_clips_exact_match_reward_at_zero(monkeypatch) -> None:
@@ -476,6 +558,35 @@ def test_build_rubric_penalizes_correct_forced_finalize_turn(monkeypatch) -> Non
     assert state["reward_max_turn_penalty"] == 0.25
 
 
+def test_build_rubric_supports_stronger_forced_finalize_penalty(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+        max_turn_penalty_enabled=True,
+        max_turn_penalty=0.5,
+    )
+    reward_fn = rubric.funcs[0]
+    state = {
+        "final_answer": "42",
+        "finalized_on_forced_prompt": True,
+        "efficiency_penalty_coef": 0.0,
+        "rlm_segments": [],
+        "trajectory": [],
+    }
+
+    score = asyncio.run(reward_fn(state, [], "42", {"question": "What is the answer?"}))
+
+    assert score == 0.5
+    assert state["reward_correctness"] == 1.0
+    assert state["reward_max_turn_penalty"] == 0.5
+
+
 def _adaptive_test_state(final_answer: str, total_tokens: int, *, answer: str = "42") -> dict:
     prompt_tokens = max(0, total_tokens - 10)
     completion_tokens = min(10, total_tokens)
@@ -619,6 +730,77 @@ def test_adaptive_group_can_penalize_incorrect_rollouts_by_relative_group_cost(m
     assert states[1]["reward_incorrect_cost_penalty"] == states[1]["reward_efficiency_penalty"]
 
 
+def _adaptive_root_subcall_state(final_answer: str, *, root_tokens: int, subcall_tokens: int) -> dict:
+    return {
+        "final_answer": final_answer,
+        "answer": "42",
+        "completion": [],
+        "info": {"question": "What is the answer?"},
+        "prompt": [],
+        "task": "rlm_rlvr",
+        "rlm_segments": [
+            {
+                "kind": "root_turn",
+                "train_scope": "root_turn",
+                "is_trainable_rlm_turn": True,
+                "prompt_token_count": root_tokens,
+                "completion_token_count": 0,
+            },
+            {
+                "kind": "plain_query",
+                "train_scope": "llm_subcall",
+                "is_trainable_rlm_turn": True,
+                "prompt_token_count": subcall_tokens,
+                "completion_token_count": 0,
+            },
+        ],
+        "trajectory": [],
+    }
+
+
+def test_adaptive_group_uses_weighted_turn_tokens_when_configured(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    async def _judge_zero(*args, **kwargs):
+        del args, kwargs
+        return 0.0, "0", None
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    monkeypatch.setattr(reward_module, "_call_binary_judge", _judge_zero)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+        efficiency_penalty_mode="adaptive_group",
+        adaptive_efficiency_beta_max=0.35,
+        adaptive_efficiency_gamma=1.0,
+        adaptive_efficiency_cost_basis="weighted_turn_tokens",
+        efficiency_root_token_multiplier=8.0,
+        efficiency_plain_subcall_token_multiplier=1.0,
+        efficiency_penalty_applies_to="all_rollouts",
+    )
+    reward_fn = rubric.funcs[0]
+    states = [
+        _adaptive_root_subcall_state("42", root_tokens=20, subcall_tokens=100),
+        _adaptive_root_subcall_state("42", root_tokens=40, subcall_tokens=0),
+        _adaptive_root_subcall_state("42", root_tokens=20, subcall_tokens=300),
+        _adaptive_root_subcall_state("42", root_tokens=80, subcall_tokens=0),
+    ]
+
+    scores = asyncio.run(reward_fn(states))
+
+    assert states[0]["cost_weighted_tokens"] == 260.0
+    assert states[1]["cost_weighted_tokens"] == 320.0
+    assert states[2]["cost_weighted_tokens"] == 460.0
+    assert states[3]["cost_weighted_tokens"] == 640.0
+    assert states[0]["reward_adaptive_beta"] == 0.35
+    assert scores[0] == 1.0
+    assert scores[1] > scores[2]
+    assert scores[3] == 0.65
+
+
 def test_adaptive_group_all_wrong_keeps_beta_zero_even_with_all_rollouts_penalty(monkeypatch) -> None:
     class _DummyAsyncOpenAI:
         def __init__(self, *args, **kwargs) -> None:
@@ -740,6 +922,120 @@ def test_adaptive_group_zeroes_missing_final_and_penalizes_valid_correct_rollout
     assert states[2]["reward_correctness"] == 0.0
     assert states[2]["judge_raw_response"] == "[missing_final_at_max_turn]"
     assert states[0]["reward_max_turn_penalty"] == 0.25
+
+
+def test_oversized_candidate_scores_zero_without_calling_judge(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    async def _judge_should_not_run(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("oversized candidate should not call the judge")
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    monkeypatch.setattr(reward_module, "_call_binary_judge", _judge_should_not_run)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+        judge_candidate_max_chars=8,
+    )
+    reward_fn = rubric.funcs[0]
+    state = {
+        "final_answer": "this candidate is too long",
+        "efficiency_penalty_coef": 0.0,
+        "rlm_segments": [],
+        "trajectory": [],
+    }
+
+    score = asyncio.run(reward_fn(state, [], "42", {"question": "What is the answer?"}))
+
+    assert score == 0.0
+    assert state["judge_raw_response"] == "[candidate_too_large]"
+    assert state["judge_parse_error"] == "candidate_too_large"
+
+
+def test_oversized_question_and_expected_are_truncated_before_judging(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    captured: dict[str, str] = {}
+
+    async def _judge_capture_prompt(*args, **kwargs):
+        del args
+        captured["prompt"] = kwargs["judge_prompt"]
+        return 1.0, "1", None
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    monkeypatch.setattr(reward_module, "_call_binary_judge", _judge_capture_prompt)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+        judge_question_max_chars=24,
+        judge_expected_max_chars=16,
+    )
+    reward_fn = rubric.funcs[0]
+    state = {
+        "final_answer": "candidate",
+        "efficiency_penalty_coef": 0.0,
+        "rlm_segments": [],
+        "trajectory": [],
+    }
+
+    score = asyncio.run(
+        reward_fn(
+            state,
+            [],
+            "x" * 100,
+            {
+                "question": "q" * 100,
+                "acceptable_answers": ["x" * 100],
+            },
+        )
+    )
+
+    assert score == 1.0
+    assert "[truncated before semantic judging]" in captured["prompt"]
+    assert "q" * 100 not in captured["prompt"]
+    assert "x" * 100 not in captured["prompt"]
+
+
+def test_vertex_oversized_input_error_scores_zero(monkeypatch) -> None:
+    class _FakeGenerateContentConfig:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    async def _judge_raises_oversized(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("Request contains text fields that are too large")
+
+    fake_types = SimpleNamespace(GenerateContentConfig=_FakeGenerateContentConfig)
+    monkeypatch.setattr(reward_module, "_load_google_genai", lambda: (SimpleNamespace(), fake_types))
+    monkeypatch.setattr(reward_module, "_call_vertex_binary_judge", _judge_raises_oversized)
+    rubric = build_rubric(
+        judge_provider="vertex",
+        judge_model="gemini-3-flash-preview",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key=None,
+        judge_vertex_project="test-project",
+        judge_thinking_level=None,
+    )
+    reward_fn = rubric.funcs[0]
+    state = {
+        "final_answer": "candidate",
+        "efficiency_penalty_coef": 0.0,
+        "rlm_segments": [],
+        "trajectory": [],
+    }
+
+    score = asyncio.run(reward_fn(state, [], "42", {"question": "What is the answer?"}))
+
+    assert score == 0.0
+    assert state["judge_parse_error"] == "vertex_input_too_large"
+    assert _is_oversized_judge_exception(RuntimeError("input token count over 1048576"))
 
 
 def test_vertex_judge_calls_generate_content_and_parses_binary(monkeypatch) -> None:

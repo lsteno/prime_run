@@ -74,6 +74,10 @@ def validate_shared_wandb_config(
             "or use [wandb] to configure both at once."
         )
     if trainer.wandb and orchestrator.wandb:
+        if trainer.wandb.entity != orchestrator.wandb.entity:
+            raise ValueError(
+                f"Trainer W&B entity ({trainer.wandb.entity}) and orchestrator W&B entity ({orchestrator.wandb.entity}) are not the same. Please specify the same W&B entity for both."
+            )
         if trainer.wandb.project != orchestrator.wandb.project:
             raise ValueError(
                 f"Trainer W&B project ({trainer.wandb.project}) and orchestrator W&B project ({orchestrator.wandb.project}) are not the same. Please specify the same W&B project for both."

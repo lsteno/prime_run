@@ -59,6 +59,7 @@ class RuntimeConfig:
     max_total_subcalls: int = 80
     max_batched_subcalls: int = 80
     subcall_batch_max_workers: int | None = None
+    train_plain_llm_subcalls: bool = False
     capture_prompt_messages: bool = False
     include_budget_reminder: bool = True
     recursive_rlm_batch_mode: str = "serial"
@@ -67,6 +68,8 @@ class RuntimeConfig:
     def __post_init__(self) -> None:
         if self.subcall_batch_max_workers is not None and self.subcall_batch_max_workers < 1:
             raise ValueError("subcall_batch_max_workers must be >= 1 when set")
+        if self.train_plain_llm_subcalls and self.llm_subcall_model is not None:
+            raise ValueError("train_plain_llm_subcalls requires same-root plain subcalls; omit llm_subcall_model")
         self.recursive_rlm_batch_mode = self.recursive_rlm_batch_mode.lower()
         valid_recursive_rlm_batch_modes = {"serial", "thread"}
         if self.recursive_rlm_batch_mode not in valid_recursive_rlm_batch_modes:
@@ -1071,7 +1074,7 @@ class RecursiveRuntime:
             turn_index=-1,
             kind="plain_query",
             train_scope="llm_subcall",
-            is_trainable_rlm_turn=False,
+            is_trainable_rlm_turn=bool(self.config.train_plain_llm_subcalls),
             response_source="llm_subcall",
             response_text=text,
             messages=messages,

@@ -66,6 +66,8 @@ class SharedLogConfig(BaseConfig):
 class SharedWandbConfig(BaseConfig):
     """Configures shared W&B configs."""
 
+    entity: Annotated[str | None, Field(description="The W&B entity/team to use.")] = None
+
     project: Annotated[str | None, Field(description="The W&B project to use.")] = "prime-rl"
 
     name: Annotated[str | None, Field(description="The W&B run name to use.")] = None
@@ -446,6 +448,10 @@ class RLConfig(BaseConfig):
             if self.wandb.project:
                 self.trainer.wandb.project = self.wandb.project
                 self.orchestrator.wandb.project = self.wandb.project
+
+            if self.wandb.entity:
+                self.trainer.wandb.entity = self.wandb.entity
+                self.orchestrator.wandb.entity = self.wandb.entity
 
             # If specified, automatically use shared W&B name for orchestrator and trainer with suffixes
             if self.wandb.name:

@@ -106,6 +106,8 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         state["adaptive_efficiency_gamma"] = getattr(self, "adaptive_efficiency_gamma", 2.0)
         state["adaptive_efficiency_solve_rate_floor"] = getattr(self, "adaptive_efficiency_solve_rate_floor", 0.25)
         state["adaptive_efficiency_cost_basis"] = getattr(self, "adaptive_efficiency_cost_basis", "total_tokens")
+        state["efficiency_root_token_multiplier"] = getattr(self, "efficiency_root_token_multiplier", 1.0)
+        state["efficiency_plain_subcall_token_multiplier"] = getattr(self, "efficiency_plain_subcall_token_multiplier", 1.0)
         state["efficiency_penalty_applies_to"] = getattr(self, "efficiency_penalty_applies_to", "correct_only")
         state["reward_clip_min"] = getattr(self, "reward_clip_min", 0.0)
         state["reward_clip_max"] = getattr(self, "reward_clip_max", 1.0)
@@ -380,6 +382,7 @@ def load_environment(
     max_total_subcalls: int = 80,
     max_batched_subcalls: int = 80,
     subcall_batch_max_workers: int | None = None,
+    train_plain_llm_subcalls: bool = False,
     include_budget_reminder: bool = True,
     efficiency_penalty_coef: float = 0.02,
     inference_mode: str = "hosted",
@@ -411,12 +414,17 @@ def load_environment(
     adaptive_efficiency_gamma: float = 2.0,
     adaptive_efficiency_solve_rate_floor: float = 0.25,
     adaptive_efficiency_cost_basis: str = "total_tokens",
+    efficiency_root_token_multiplier: float = 1.0,
+    efficiency_plain_subcall_token_multiplier: float = 1.0,
     efficiency_penalty_applies_to: str = "correct_only",
     reward_clip_min: float = 0.0,
     reward_clip_max: float = 1.0,
     max_turn_penalty_enabled: bool = False,
     max_turn_penalty: float = 0.25,
     missing_final_at_max_turn_zero_reward: bool = True,
+    judge_candidate_max_chars: int = 8192,
+    judge_question_max_chars: int = 32768,
+    judge_expected_max_chars: int = 8192,
     repl_backend: str = "local",
     repl_backend_kwargs: dict[str, Any] | None = None,
     repl_timeout_seconds: float | None = None,
@@ -467,9 +475,13 @@ def load_environment(
         raise ValueError("adaptive_efficiency_gamma must be > 0.0")
     if not 0.0 <= adaptive_efficiency_solve_rate_floor < 1.0:
         raise ValueError("adaptive_efficiency_solve_rate_floor must be >= 0.0 and < 1.0")
-    valid_adaptive_cost_bases = {"total_tokens"}
+    valid_adaptive_cost_bases = {"total_tokens", "weighted_turn_tokens"}
     if adaptive_efficiency_cost_basis not in valid_adaptive_cost_bases:
         raise ValueError(f"adaptive_efficiency_cost_basis must be one of {sorted(valid_adaptive_cost_bases)}")
+    if efficiency_root_token_multiplier < 0.0:
+        raise ValueError("efficiency_root_token_multiplier must be >= 0.0")
+    if efficiency_plain_subcall_token_multiplier < 0.0:
+        raise ValueError("efficiency_plain_subcall_token_multiplier must be >= 0.0")
     valid_efficiency_penalty_scopes = {"correct_only", "all_rollouts"}
     if efficiency_penalty_applies_to not in valid_efficiency_penalty_scopes:
         raise ValueError(f"efficiency_penalty_applies_to must be one of {sorted(valid_efficiency_penalty_scopes)}")
@@ -477,6 +489,12 @@ def load_environment(
         raise ValueError("reward_clip_min must be <= reward_clip_max")
     if max_turn_penalty < 0.0:
         raise ValueError("max_turn_penalty must be >= 0.0")
+    if judge_candidate_max_chars < 1:
+        raise ValueError("judge_candidate_max_chars must be >= 1")
+    if judge_question_max_chars < 1:
+        raise ValueError("judge_question_max_chars must be >= 1")
+    if judge_expected_max_chars < 1:
+        raise ValueError("judge_expected_max_chars must be >= 1")
 
     valid_api_providers = {"openai_compatible", "vertex"}
     if llm_subcall_provider not in valid_api_providers:
@@ -589,6 +607,7 @@ def load_environment(
         max_total_subcalls=max_total_subcalls,
         max_batched_subcalls=max_batched_subcalls,
         subcall_batch_max_workers=subcall_batch_max_workers,
+        train_plain_llm_subcalls=train_plain_llm_subcalls,
         include_budget_reminder=include_budget_reminder,
         recursive_rlm_batch_mode=recursive_rlm_batch_mode,
         recursive_cap_prompt_variant=recursive_cap_prompt_variant,
@@ -619,12 +638,17 @@ def load_environment(
         adaptive_efficiency_gamma=adaptive_efficiency_gamma,
         adaptive_efficiency_solve_rate_floor=adaptive_efficiency_solve_rate_floor,
         adaptive_efficiency_cost_basis=adaptive_efficiency_cost_basis,
+        efficiency_root_token_multiplier=efficiency_root_token_multiplier,
+        efficiency_plain_subcall_token_multiplier=efficiency_plain_subcall_token_multiplier,
         efficiency_penalty_applies_to=efficiency_penalty_applies_to,
         reward_clip_min=reward_clip_min,
         reward_clip_max=reward_clip_max,
         max_turn_penalty_enabled=max_turn_penalty_enabled,
         max_turn_penalty=max_turn_penalty,
         missing_final_at_max_turn_zero_reward=missing_final_at_max_turn_zero_reward,
+        judge_candidate_max_chars=judge_candidate_max_chars,
+        judge_question_max_chars=judge_question_max_chars,
+        judge_expected_max_chars=judge_expected_max_chars,
     )
     add_metrics(reward_rubric)
     return RLMRLVREnv(
@@ -639,6 +663,8 @@ def load_environment(
         adaptive_efficiency_gamma=adaptive_efficiency_gamma,
         adaptive_efficiency_solve_rate_floor=adaptive_efficiency_solve_rate_floor,
         adaptive_efficiency_cost_basis=adaptive_efficiency_cost_basis,
+        efficiency_root_token_multiplier=efficiency_root_token_multiplier,
+        efficiency_plain_subcall_token_multiplier=efficiency_plain_subcall_token_multiplier,
         efficiency_penalty_applies_to=efficiency_penalty_applies_to,
         reward_clip_min=reward_clip_min,
         reward_clip_max=reward_clip_max,

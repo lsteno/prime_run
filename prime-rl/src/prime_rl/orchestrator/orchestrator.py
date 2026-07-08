@@ -11,7 +11,7 @@ from prime_rl.orchestrator.advantage import compute_advantages
 from prime_rl.orchestrator.eval_utils import compute_eval_ckpt_step, get_eval_sampling_args
 from prime_rl.orchestrator.event_loop_lag import EventLoopLagMonitor
 from prime_rl.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
-from prime_rl.orchestrator.rlm_trajectories import rollout_to_training_samples
+from prime_rl.orchestrator.rlm_trajectories import RlmTrainingSampleResult, rollout_to_training_sample_result
 from prime_rl.orchestrator.trajectories import build_vlm_image_cache, interleave_rollout, offload_images_to_disk
 from prime_rl.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
 from prime_rl.utils.pathing import get_log_dir
@@ -635,26 +635,37 @@ async def orchestrate(config: OrchestratorConfig):
             vlm_cache = None
 
         # Process rollouts in parallel
-        def process_rollout(rollout: vf.RolloutOutput, rollout_idx: int) -> list[TrainingSample] | None:
-            return rollout_to_training_samples(rollout, vlm_cache=vlm_cache, cache_key=rollout_idx)
+        def process_rollout(rollout: vf.RolloutOutput, rollout_idx: int) -> RlmTrainingSampleResult:
+            return rollout_to_training_sample_result(
+                rollout,
+                vlm_cache=vlm_cache,
+                cache_key=rollout_idx,
+                max_trainable_llm_subcalls_per_rollout=config.max_trainable_llm_subcalls_per_rollout,
+                selection_seed=config.seed,
+                selection_step=progress.step,
+            )
 
         loop = asyncio.get_event_loop()
         futures = [
             loop.run_in_executor(rollout_executor, process_rollout, r, rollout_idx)
             for rollout_idx, r in enumerate(train_rollouts)
         ]
-        results = await asyncio.gather(*futures)
+        sample_results = await asyncio.gather(*futures)
 
         # Collect results and assign advantages
         train_examples: list[TrainingSample] = []
         rollout_prefill_lens: list[int] = []
         rollout_decode_lens: list[int] = []
         rollout_samples_per_rollout: list[int] = []
+        rollout_eligible_trainable_llm_subcalls: list[int] = []
+        rollout_selected_trainable_llm_subcalls: list[int] = []
+        rollout_dropped_trainable_llm_subcalls: list[int] = []
         num_prefill_tokens = 0
         num_decode_tokens = 0
-        for rollout, advantage, samples in zip(train_rollouts, advantages, results):
+        for rollout, advantage, sample_result in zip(train_rollouts, advantages, sample_results):
             rollout_prefill_tokens = 0
             rollout_decode_tokens = 0
+            samples = sample_result.samples
             if samples is not None:
                 rollout_samples_per_rollout.append(len(samples))
                 for sample in samples:
@@ -667,6 +678,9 @@ async def orchestrate(config: OrchestratorConfig):
                     train_examples.append(sample)
             else:
                 rollout_samples_per_rollout.append(0)
+            rollout_eligible_trainable_llm_subcalls.append(sample_result.eligible_llm_subcalls)
+            rollout_selected_trainable_llm_subcalls.append(sample_result.selected_llm_subcalls)
+            rollout_dropped_trainable_llm_subcalls.append(sample_result.dropped_llm_subcalls)
             rollout_prefill_lens.append(rollout_prefill_tokens)
             rollout_decode_lens.append(rollout_decode_tokens)
             num_prefill_tokens += rollout_prefill_tokens
@@ -727,6 +741,9 @@ async def orchestrate(config: OrchestratorConfig):
                 "prefill_len": rollout_prefill_lens,
                 "decode_len": rollout_decode_lens,
                 "samples_per_rollout": rollout_samples_per_rollout,
+                "eligible_trainable_llm_subcalls": rollout_eligible_trainable_llm_subcalls,
+                "selected_trainable_llm_subcalls": rollout_selected_trainable_llm_subcalls,
+                "dropped_trainable_llm_subcalls": rollout_dropped_trainable_llm_subcalls,
                 "num_turns": [len(rollout["trajectory"]) for rollout in train_rollouts],
                 "generation_ms": [rollout["timing"]["generation_ms"] for rollout in train_rollouts],
                 "scoring_ms": [rollout["timing"]["scoring_ms"] for rollout in train_rollouts],
@@ -804,6 +821,17 @@ async def orchestrate(config: OrchestratorConfig):
             "samples_per_rollout/all/mean": by_example.samples_per_rollout.mean().mean(),
             "samples_per_rollout/all/max": by_example.samples_per_rollout.mean().max(),
             "samples_per_rollout/all/min": by_example.samples_per_rollout.mean().min(),
+            "trainable_llm_subcalls/all/eligible_mean": by_example.eligible_trainable_llm_subcalls.mean().mean(),
+            "trainable_llm_subcalls/all/eligible_max": by_example.eligible_trainable_llm_subcalls.mean().max(),
+            "trainable_llm_subcalls/all/selected_mean": by_example.selected_trainable_llm_subcalls.mean().mean(),
+            "trainable_llm_subcalls/all/selected_max": by_example.selected_trainable_llm_subcalls.mean().max(),
+            "trainable_llm_subcalls/all/dropped_mean": by_example.dropped_trainable_llm_subcalls.mean().mean(),
+            "trainable_llm_subcalls/all/dropped_max": by_example.dropped_trainable_llm_subcalls.mean().max(),
+            "trainable_llm_subcalls/cap": (
+                -1.0
+                if config.max_trainable_llm_subcalls_per_rollout is None
+                else float(config.max_trainable_llm_subcalls_per_rollout)
+            ),
             "num_turns/all/mean": by_example.num_turns.mean().mean(),
             "num_turns/all/max": by_example.num_turns.mean().max(),
             "num_turns/all/min": by_example.num_turns.mean().min(),

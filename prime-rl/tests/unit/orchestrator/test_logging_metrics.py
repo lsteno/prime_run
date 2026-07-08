@@ -60,7 +60,9 @@ def test_rlm_cost_subcall_metrics_emit_primary_namespaces() -> None:
     metrics_df = pd.DataFrame(
         {
             "cost_total_tokens_metric": [100.0, 200.0],
+            "cost_rlm_turn_tokens_metric": [80.0, 160.0],
             "cost_plain_subcall_tokens_metric": [20.0, 40.0],
+            "cost_weighted_tokens_metric": [660.0, 1320.0],
             "adaptive_cost_penalty_metric": [0.0, 0.1],
             "used_llm_subcalls_metric": [1.0, 0.0],
             "num_llm_subcalls_metric": [3.0, 0.0],
@@ -70,7 +72,9 @@ def test_rlm_cost_subcall_metrics_emit_primary_namespaces() -> None:
     metrics = rlm_cost_subcall_metrics(results_df, metrics_df, prefix="all")
 
     assert metrics["cost/all/total_tokens_mean"] == 150.0
+    assert metrics["cost/all/rlm_turn_tokens_mean"] == 120.0
     assert metrics["cost/all/plain_subcall_tokens_mean"] == 30.0
+    assert metrics["cost/all/weighted_tokens_mean"] == 990.0
     assert metrics["cost/all/adaptive_cost_penalty_mean"] == 0.05
     assert metrics["subcalls/all/llm_usage_rate"] == 0.5
     assert metrics["subcalls/all/num_llm_mean"] == 1.5

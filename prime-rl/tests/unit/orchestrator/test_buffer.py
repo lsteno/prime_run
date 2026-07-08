@@ -226,6 +226,41 @@ def test_buffer_online_difficulty_filtering_filters_easy_by_correctness_without_
     assert metrics["filtered_rollouts/easy"] == pytest.approx(1 / 3)
 
 
+def test_buffer_online_filtering_can_retire_all_correct_examples(dummy_env_group, make_rollouts, tmp_path):
+    """All-correct groups can be filtered from the update and retired from future sampling."""
+    dataset = dummy_env_group.get_dataset()
+    buffer = Buffer(
+        dataset,
+        dummy_env_group.env_names,
+        BufferConfig(
+            online_difficulty_filtering=True,
+            online_filter_easy=True,
+            easy_threshold=1.0,
+            easy_fraction=0.0,
+            hash_keys=["prompt", "task"],
+        ),
+    )
+    retired_example_id = dataset[0]["example_id"]
+
+    buffer.update(make_rollouts(dataset.select(range(1)), rewards=[0.75], correctness=[1.0]))
+
+    assert len(buffer.rollout_buffer) == 0
+    assert len(buffer.easy_examples) == 1
+    assert retired_example_id not in get_normal_ids(buffer)
+    assert all(example["example_id"] != retired_example_id for example in buffer.sample_examples(20))
+
+    buffer.save(tmp_path / "buffer")
+    reloaded = Buffer(
+        dataset,
+        dummy_env_group.env_names,
+        BufferConfig(easy_fraction=0.0, hash_keys=["prompt", "task"]),
+    )
+    reloaded.load(tmp_path / "buffer")
+
+    assert len(reloaded.easy_examples) == 1
+    assert retired_example_id not in get_normal_ids(reloaded)
+
+
 def test_buffer_no_filtering_by_default(dummy_env_group, make_rollouts):
     """With online_difficulty_filtering=False (default), all rollouts are kept."""
     dataset = dummy_env_group.get_dataset()

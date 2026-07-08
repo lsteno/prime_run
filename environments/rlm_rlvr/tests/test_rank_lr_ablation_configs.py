@@ -8,6 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 ABLATION_DIR = ROOT / "configs/rlm_rlvr/ablation_rank_lr"
 DEPTH1_H100_LORA_DIR = ROOT / "configs/rlm_rlvr/ablation_depth1_h100_lora_same_root"
+DEPTH1_H100_TRAINABLE_SUBCALL_RERUN_DIR = ROOT / "configs/rlm_rlvr/rerun_depth1_h100_lora_trainable_subcalls"
 FULL_FT_CONFIG = (
     ROOT
     / "configs/rlm_rlvr/full_ft/qwen3_4b_instruct_sanjaya_depth1_llmonly_fullft_lr1e-6_s150_8xa10080_bal35f40v1.toml"
@@ -21,6 +22,11 @@ def _load_manifest() -> list[dict[str, str]]:
 
 def _load_depth1_h100_lora_manifest() -> list[dict[str, str]]:
     with (DEPTH1_H100_LORA_DIR / "manifest.csv").open(newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _load_depth1_h100_trainable_subcall_rerun_manifest() -> list[dict[str, str]]:
+    with (DEPTH1_H100_TRAINABLE_SUBCALL_RERUN_DIR / "manifest.csv").open(newline="") as handle:
         return list(csv.DictReader(handle))
 
 
@@ -304,6 +310,65 @@ def test_depth1_h100_lora_sweep_configs_match_manifest() -> None:
         assert inference["parallel"]["dp"] == 4
         assert inference["parallel"]["tp"] == 1
         assert inference["deployment"]["gpus_per_node"] == 4
+
+
+def test_depth1_h100_trainable_subcall_rerun_config() -> None:
+    rows = _load_depth1_h100_trainable_subcall_rerun_manifest()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["rank"] == "4"
+    assert row["alpha"] == "8"
+    assert row["lr"] == "1e-4"
+    assert row["status"] == "pending"
+    assert "train_plain_llm_subcalls=true" in row["notes"]
+    assert row["max_trainable_llm_subcalls_per_rollout"] == "3"
+    assert "max_trainable_llm_subcalls_per_rollout=3" in row["notes"]
+    assert row["adaptive_efficiency_beta_max"] == "1.0"
+    assert row["adaptive_efficiency_cost_basis"] == "weighted_turn_tokens"
+    assert row["efficiency_root_token_multiplier"] == "8.0"
+    assert row["efficiency_plain_subcall_token_multiplier"] == "1.0"
+    assert row["max_turn_penalty"] == "0.5"
+    assert row["judge_candidate_max_chars"] == "8192"
+    assert row["judge_question_max_chars"] == "32768"
+    assert row["judge_expected_max_chars"] == "8192"
+    assert "easy_threshold=1.0" in row["notes"]
+
+    config = tomllib.loads((ROOT / row["config_path"]).read_text())
+    assert config["output_dir"] == f"../{row['output_dir']}"
+    assert config["wandb"]["name"] == row["wandb_name"]
+    assert config["model"]["name"] == "Qwen/Qwen3-4B-Instruct-2507"
+    assert config["trainer"]["optim"]["lr"] == 1e-4
+    assert config["trainer"]["model"]["lora"]["rank"] == 4
+    assert config["trainer"]["model"]["lora"]["alpha"] == 8
+    assert config["ckpt"] == {"interval": 25, "keep_last": 2, "keep_interval": 100}
+    assert config["orchestrator"]["max_trainable_llm_subcalls_per_rollout"] == 3
+
+    buffer = config["orchestrator"]["buffer"]
+    assert buffer["online_difficulty_filtering"] is True
+    assert buffer["online_filter_easy"] is True
+    assert buffer["easy_threshold"] == 1.0
+    assert buffer["easy_fraction"] == 0.0
+    assert buffer["hard_threshold"] == 0.0
+    assert buffer["hard_cooldown_steps"] == 5
+
+    for args in (config["orchestrator"]["env"][0]["args"], config["orchestrator"]["eval"]["env"][0]["args"]):
+        assert args["prompt_variant"] == "sanjaya_text_depth1_llm_only_v1"
+        assert args["max_depth"] == 0
+        assert args["train_plain_llm_subcalls"] is True
+        assert "llm_subcall_provider" not in args
+        assert "llm_subcall_model" not in args
+        assert args["subcall_batch_max_workers"] == 2
+        assert args["judge_provider"] == "vertex"
+        assert args["max_turn_penalty"] == 0.5
+        assert args["judge_candidate_max_chars"] == 8192
+        assert args["judge_question_max_chars"] == 32768
+        assert args["judge_expected_max_chars"] == 8192
+
+    train_args = config["orchestrator"]["env"][0]["args"]
+    assert train_args["adaptive_efficiency_beta_max"] == 1.0
+    assert train_args["adaptive_efficiency_cost_basis"] == "weighted_turn_tokens"
+    assert train_args["efficiency_root_token_multiplier"] == 8.0
+    assert train_args["efficiency_plain_subcall_token_multiplier"] == 1.0
 
 
 def test_full_ft_pilot_config_removes_lora_and_uses_nccl_broadcast() -> None:

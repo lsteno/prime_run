@@ -49,6 +49,7 @@ class WandbMonitor(Monitor):
                     "W&B online mode requires authentication. Set WANDB_API_KEY or run `wandb login` before starting the run."
                 )
         self.wandb = wandb.init(
+            entity=config.entity,
             project=config.project,
             name=config.name,
             id=config.id,

@@ -52,8 +52,9 @@ _JUDGE_RETRY_BASE_SECONDS = 1.0
 _JUDGE_RETRY_MAX_SECONDS = 30.0
 _VERTEX_JUDGE_MAX_OUTPUT_TOKENS = 1024
 _VALID_EFFICIENCY_PENALTY_MODES = {"static_per_1k", "adaptive_group"}
-_VALID_ADAPTIVE_COST_BASES = {"total_tokens"}
+_VALID_ADAPTIVE_COST_BASES = {"total_tokens", "weighted_turn_tokens"}
 _VALID_EFFICIENCY_PENALTY_SCOPES = {"correct_only", "all_rollouts"}
+_JUDGE_TRUNCATION_MARKER = "\n\n[truncated before semantic judging]"
 
 
 @dataclass(frozen=True)
@@ -71,7 +72,30 @@ class TokenBreakdown:
     completion_tokens: int
     total_tokens: int
     trainable_tokens: int
+    rlm_turn_tokens: int
     plain_subcall_tokens: int
+
+
+def _truncate_for_judge(text: str, *, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    keep_chars = max(0, max_chars - len(_JUDGE_TRUNCATION_MARKER))
+    return text[:keep_chars].rstrip() + _JUDGE_TRUNCATION_MARKER
+
+
+def _is_oversized_judge_exception(exc: BaseException) -> bool:
+    error_text = f"{type(exc).__name__}: {exc}".casefold()
+    return any(
+        marker in error_text
+        for marker in (
+            "text fields that are too large",
+            "input token count",
+            "exceeds",
+            "too many tokens",
+            "request payload size exceeds",
+            "payload too large",
+        )
+    )
 
 
 def _get_predicted_answer(state: vf.State, completion) -> str:
@@ -501,6 +525,7 @@ def _segment_rollout_token_breakdown(state: vf.State) -> TokenBreakdown:
         prompt_tokens = 0
         completion_tokens = 0
         trainable_tokens = 0
+        rlm_turn_tokens = 0
         plain_subcall_tokens = 0
         for segment in segments:
             if not isinstance(segment, dict):
@@ -522,11 +547,14 @@ def _segment_rollout_token_breakdown(state: vf.State) -> TokenBreakdown:
                 trainable_tokens += segment_total_tokens
             if segment.get("kind") == "plain_query" or segment.get("train_scope") == "llm_subcall":
                 plain_subcall_tokens += segment_total_tokens
+            else:
+                rlm_turn_tokens += segment_total_tokens
         return TokenBreakdown(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
             trainable_tokens=trainable_tokens,
+            rlm_turn_tokens=rlm_turn_tokens,
             plain_subcall_tokens=plain_subcall_tokens,
         )
 
@@ -537,6 +565,7 @@ def _segment_rollout_token_breakdown(state: vf.State) -> TokenBreakdown:
         completion_tokens=completion_tokens,
         total_tokens=prompt_tokens + completion_tokens,
         trainable_tokens=prompt_tokens + completion_tokens,
+        rlm_turn_tokens=prompt_tokens + completion_tokens,
         plain_subcall_tokens=0,
     )
 
@@ -560,7 +589,9 @@ def _record_reward_breakdown(
     completion_tokens: int,
     total_tokens: int,
     trainable_tokens: int | None = None,
+    rlm_turn_tokens: int | None = None,
     plain_subcall_tokens: int | None = None,
+    weighted_tokens: float | None = None,
     group_solve_rate: float | None = None,
     adaptive_beta: float | None = None,
     adaptive_normalized_cost: float | None = None,
@@ -578,8 +609,12 @@ def _record_reward_breakdown(
     state["cost_total_tokens"] = float(total_tokens)
     if trainable_tokens is not None:
         state["cost_trainable_tokens"] = float(trainable_tokens)
+    if rlm_turn_tokens is not None:
+        state["cost_rlm_turn_tokens"] = float(rlm_turn_tokens)
     if plain_subcall_tokens is not None:
         state["cost_plain_subcall_tokens"] = float(plain_subcall_tokens)
+    if weighted_tokens is not None:
+        state["cost_weighted_tokens"] = float(weighted_tokens)
     if group_solve_rate is not None:
         state["reward_group_solve_rate"] = group_solve_rate
     if adaptive_beta is not None:
@@ -605,8 +640,12 @@ def _record_reward_breakdown(
     }
     if trainable_tokens is not None:
         debug_payload["cost_trainable_tokens"] = trainable_tokens
+    if rlm_turn_tokens is not None:
+        debug_payload["cost_rlm_turn_tokens"] = rlm_turn_tokens
     if plain_subcall_tokens is not None:
         debug_payload["cost_plain_subcall_tokens"] = plain_subcall_tokens
+    if weighted_tokens is not None:
+        debug_payload["cost_weighted_tokens"] = weighted_tokens
     if group_solve_rate is not None:
         debug_payload["reward_group_solve_rate"] = group_solve_rate
     if adaptive_beta is not None:
@@ -718,6 +757,9 @@ async def _score_correctness(
     judge_client: Any,
     judge_model: str,
     judge_thinking_level: str | None,
+    judge_candidate_max_chars: int,
+    judge_question_max_chars: int,
+    judge_expected_max_chars: int,
 ) -> CorrectnessResult:
     predicted_answer = _get_predicted_answer(state, completion).strip()
     expected_answers = _get_expected_answers(answer, info)
@@ -730,6 +772,24 @@ async def _score_correctness(
             score=0.0,
             raw_response="0",
             parse_error=None,
+        )
+        _record_judge_payload(
+            state,
+            predicted_answer=result.predicted_answer,
+            expected_answers=result.expected_answers,
+            score=result.score,
+            raw_response=result.raw_response,
+            parse_error=result.parse_error,
+        )
+        return result
+
+    if len(predicted_answer) > judge_candidate_max_chars:
+        result = CorrectnessResult(
+            predicted_answer=predicted_answer,
+            expected_answers=expected_answers,
+            score=0.0,
+            raw_response="[candidate_too_large]",
+            parse_error="candidate_too_large",
         )
         _record_judge_payload(
             state,
@@ -779,18 +839,26 @@ async def _score_correctness(
         )
         return result
 
+    judge_expected_answers = [
+        _truncate_for_judge(str(expected_answer), max_chars=judge_expected_max_chars) for expected_answer in expected_answers
+    ]
     judge_prompt = JUDGE_PROMPT.format(
-        question=question or "(not provided)",
-        expected_answers=_format_expected_answers(expected_answers),
+        question=_truncate_for_judge(question or "(not provided)", max_chars=judge_question_max_chars),
+        expected_answers=_format_expected_answers(judge_expected_answers),
         predicted_answer=predicted_answer,
     )
     if judge_provider == "vertex":
-        score, raw_response, parse_error = await _call_vertex_binary_judge(
-            judge_client,
-            judge_model=judge_model,
-            judge_prompt=judge_prompt,
-            thinking_level=judge_thinking_level,
-        )
+        try:
+            score, raw_response, parse_error = await _call_vertex_binary_judge(
+                judge_client,
+                judge_model=judge_model,
+                judge_prompt=judge_prompt,
+                thinking_level=judge_thinking_level,
+            )
+        except Exception as exc:
+            if not _is_oversized_judge_exception(exc):
+                raise
+            score, raw_response, parse_error = 0.0, f"[vertex_oversized_input: {type(exc).__name__}]", "vertex_input_too_large"
     else:
         score, raw_response, parse_error = await _call_binary_judge(
             judge_client,
@@ -826,6 +894,9 @@ async def _score_correctness_with_protocol(
     judge_client: Any,
     judge_model: str,
     judge_thinking_level: str | None,
+    judge_candidate_max_chars: int,
+    judge_question_max_chars: int,
+    judge_expected_max_chars: int,
     missing_final_at_max_turn_zero_reward: bool,
 ) -> CorrectnessResult:
     if missing_final_at_max_turn_zero_reward and _missing_formal_final_at_max_turn(state):
@@ -856,6 +927,9 @@ async def _score_correctness_with_protocol(
         judge_client=judge_client,
         judge_model=judge_model,
         judge_thinking_level=judge_thinking_level,
+        judge_candidate_max_chars=judge_candidate_max_chars,
+        judge_question_max_chars=judge_question_max_chars,
+        judge_expected_max_chars=judge_expected_max_chars,
     )
 
 
@@ -868,13 +942,39 @@ def _adaptive_beta_for_solve_rate(*, solve_rate: float, beta_max: float, gamma: 
     return beta_max * (ramp**gamma)
 
 
-def _adaptive_cost_value(state: vf.State, *, cost_basis: str) -> int:
-    if cost_basis != "total_tokens":
+def _weighted_turn_token_cost(
+    breakdown: TokenBreakdown,
+    *,
+    root_token_multiplier: float,
+    plain_subcall_token_multiplier: float,
+) -> float:
+    return (
+        float(root_token_multiplier) * float(breakdown.rlm_turn_tokens)
+        + float(plain_subcall_token_multiplier) * float(breakdown.plain_subcall_tokens)
+    )
+
+
+def _adaptive_cost_value(
+    state: vf.State,
+    *,
+    cost_basis: str,
+    root_token_multiplier: float,
+    plain_subcall_token_multiplier: float,
+) -> float:
+    breakdown = _segment_rollout_token_breakdown(state)
+    if cost_basis == "total_tokens":
+        return float(breakdown.total_tokens)
+    if cost_basis == "weighted_turn_tokens":
+        return _weighted_turn_token_cost(
+            breakdown,
+            root_token_multiplier=root_token_multiplier,
+            plain_subcall_token_multiplier=plain_subcall_token_multiplier,
+        )
+    else:
         raise ValueError(f"adaptive_efficiency_cost_basis must be one of {sorted(_VALID_ADAPTIVE_COST_BASES)}")
-    return _segment_rollout_token_breakdown(state).total_tokens
 
 
-def _min_max_normalized(value: int, *, min_value: int, max_value: int) -> float:
+def _min_max_normalized(value: float, *, min_value: float, max_value: float) -> float:
     span = max_value - min_value
     if span <= 0:
         return 0.0
@@ -900,12 +1000,17 @@ def build_rubric(
     adaptive_efficiency_gamma: float = 2.0,
     adaptive_efficiency_solve_rate_floor: float = 0.25,
     adaptive_efficiency_cost_basis: str = "total_tokens",
+    efficiency_root_token_multiplier: float = 1.0,
+    efficiency_plain_subcall_token_multiplier: float = 1.0,
     efficiency_penalty_applies_to: str = "correct_only",
     reward_clip_min: float = 0.0,
     reward_clip_max: float = 1.0,
     max_turn_penalty_enabled: bool = False,
     max_turn_penalty: float = 0.25,
     missing_final_at_max_turn_zero_reward: bool = True,
+    judge_candidate_max_chars: int = 8192,
+    judge_question_max_chars: int = 32768,
+    judge_expected_max_chars: int = 8192,
 ) -> vf.Rubric:
     if efficiency_penalty_mode not in _VALID_EFFICIENCY_PENALTY_MODES:
         raise ValueError(f"efficiency_penalty_mode must be one of {sorted(_VALID_EFFICIENCY_PENALTY_MODES)}")
@@ -921,8 +1026,18 @@ def build_rubric(
         raise ValueError("adaptive_efficiency_gamma must be > 0.0")
     if not 0.0 <= adaptive_efficiency_solve_rate_floor < 1.0:
         raise ValueError("adaptive_efficiency_solve_rate_floor must be >= 0.0 and < 1.0")
+    if efficiency_root_token_multiplier < 0.0:
+        raise ValueError("efficiency_root_token_multiplier must be >= 0.0")
+    if efficiency_plain_subcall_token_multiplier < 0.0:
+        raise ValueError("efficiency_plain_subcall_token_multiplier must be >= 0.0")
     if max_turn_penalty < 0.0:
         raise ValueError("max_turn_penalty must be >= 0.0")
+    if judge_candidate_max_chars < 1:
+        raise ValueError("judge_candidate_max_chars must be >= 1")
+    if judge_question_max_chars < 1:
+        raise ValueError("judge_question_max_chars must be >= 1")
+    if judge_expected_max_chars < 1:
+        raise ValueError("judge_expected_max_chars must be >= 1")
 
     if judge_provider == "vertex":
         if not judge_vertex_project:
@@ -948,10 +1063,18 @@ def build_rubric(
             judge_client=judge_client,
             judge_model=judge_model,
             judge_thinking_level=judge_thinking_level,
+            judge_candidate_max_chars=judge_candidate_max_chars,
+            judge_question_max_chars=judge_question_max_chars,
+            judge_expected_max_chars=judge_expected_max_chars,
             missing_final_at_max_turn_zero_reward=missing_final_at_max_turn_zero_reward,
         )
         efficiency_penalty, prompt_tokens, completion_tokens, total_tokens = _efficiency_penalty_from_state(state)
         breakdown = _segment_rollout_token_breakdown(state)
+        weighted_tokens = _weighted_turn_token_cost(
+            breakdown,
+            root_token_multiplier=efficiency_root_token_multiplier,
+            plain_subcall_token_multiplier=efficiency_plain_subcall_token_multiplier,
+        )
         terminal_penalty = _max_turn_penalty_from_state(
             state,
             correctness=correctness_result.score,
@@ -976,7 +1099,9 @@ def build_rubric(
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
             trainable_tokens=breakdown.trainable_tokens,
+            rlm_turn_tokens=breakdown.rlm_turn_tokens,
             plain_subcall_tokens=breakdown.plain_subcall_tokens,
+            weighted_tokens=weighted_tokens,
             incorrect_cost_penalty=scoped_efficiency_penalty if correctness_result.score <= 0.0 else 0.0,
             max_turn_penalty=terminal_penalty,
         )
@@ -994,6 +1119,9 @@ def build_rubric(
                     judge_client=judge_client,
                     judge_model=judge_model,
                     judge_thinking_level=judge_thinking_level,
+                    judge_candidate_max_chars=judge_candidate_max_chars,
+                    judge_question_max_chars=judge_question_max_chars,
+                    judge_expected_max_chars=judge_expected_max_chars,
                     missing_final_at_max_turn_zero_reward=missing_final_at_max_turn_zero_reward,
                 )
                 for state in states
@@ -1008,7 +1136,15 @@ def build_rubric(
             solve_rate_floor=adaptive_efficiency_solve_rate_floor,
         )
 
-        costs = [_adaptive_cost_value(state, cost_basis=adaptive_efficiency_cost_basis) for state in states]
+        costs = [
+            _adaptive_cost_value(
+                state,
+                cost_basis=adaptive_efficiency_cost_basis,
+                root_token_multiplier=efficiency_root_token_multiplier,
+                plain_subcall_token_multiplier=efficiency_plain_subcall_token_multiplier,
+            )
+            for state in states
+        ]
         correct_costs = [cost for cost, correctness in zip(costs, correctness_scores, strict=True) if correctness > 0.0]
         if efficiency_penalty_applies_to == "all_rollouts":
             normalization_costs = costs
@@ -1020,6 +1156,11 @@ def build_rubric(
         rewards: list[float] = []
         for state, correctness, cost in zip(states, correctness_scores, costs, strict=True):
             breakdown = _segment_rollout_token_breakdown(state)
+            weighted_tokens = _weighted_turn_token_cost(
+                breakdown,
+                root_token_multiplier=efficiency_root_token_multiplier,
+                plain_subcall_token_multiplier=efficiency_plain_subcall_token_multiplier,
+            )
             normalized_cost = 0.0
             applies_to_rollout = correctness > 0.0 or efficiency_penalty_applies_to == "all_rollouts"
             if applies_to_rollout:
@@ -1045,7 +1186,9 @@ def build_rubric(
                 completion_tokens=breakdown.completion_tokens,
                 total_tokens=breakdown.total_tokens,
                 trainable_tokens=breakdown.trainable_tokens,
+                rlm_turn_tokens=breakdown.rlm_turn_tokens,
                 plain_subcall_tokens=breakdown.plain_subcall_tokens,
+                weighted_tokens=weighted_tokens,
                 group_solve_rate=solve_rate,
                 adaptive_beta=beta,
                 adaptive_normalized_cost=normalized_cost,
@@ -1109,8 +1252,16 @@ async def cost_trainable_tokens_metric(state: vf.State) -> float:
     return float(state.get("cost_trainable_tokens", 0.0))
 
 
+async def cost_rlm_turn_tokens_metric(state: vf.State) -> float:
+    return float(state.get("cost_rlm_turn_tokens", 0.0))
+
+
 async def cost_plain_subcall_tokens_metric(state: vf.State) -> float:
     return float(state.get("cost_plain_subcall_tokens", 0.0))
+
+
+async def cost_weighted_tokens_metric(state: vf.State) -> float:
+    return float(state.get("cost_weighted_tokens", 0.0))
 
 
 async def adaptive_group_solve_rate_metric(state: vf.State) -> float:
@@ -1194,7 +1345,9 @@ def add_metrics(rubric: vf.Rubric) -> vf.Rubric:
     rubric.add_metric(cost_completion_tokens_metric)
     rubric.add_metric(cost_total_tokens_metric)
     rubric.add_metric(cost_trainable_tokens_metric)
+    rubric.add_metric(cost_rlm_turn_tokens_metric)
     rubric.add_metric(cost_plain_subcall_tokens_metric)
+    rubric.add_metric(cost_weighted_tokens_metric)
     rubric.add_metric(adaptive_group_solve_rate_metric)
     rubric.add_metric(adaptive_beta_metric)
     rubric.add_metric(adaptive_normalized_cost_metric)

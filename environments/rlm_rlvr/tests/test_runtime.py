@@ -1906,6 +1906,51 @@ def test_plain_query_segments_are_non_trainable_llm_subcalls() -> None:
     }
 
 
+def test_plain_query_segments_can_be_trainable_same_root_subcalls() -> None:
+    class _StubSession:
+        model_name = "fake-model"
+
+        def generate(self, *, messages, max_tokens: int, temperature: float, top_p: float):
+            del messages, max_tokens, temperature, top_p
+            return (
+                "plain answer",
+                TokenPayload(
+                    prompt_ids=[11, 12],
+                    completion_ids=[21, 22],
+                    completion_logprobs=[-0.1, -0.2],
+                    completion_mask=[True, True],
+                ),
+            )
+
+    state = _runtime_state(_sync_session=_StubSession())
+    runtime = RecursiveRuntime(
+        state,
+        RuntimeConfig(
+            subcall_max_tokens=4,
+            temperature=0.0,
+            top_p=1.0,
+            capture_prompt_messages=True,
+            train_plain_llm_subcalls=True,
+            live_trace_dir=None,
+        ),
+    )
+
+    runtime._plain_query("solve this subproblem")
+
+    segment = state["rlm_segments"][0]
+    assert segment["train_scope"] == "llm_subcall"
+    assert segment["is_trainable_rlm_turn"] is True
+    assert segment["prompt_ids"] == [11, 12]
+    assert segment["completion_ids"] == [21, 22]
+    assert segment["completion_logprobs"] == [-0.1, -0.2]
+    assert segment["prompt_messages"] == [{"role": "user", "content": "solve this subproblem"}]
+
+
+def test_train_plain_llm_subcalls_requires_same_root_subcalls() -> None:
+    with pytest.raises(ValueError, match="requires same-root plain subcalls"):
+        RuntimeConfig(train_plain_llm_subcalls=True, llm_subcall_model="external-model")
+
+
 def test_live_trace_compacts_segments_without_token_arrays(tmp_path) -> None:
     from rlm_rlvr.live_trace import write_live_trace
 
