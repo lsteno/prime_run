@@ -315,6 +315,7 @@ def test_semantic_subcall_cap_samples_distinct_chunks_and_exposes_local_advantag
     assert result.samples is not None
     assert result.sample_local_advantages is not None
     assert len(result.samples) == 3
+    assert all(sample.loss_branch == "semantic_child" for sample in result.samples)
     selected_orders = {sample.prompt_ids[0] - 100 for sample in result.samples}
     selected_chunks = {
         next(segment["semantic_primary_chunk_id"] for segment in subcalls if segment["order"] == order)
@@ -359,6 +360,7 @@ def test_semantic_child_only_rollout_emits_no_root_sample() -> None:
 
     assert result.samples is not None
     assert [sample.prompt_ids for sample in result.samples] == [[101]]
+    assert result.samples[0].loss_branch == "semantic_child"
     assert result.sample_local_advantages == [-0.5]
 
 

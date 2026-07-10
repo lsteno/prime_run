@@ -159,6 +159,11 @@ def rollout_to_training_sample_result(
             completion_temperatures=[float(segment.get("temperature", default_temperature))] * len(completion_ids),
             teacher_logprobs=None,
             advantage=None,
+            loss_branch=(
+                "semantic_child"
+                if bool(segment.get("semantic_child_segment")) and bool(segment.get("semantic_local_signal"))
+                else "root"
+            ),
         )
         samples.append(sample)
         local_advantage = segment.get("semantic_local_advantage")

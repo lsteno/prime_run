@@ -2005,6 +2005,39 @@ def test_plain_query_segments_can_be_trainable_same_root_subcalls() -> None:
     assert segment["prompt_messages"] == [{"role": "user", "content": "solve this subproblem"}]
 
 
+def test_plain_query_records_structured_semantic_evidence_without_raw_text() -> None:
+    class _StubSession:
+        model_name = "fake-model"
+
+        def generate(self, *, messages, max_tokens: int, temperature: float, top_p: float):
+            del messages, max_tokens, temperature, top_p
+            return (
+                "positive",
+                TokenPayload(
+                    prompt_ids=[11],
+                    completion_ids=[21],
+                    completion_logprobs=[-0.1],
+                    completion_mask=[True],
+                ),
+            )
+
+    state = _runtime_state(_sync_session=_StubSession())
+    runtime = RecursiveRuntime(
+        state,
+        RuntimeConfig(train_plain_llm_subcalls=True, capture_prompt_messages=False, live_trace_dir=None),
+    )
+    runtime._plain_query(
+        "### chunk_001\nRecord ID: r00001 || Text: a semantic review\n"
+        "Record ID: r00002 || Text: another semantic review"
+    )
+
+    segment = state["rlm_segments"][0]
+    assert set(segment["semantic_prompt_record_hashes"]) == {"r00001", "r00002"}
+    assert segment["semantic_prompt_chunk_ids"] == ["chunk_001"]
+    assert "prompt_messages" not in segment
+    assert "semantic review" not in json.dumps(segment)
+
+
 def test_train_plain_llm_subcalls_requires_same_root_subcalls() -> None:
     with pytest.raises(ValueError, match="requires same-root plain subcalls"):
         RuntimeConfig(train_plain_llm_subcalls=True, llm_subcall_model="external-model")

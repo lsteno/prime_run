@@ -13,6 +13,8 @@ from typing import Any, Awaitable, Callable
 from openai import AsyncOpenAI
 import verifiers as vf
 
+from .semantic_evidence import parse_semantic_prompt_evidence
+
 JUDGE_PROMPT = """You are a binary grader.
 
 You will be given three things:
@@ -313,7 +315,7 @@ def _is_oolong_semantic_aggregation_task(info: dict[str, Any] | None) -> bool:
     derived_dataset = str(metadata.get("derived_dataset") or "")
     return derived_dataset == "oolong_semantic_agg_v2" or (
         source_task.startswith("TASK_TYPE.SEMANTIC_")
-        and derived_dataset != "oolong_semantic_delegation_v3"
+        and derived_dataset not in {"oolong_semantic_delegation_v3", "oolong_semantic_delegation_v4"}
     )
 
 
@@ -323,7 +325,10 @@ def _semantic_delegation_metadata(info: dict[str, Any] | None) -> dict[str, Any]
     metadata = info.get("metadata")
     if not isinstance(metadata, dict):
         return None
-    if metadata.get("derived_dataset") != "oolong_semantic_delegation_v3":
+    if metadata.get("derived_dataset") not in {
+        "oolong_semantic_delegation_v3",
+        "oolong_semantic_delegation_v4",
+    }:
         return None
     return metadata
 
@@ -408,7 +413,7 @@ def _score_semantic_delegation_v3(
     )
 
 
-def _annotate_semantic_child_segments(state: vf.State, info: dict[str, Any] | None) -> None:
+def _annotate_semantic_child_segments_v3(state: vf.State, info: dict[str, Any] | None) -> None:
     metadata = _semantic_delegation_metadata(info)
     if metadata is None:
         return
@@ -504,6 +509,216 @@ def _annotate_semantic_child_segments(state: vf.State, info: dict[str, Any] | No
     state["semantic_duplicate_coverage"] = (
         (len(queried_ids) - len(unique_queried)) / len(queried_ids) if queried_ids else 0.0
     )
+
+
+def _strict_semantic_input(
+    segment: dict[str, Any],
+    *,
+    gold_labels: dict[str, str],
+    record_chunks: dict[str, str],
+    context_hashes: dict[str, str],
+    chunk_records: dict[str, set[str]],
+    min_record_map_records: int,
+) -> tuple[str | None, list[str], str | None, bool]:
+    prompt_hashes = {
+        str(record_id).casefold(): str(text_hash)
+        for record_id, text_hash in (segment.get("semantic_prompt_record_hashes") or {}).items()
+    }
+    prompt_ids = list(prompt_hashes)
+    if not prompt_ids:
+        return None, [], "no_structured_records", False
+    if segment.get("semantic_prompt_malformed_record_lines"):
+        return None, [], "malformed_record_line", False
+    if segment.get("semantic_prompt_duplicate_record_ids"):
+        return None, [], "duplicate_record_id", False
+    if any(record_id not in gold_labels or record_id not in context_hashes for record_id in prompt_ids):
+        return None, [], "unknown_record_id", False
+    if any(prompt_hashes[record_id] != context_hashes[record_id] for record_id in prompt_ids):
+        return None, [], "record_text_mismatch", False
+
+    chunks = {record_chunks[record_id] for record_id in prompt_ids}
+    if len(chunks) != 1:
+        return None, [], "mixed_chunks", False
+    chunk_id = next(iter(chunks))
+    full_chunk = set(prompt_ids) == chunk_records.get(chunk_id, set())
+    if full_chunk:
+        return chunk_id, prompt_ids, None, True
+    if len(prompt_ids) < min_record_map_records:
+        return None, prompt_ids, "too_few_records", False
+    return chunk_id, prompt_ids, None, False
+
+
+def _score_strict_semantic_child(
+    response_text: str,
+    *,
+    chunk_id: str,
+    prompt_ids: list[str],
+    full_chunk: bool,
+    gold_labels: dict[str, str],
+    chunk_labels: dict[str, str],
+    label_space: list[str],
+) -> tuple[str, float, float, bool, int]:
+    parsed = _extract_json_object(response_text)
+    normalized_chunk_label: str | None = None
+    if full_chunk:
+        if parsed is not None and set(map(str, parsed)) == {chunk_id}:
+            normalized_chunk_label = _normalize_semantic_label(parsed[chunk_id], label_space)
+        elif parsed is None:
+            normalized_chunk_label = _normalize_semantic_label(response_text, label_space)
+    if normalized_chunk_label is not None:
+        accuracy = float(normalized_chunk_label == chunk_labels[chunk_id])
+        return "chunk_label", accuracy, 1.0, True, 1
+
+    predictions: dict[str, str] = {}
+    schema_valid = parsed is not None
+    if parsed is not None:
+        prompt_lookup = {record_id.casefold(): record_id for record_id in prompt_ids}
+        for raw_id, raw_label in parsed.items():
+            record_id = prompt_lookup.get(str(raw_id).casefold())
+            label = _normalize_semantic_label(raw_label, label_space)
+            if record_id is None or label is None:
+                schema_valid = False
+                continue
+            predictions[record_id] = label
+
+    correct = sum(predictions.get(record_id) == gold_labels[record_id] for record_id in prompt_ids)
+    accuracy = correct / len(prompt_ids) if schema_valid else 0.0
+    coverage = len(predictions) / len(prompt_ids)
+    return "record_map", accuracy, coverage, schema_valid, len(predictions)
+
+
+def _annotate_semantic_child_segments_v4(state: vf.State, info: dict[str, Any]) -> None:
+    metadata = _semantic_delegation_metadata(info)
+    assert metadata is not None
+    gold_labels = {
+        str(record_id).casefold(): str(label)
+        for record_id, label in (metadata.get("record_labels") or {}).items()
+    }
+    record_chunks = {
+        str(record_id).casefold(): str(chunk_id)
+        for record_id, chunk_id in (metadata.get("record_chunks") or {}).items()
+    }
+    chunk_labels = {
+        str(chunk_id): str(label)
+        for chunk_id, label in (metadata.get("chunk_labels") or {}).items()
+    }
+    chunk_records: dict[str, set[str]] = {}
+    for record_id, chunk_id in record_chunks.items():
+        chunk_records.setdefault(chunk_id, set()).add(record_id)
+    context_hashes = parse_semantic_prompt_evidence(str(info.get("context") or "")).record_hashes
+    label_space = [str(label) for label in metadata.get("label_space") or []]
+    min_records = int(state.get("semantic_record_map_min_records", 8))
+    segments = state.get("rlm_segments")
+    if not isinstance(segments, list):
+        return
+
+    child_count = 0
+    verified_count = 0
+    valid_output_count = 0
+    chunk_contract_count = 0
+    record_contract_count = 0
+    exact_count = 0
+    local_accuracy_sum = 0.0
+    local_coverage_sum = 0.0
+    prediction_count = 0
+    expected_count = 0
+    queried_ids: list[str] = []
+    verified_full_chunks: set[str] = set()
+    rejection_counts: dict[str, int] = {}
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        if segment.get("kind") != "plain_query" and segment.get("train_scope") != "llm_subcall":
+            continue
+        child_count += 1
+        segment["semantic_child_segment"] = True
+        chunk_id, prompt_ids, rejection_reason, full_chunk = _strict_semantic_input(
+            segment,
+            gold_labels=gold_labels,
+            record_chunks=record_chunks,
+            context_hashes=context_hashes,
+            chunk_records=chunk_records,
+            min_record_map_records=min_records,
+        )
+        segment["semantic_recognized_record_count"] = len(prompt_ids)
+        segment["semantic_recognized_chunk_ids"] = [chunk_id] if chunk_id else []
+        segment["semantic_primary_chunk_id"] = chunk_id
+        segment["semantic_full_chunk"] = full_chunk
+        segment["semantic_input_verified"] = rejection_reason is None
+        segment["semantic_input_rejection_reason"] = rejection_reason
+        if rejection_reason is not None or chunk_id is None:
+            segment["semantic_local_signal"] = False
+            segment["semantic_local_schema_valid"] = False
+            rejection_counts[rejection_reason or "unknown"] = rejection_counts.get(rejection_reason or "unknown", 0) + 1
+            continue
+
+        verified_count += 1
+        queried_ids.extend(prompt_ids)
+        if full_chunk:
+            verified_full_chunks.add(chunk_id)
+        contract, accuracy, coverage, schema_valid, predictions = _score_strict_semantic_child(
+            str(segment.get("response_text") or ""),
+            chunk_id=chunk_id,
+            prompt_ids=prompt_ids,
+            full_chunk=full_chunk,
+            gold_labels=gold_labels,
+            chunk_labels=chunk_labels,
+            label_space=label_space,
+        )
+        local_advantage = 2.0 * accuracy - 1.0
+        segment.update(
+            {
+                "semantic_local_signal": True,
+                "semantic_local_contract": contract,
+                "semantic_local_accuracy": accuracy,
+                "semantic_local_coverage": coverage,
+                "semantic_local_schema_valid": schema_valid,
+                "semantic_local_advantage": local_advantage,
+                "semantic_local_exact": float(accuracy == 1.0 and schema_valid),
+                "semantic_local_prediction_count": predictions,
+            }
+        )
+        valid_output_count += int(schema_valid)
+        chunk_contract_count += int(contract == "chunk_label")
+        record_contract_count += int(contract == "record_map")
+        exact_count += int(accuracy == 1.0 and schema_valid)
+        local_accuracy_sum += accuracy
+        local_coverage_sum += coverage
+        prediction_count += predictions
+        expected_count += 1 if contract == "chunk_label" else len(prompt_ids)
+
+    unique_queried = set(queried_ids)
+    denominator = verified_count or 1
+    state["semantic_child_scored_segments"] = float(verified_count)
+    state["semantic_child_local_accuracy"] = local_accuracy_sum / denominator
+    state["semantic_child_local_coverage"] = local_coverage_sum / denominator
+    state["semantic_child_exact_rate"] = exact_count / denominator
+    state["semantic_child_verified_input_rate"] = verified_count / child_count if child_count else 0.0
+    state["semantic_child_invalid_input_rate"] = 1.0 - state["semantic_child_verified_input_rate"] if child_count else 0.0
+    state["semantic_child_valid_output_rate"] = valid_output_count / denominator
+    state["semantic_child_chunk_contract_rate"] = chunk_contract_count / denominator
+    state["semantic_child_record_contract_rate"] = record_contract_count / denominator
+    state["semantic_records_per_subcall"] = len(queried_ids) / denominator
+    state["semantic_record_coverage"] = len(unique_queried) / len(gold_labels) if gold_labels else 0.0
+    state["semantic_duplicate_coverage"] = (
+        (len(queried_ids) - len(unique_queried)) / len(queried_ids) if queried_ids else 0.0
+    )
+    state["semantic_verified_full_chunk_coverage"] = (
+        len(verified_full_chunks) / len(chunk_labels) if chunk_labels else 0.0
+    )
+    state["semantic_child_prediction_count"] = float(prediction_count)
+    state["semantic_child_expected_output_count"] = float(expected_count)
+    state["semantic_child_input_rejections"] = rejection_counts
+
+
+def _annotate_semantic_child_segments(state: vf.State, info: dict[str, Any] | None) -> None:
+    metadata = _semantic_delegation_metadata(info)
+    if metadata is None:
+        return
+    if metadata.get("derived_dataset") == "oolong_semantic_delegation_v4":
+        _annotate_semantic_child_segments_v4(state, info or {})
+    else:
+        _annotate_semantic_child_segments_v3(state, info)
 
 
 def _record_semantic_delegation_metrics(state: vf.State, score: SemanticDelegationScore) -> None:
@@ -1599,6 +1814,30 @@ async def semantic_child_local_coverage_metric(state: vf.State) -> float:
     return float(state.get("semantic_child_local_coverage", 0.0))
 
 
+async def semantic_child_verified_input_rate_metric(state: vf.State) -> float:
+    return float(state.get("semantic_child_verified_input_rate", 0.0))
+
+
+async def semantic_child_invalid_input_rate_metric(state: vf.State) -> float:
+    return float(state.get("semantic_child_invalid_input_rate", 0.0))
+
+
+async def semantic_child_valid_output_rate_metric(state: vf.State) -> float:
+    return float(state.get("semantic_child_valid_output_rate", 0.0))
+
+
+async def semantic_child_chunk_contract_rate_metric(state: vf.State) -> float:
+    return float(state.get("semantic_child_chunk_contract_rate", 0.0))
+
+
+async def semantic_child_record_contract_rate_metric(state: vf.State) -> float:
+    return float(state.get("semantic_child_record_contract_rate", 0.0))
+
+
+async def semantic_verified_full_chunk_coverage_metric(state: vf.State) -> float:
+    return float(state.get("semantic_verified_full_chunk_coverage", 0.0))
+
+
 async def semantic_records_per_subcall_metric(state: vf.State) -> float:
     return float(state.get("semantic_records_per_subcall", 0.0))
 
@@ -1760,6 +1999,12 @@ def add_metrics(rubric: vf.Rubric) -> vf.Rubric:
     rubric.add_metric(semantic_exact_metric)
     rubric.add_metric(semantic_child_local_accuracy_metric)
     rubric.add_metric(semantic_child_local_coverage_metric)
+    rubric.add_metric(semantic_child_verified_input_rate_metric)
+    rubric.add_metric(semantic_child_invalid_input_rate_metric)
+    rubric.add_metric(semantic_child_valid_output_rate_metric)
+    rubric.add_metric(semantic_child_chunk_contract_rate_metric)
+    rubric.add_metric(semantic_child_record_contract_rate_metric)
+    rubric.add_metric(semantic_verified_full_chunk_coverage_metric)
     rubric.add_metric(semantic_records_per_subcall_metric)
     rubric.add_metric(semantic_record_coverage_metric)
     rubric.add_metric(semantic_duplicate_coverage_metric)

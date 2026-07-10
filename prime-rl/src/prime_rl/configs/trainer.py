@@ -531,6 +531,23 @@ class DefaultLossConfig(BaseModel):
     adv_tau: Annotated[float, Field(ge=0, description="The tau for advantages.")] = 1.0
     teacher_tau: Annotated[float, Field(ge=0, description="The tau for teacher logprobs.")] = 0.0
     kl_tau: Annotated[float, Field(ge=0, description="The tau for KL divergence.")] = 1e-3
+    normalization: Annotated[
+        Literal["token", "branch_sequence"],
+        Field(
+            description=(
+                "Loss normalization. 'token' preserves the default token-proportional objective; "
+                "'branch_sequence' averages policy loss per sequence and mixes root and semantic-child branches."
+            )
+        ),
+    ] = "token"
+    semantic_child_fraction: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description="Policy-loss fraction assigned to semantic-child sequences when both branches are present.",
+        ),
+    ] = 0.5
 
 
 class CustomLossConfig(BaseModel):

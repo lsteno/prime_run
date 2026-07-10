@@ -27,6 +27,8 @@ class LossOutputs:
 
     loss: Float[Tensor, ""]
     metrics: dict[str, Tensor]
+    policy_loss: Float[Tensor, ""] | None = None
+    regularization_loss: Float[Tensor, ""] | None = None
 
 
 LossFn = Callable[..., LossOutputs]
@@ -147,7 +149,9 @@ def default_loss_fn(inputs: LossInputs, loss_config: DefaultLossConfig) -> LossO
 
     pg_loss = keep_mask * advantages * importance_ratio
     kl_loss = loss_mask * log_importance_ratio**2
-    loss = (-pg_loss + loss_config.kl_tau * kl_loss).sum()
+    policy_loss = -pg_loss.sum()
+    regularization_loss = loss_config.kl_tau * kl_loss.sum()
+    loss = policy_loss + regularization_loss
 
     metrics = {
         "mismatch_kl": _safe_mean(mismatch_kl, loss_mask),  # all trainable tokens
@@ -160,7 +164,12 @@ def default_loss_fn(inputs: LossInputs, loss_config: DefaultLossConfig) -> LossO
     if teacher_kl is not None:
         metrics["teacher_kl"] = _safe_mean(teacher_kl, loss_mask)
 
-    return LossOutputs(loss=loss, metrics=metrics)
+    return LossOutputs(
+        loss=loss,
+        metrics=metrics,
+        policy_loss=policy_loss,
+        regularization_loss=regularization_loss,
+    )
 
 
 def setup_loss_fn(loss_config: LossConfig) -> LossFn:
@@ -188,6 +197,12 @@ def compute_loss(
     loss_mask: list[Bool[Tensor, " seq_i"]],
     loss_fn: LossFn,
     loss_scale: int,
+    loss_branches: list[Int[Tensor, " seq_i"]] | None = None,
+    normalization: str = "token",
+    semantic_child_fraction: float = 0.5,
+    global_branch_counts: tuple[int, int] | None = None,
+    global_trainable_tokens: int | None = None,
+    dp_scale: int = 1,
 ) -> tuple[Float[Tensor, ""], dict[str, Any]]:
     """
     Compute loss for packed sequences (batch size = 1, multiple sequences packed along sequence dimension).
@@ -204,14 +219,19 @@ def compute_loss(
     Returns:
         Tuple of (scaled_loss, aggregated_metrics)
     """
-    total_loss = 0.0
+    zero_loss = trainer_logprobs[0].sum() * 0.0
+    total_loss: Tensor = zero_loss
+    branch_policy_losses: list[Tensor] = [zero_loss, zero_loss]
+    regularization_loss: Tensor = zero_loss
     all_metrics: dict[str, list[Tensor]] = {}
 
     if teacher_logprobs is None:
         teacher_logprobs = [None] * len(trainer_logprobs)
+    if loss_branches is None:
+        loss_branches = [torch.zeros_like(mask, dtype=torch.int64) for mask in loss_mask]
 
-    for t_logp, i_logp, teach_logp, adv, mask in zip(
-        trainer_logprobs, inference_logprobs, teacher_logprobs, advantages, loss_mask
+    for t_logp, i_logp, teach_logp, adv, mask, branches in zip(
+        trainer_logprobs, inference_logprobs, teacher_logprobs, advantages, loss_mask, loss_branches
     ):
         inputs = LossInputs(
             trainer_logprobs=t_logp,
@@ -223,14 +243,48 @@ def compute_loss(
 
         result = loss_fn(inputs)
 
-        total_loss = total_loss + result.loss
+        if normalization == "branch_sequence":
+            if result.policy_loss is None or result.regularization_loss is None:
+                raise ValueError("branch_sequence normalization requires the default structured loss outputs")
+            trainable_tokens = int(mask.sum().item())
+            if trainable_tokens:
+                trainable_branches = torch.unique(branches[mask])
+                if trainable_branches.numel() != 1 or int(trainable_branches.item()) not in {0, 1}:
+                    raise ValueError("Each training sequence must belong to exactly one supported loss branch")
+                branch = int(trainable_branches.item())
+                branch_policy_losses[branch] = branch_policy_losses[branch] + result.policy_loss / trainable_tokens
+                regularization_loss = regularization_loss + result.regularization_loss
+        else:
+            total_loss = total_loss + result.loss
 
         for k, v in result.metrics.items():
             if k not in all_metrics:
                 all_metrics[k] = []
             all_metrics[k].append(v)
 
-    scaled_loss = total_loss / loss_scale
+    if normalization == "branch_sequence":
+        if global_branch_counts is None or global_trainable_tokens is None:
+            raise ValueError("branch_sequence normalization requires global branch and token counts")
+        root_count, child_count = global_branch_counts
+        if root_count and child_count:
+            root_fraction = 1.0 - semantic_child_fraction
+            child_fraction = semantic_child_fraction
+        elif root_count:
+            root_fraction, child_fraction = 1.0, 0.0
+        elif child_count:
+            root_fraction, child_fraction = 0.0, 1.0
+        else:
+            root_fraction = child_fraction = 0.0
+        policy_loss: Tensor = zero_loss
+        if root_count:
+            policy_loss = policy_loss + root_fraction * branch_policy_losses[0] / root_count
+        if child_count:
+            policy_loss = policy_loss + child_fraction * branch_policy_losses[1] / child_count
+        scaled_loss = dp_scale * (
+            policy_loss + regularization_loss / max(global_trainable_tokens, 1)
+        )
+    else:
+        scaled_loss = total_loss / loss_scale
 
     aggregated: dict[str, Any] = {}
     for k, v in all_metrics.items():
@@ -238,5 +292,21 @@ def compute_loss(
             aggregated[k] = torch.stack(v)
         else:
             aggregated[k] = torch.cat(v)
+
+    if normalization == "branch_sequence":
+        root_count, child_count = global_branch_counts or (0, 0)
+        device = trainer_logprobs[0].device
+        aggregated.update(
+            {
+                "branch_root_policy_loss": torch.as_tensor(branch_policy_losses[0], device=device).reshape(1),
+                "branch_child_policy_loss": torch.as_tensor(branch_policy_losses[1], device=device).reshape(1),
+                "branch_root_sequence_count": torch.tensor([root_count], device=device, dtype=torch.float32),
+                "branch_child_sequence_count": torch.tensor([child_count], device=device, dtype=torch.float32),
+                "branch_semantic_child_fraction": torch.tensor(
+                    [semantic_child_fraction if root_count and child_count else float(bool(child_count))],
+                    device=device,
+                ),
+            }
+        )
 
     return scaled_loss, aggregated

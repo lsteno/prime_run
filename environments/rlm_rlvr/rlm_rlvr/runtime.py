@@ -17,6 +17,7 @@ from .live_trace import write_live_trace
 from .parsing import extract_final_answer
 from .prompt_variants import DEFAULT_PROMPT_VARIANT
 from .repl import create_repl
+from .semantic_evidence import parse_semantic_prompt_evidence
 from .trace import append_step_trace, make_call_trace, make_segment, prompt_provenance
 
 
@@ -799,11 +800,17 @@ class RecursiveRuntime:
             return call_id
 
     @staticmethod
-    def _semantic_prompt_ids(messages: list[dict[str, str]]) -> tuple[list[str], list[str]]:
+    def _semantic_prompt_evidence(messages: list[dict[str, str]]) -> dict[str, Any]:
         text = "\n".join(str(message.get("content", "")) for message in messages)
-        record_ids = list(dict.fromkeys(re.findall(r"\b(r\d{5})\b", text, flags=re.IGNORECASE)))
         chunk_ids = list(dict.fromkeys(re.findall(r"\b(chunk_\d{3})\b", text, flags=re.IGNORECASE)))
-        return [value.casefold() for value in record_ids], [value.casefold() for value in chunk_ids]
+        evidence = parse_semantic_prompt_evidence(text)
+        return {
+            "semantic_prompt_record_ids": list(evidence.record_hashes),
+            "semantic_prompt_record_hashes": evidence.record_hashes,
+            "semantic_prompt_duplicate_record_ids": list(evidence.duplicate_record_ids),
+            "semantic_prompt_malformed_record_lines": evidence.malformed_record_lines,
+            "semantic_prompt_chunk_ids": [value.casefold() for value in chunk_ids],
+        }
 
     def _append_segment(
         self,
@@ -859,9 +866,7 @@ class RecursiveRuntime:
         if payload.metadata:
             segment.update(payload.metadata)
         if kind == "plain_query":
-            record_ids, chunk_ids = self._semantic_prompt_ids(messages)
-            segment["semantic_prompt_record_ids"] = record_ids
-            segment["semantic_prompt_chunk_ids"] = chunk_ids
+            segment.update(self._semantic_prompt_evidence(messages))
         with self._state_lock:
             self.state["rlm_segments"].append(segment)
             prompt_token_count = float(payload.prompt_token_count if payload.prompt_token_count is not None else len(payload.prompt_ids))

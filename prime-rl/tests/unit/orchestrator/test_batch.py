@@ -79,6 +79,23 @@ def test_prepare_batch_packs_different_temperatures(make_training_example):
     assert flat_batches[0].temperatures[4:8] == [1.1, 1.1, 1.1, 1.1]
 
 
+def test_prepare_batch_preserves_root_and_semantic_child_loss_branches(make_training_example):
+    root = make_training_example()
+    child = make_training_example()
+    child.loss_branch = "semantic_child"
+
+    batches = prepare_batch(
+        rollouts=[root, child],
+        seq_len=16,
+        num_train_workers=1,
+        idxs=[0, 0],
+        num_loras=1,
+    )
+
+    packed = batches[0][0]
+    assert packed.loss_branches == [0, 0, 0, 0, 1, 1, 1, 1]
+
+
 def test_prepare_sample_with_routed_experts():
     """Routed experts are passed through prepare_sample and match input_ids length."""
     # 2 prompt + 2 completion = 4 tokens, 2 layers, topk=2

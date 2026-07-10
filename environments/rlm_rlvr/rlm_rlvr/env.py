@@ -113,6 +113,7 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         state["efficiency_root_token_multiplier"] = getattr(self, "efficiency_root_token_multiplier", 1.0)
         state["efficiency_plain_subcall_token_multiplier"] = getattr(self, "efficiency_plain_subcall_token_multiplier", 1.0)
         state["efficiency_penalty_applies_to"] = getattr(self, "efficiency_penalty_applies_to", "correct_only")
+        state["semantic_record_map_min_records"] = int(getattr(self, "semantic_record_map_min_records", 8))
         state["reward_clip_min"] = getattr(self, "reward_clip_min", 0.0)
         state["reward_clip_max"] = getattr(self, "reward_clip_max", 1.0)
         state["used_repl"] = False
@@ -390,6 +391,7 @@ def load_environment(
     subcall_batch_max_workers: int | None = None,
     subcall_batch_overflow_mode: str = "partial",
     train_plain_llm_subcalls: bool = False,
+    semantic_record_map_min_records: int = 8,
     include_budget_reminder: bool = True,
     efficiency_penalty_coef: float = 0.02,
     inference_mode: str = "hosted",
@@ -451,6 +453,8 @@ def load_environment(
         raise ValueError("subcall_prompt_limit_ratio must be > 0 and <= 1")
     if max_total_subcalls < 1:
         raise ValueError("max_total_subcalls must be >= 1")
+    if semantic_record_map_min_records < 1:
+        raise ValueError("semantic_record_map_min_records must be >= 1")
     if max_batched_subcalls < 1:
         raise ValueError("max_batched_subcalls must be >= 1")
     if subcall_batch_max_workers is not None and subcall_batch_max_workers < 1:
@@ -682,5 +686,6 @@ def load_environment(
         max_turn_penalty_enabled=max_turn_penalty_enabled,
         max_turn_penalty=max_turn_penalty,
         missing_final_at_max_turn_zero_reward=missing_final_at_max_turn_zero_reward,
+        semantic_record_map_min_records=semantic_record_map_min_records,
         env_id="rlm_rlvr",
     )

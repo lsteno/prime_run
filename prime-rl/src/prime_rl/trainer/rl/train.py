@@ -314,6 +314,30 @@ def train(config: TrainerConfig):
             loss_scale = batch_size
         loss_scale = max(loss_scale, 1)
 
+        global_branch_counts: tuple[int, int] | None = None
+        global_trainable_tokens: int | None = None
+        branch_dp_scale = 1
+        if isinstance(config.loss, DefaultLossConfig) and config.loss.normalization == "branch_sequence":
+            local_stats = torch.zeros(3, dtype=torch.int64, device="cuda")
+            for micro_batch in micro_batches:
+                lengths = get_response_lengths(micro_batch["position_ids"])
+                masks = micro_batch["loss_mask"].squeeze().split(lengths)
+                branches = micro_batch["loss_branches"].squeeze().split(lengths)
+                for mask, branch_values in zip(masks, branches, strict=True):
+                    if not mask.any():
+                        continue
+                    branch = int(torch.unique(branch_values[mask]).item())
+                    if branch not in {0, 1}:
+                        raise ValueError(f"Unsupported loss branch id: {branch}")
+                    local_stats[branch] += 1
+                    local_stats[2] += mask.sum()
+            dp_mesh = parallel_dims.get_mesh("dp")
+            branch_dp_scale = dp_mesh.size()
+            if branch_dp_scale > 1:
+                dist.all_reduce(local_stats, op=dist.ReduceOp.SUM, group=dp_mesh.get_group())
+            global_branch_counts = (int(local_stats[0].item()), int(local_stats[1].item()))
+            global_trainable_tokens = int(local_stats[2].item())
+
         logger.debug(f"Starting forward and backward pass ({batch_size=})")
         tensors = Tensors()  # Used to accumulate tensor statistics across micro-batches and ranks for logging
         cp_enabled = parallel_dims.cp_enabled
@@ -326,6 +350,7 @@ def train(config: TrainerConfig):
             position_ids = micro_batch["position_ids"].to("cuda")
             advantages = micro_batch["advantages"].to("cuda")
             loss_mask = micro_batch["loss_mask"].to("cuda")
+            loss_branches = micro_batch["loss_branches"].to("cuda")
             inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
             teacher_logprobs = (
                 micro_batch["teacher_logprobs"].to("cuda") if micro_batch["teacher_logprobs"] is not None else None
@@ -436,6 +461,14 @@ def train(config: TrainerConfig):
                 loss_mask=loss_mask.squeeze().split(response_lengths),
                 loss_fn=loss_fn,
                 loss_scale=loss_scale,
+                loss_branches=loss_branches.squeeze().split(response_lengths),
+                normalization=config.loss.normalization if isinstance(config.loss, DefaultLossConfig) else "token",
+                semantic_child_fraction=(
+                    config.loss.semantic_child_fraction if isinstance(config.loss, DefaultLossConfig) else 0.5
+                ),
+                global_branch_counts=global_branch_counts,
+                global_trainable_tokens=global_trainable_tokens,
+                dp_scale=branch_dp_scale,
             )
 
             # Backward pass

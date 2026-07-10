@@ -23,6 +23,7 @@ from rlm_rlvr.reward import (
     _weighted_turn_token_cost,
     build_rubric,
 )
+from rlm_rlvr.semantic_evidence import parse_semantic_prompt_evidence
 
 
 def _semantic_v3_info(*, task_type: str = "chunk_map") -> dict:
@@ -55,6 +56,49 @@ def _semantic_v3_info(*, task_type: str = "chunk_map") -> dict:
             "chunk_labels": chunk_labels,
             "global_outcome": "same",
         },
+    }
+
+
+def _semantic_v4_info() -> dict:
+    record_labels = {}
+    record_chunks = {}
+    lines = ["Semantic records.", "Allowed labels: negative, positive."]
+    for chunk_index, chunk_label in ((1, "positive"), (2, "negative")):
+        chunk_id = f"chunk_{chunk_index:03d}"
+        lines.append(f"### {chunk_id}")
+        for offset in range(10):
+            record_number = (chunk_index - 1) * 10 + offset + 1
+            record_id = f"r{record_number:05d}"
+            label = chunk_label if offset < 6 else ("negative" if chunk_label == "positive" else "positive")
+            lines.append(f"Record ID: {record_id} || Text: review text {record_number}")
+            record_labels[record_id] = label
+            record_chunks[record_id] = chunk_id
+    return {
+        "context": "\n".join(lines),
+        "question": "Classify every chunk.",
+        "dataset_name": "oolong",
+        "source_task": "TASK_TYPE.SEMANTIC_CHUNK_MAP",
+        "answer_type": "ANSWER_TYPE.JSON",
+        "acceptable_answers": ['{"chunk_001":"positive","chunk_002":"negative"}'],
+        "metadata": {
+            "derived_dataset": "oolong_semantic_delegation_v4",
+            "semantic_task_type": "chunk_map",
+            "label_space": ["negative", "positive"],
+            "record_labels": record_labels,
+            "record_chunks": record_chunks,
+            "chunk_labels": {"chunk_001": "positive", "chunk_002": "negative"},
+        },
+    }
+
+
+def _v4_segment(prompt: str, response: str) -> dict:
+    evidence = parse_semantic_prompt_evidence(prompt)
+    return {
+        "kind": "plain_query",
+        "semantic_prompt_record_hashes": evidence.record_hashes,
+        "semantic_prompt_duplicate_record_ids": list(evidence.duplicate_record_ids),
+        "semantic_prompt_malformed_record_lines": evidence.malformed_record_lines,
+        "response_text": response,
     }
 
 
@@ -161,6 +205,75 @@ def test_semantic_child_local_credit_is_conditioned_on_visible_records() -> None
     assert third["semantic_local_signal"] is False
     assert state["semantic_child_local_accuracy"] == 2 / 3
     assert state["semantic_record_coverage"] == 1.0
+
+
+def test_semantic_v4_full_chunk_label_is_verified_and_scored() -> None:
+    info = _semantic_v4_info()
+    chunk = "\n".join(info["context"].splitlines()[2:13])
+    state = {"rlm_segments": [_v4_segment(chunk, '{"chunk_001":"positive"}')], "semantic_record_map_min_records": 8}
+
+    _annotate_semantic_child_segments(state, info)
+
+    segment = state["rlm_segments"][0]
+    assert segment["semantic_input_verified"] is True
+    assert segment["semantic_full_chunk"] is True
+    assert segment["semantic_local_contract"] == "chunk_label"
+    assert segment["semantic_local_advantage"] == 1.0
+    assert state["semantic_verified_full_chunk_coverage"] == 0.5
+
+
+def test_semantic_v4_record_map_requires_verified_records_from_one_chunk() -> None:
+    info = _semantic_v4_info()
+    record_lines = info["context"].splitlines()[3:11]
+    prompt = "Classify every supplied record.\n" + "\n".join(record_lines)
+    expected = {
+        f"r{index:05d}": info["metadata"]["record_labels"][f"r{index:05d}"]
+        for index in range(1, 9)
+    }
+    state = {"rlm_segments": [_v4_segment(prompt, json.dumps(expected))], "semantic_record_map_min_records": 8}
+
+    _annotate_semantic_child_segments(state, info)
+
+    segment = state["rlm_segments"][0]
+    assert segment["semantic_full_chunk"] is False
+    assert segment["semantic_local_contract"] == "record_map"
+    assert segment["semantic_local_accuracy"] == 1.0
+    assert segment["semantic_local_coverage"] == 1.0
+
+
+def test_semantic_v4_rejects_modified_duplicate_and_mixed_evidence() -> None:
+    info = _semantic_v4_info()
+    lines = info["context"].splitlines()
+    prompts = [
+        "\n".join(lines[3:11]).replace("review text 1", "changed text"),
+        "\n".join([*lines[3:11], lines[3]]),
+        "\n".join([*lines[3:10], lines[14]]),
+    ]
+    state = {
+        "rlm_segments": [_v4_segment(prompt, "positive") for prompt in prompts],
+        "semantic_record_map_min_records": 8,
+    }
+
+    _annotate_semantic_child_segments(state, info)
+
+    reasons = [segment["semantic_input_rejection_reason"] for segment in state["rlm_segments"]]
+    assert reasons == ["record_text_mismatch", "duplicate_record_id", "mixed_chunks"]
+    assert all(segment["semantic_local_signal"] is False for segment in state["rlm_segments"])
+
+
+def test_semantic_v4_invalid_record_map_output_gets_full_negative_advantage() -> None:
+    info = _semantic_v4_info()
+    prompt = "\n".join(info["context"].splitlines()[3:11])
+    response = '{"r00001":"positive","unknown":"negative"}'
+    state = {"rlm_segments": [_v4_segment(prompt, response)], "semantic_record_map_min_records": 8}
+
+    _annotate_semantic_child_segments(state, info)
+
+    segment = state["rlm_segments"][0]
+    assert segment["semantic_input_verified"] is True
+    assert segment["semantic_local_schema_valid"] is False
+    assert segment["semantic_local_accuracy"] == 0.0
+    assert segment["semantic_local_advantage"] == -1.0
 
 
 def test_semantic_adaptive_reward_uses_continuous_progress_and_correct_only_cost(monkeypatch) -> None:

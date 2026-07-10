@@ -13,6 +13,9 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     inference_logprobs = [0.0] * len(training_example.prompt_ids) + training_example.completion_logprobs
     advantages = [training_example.advantage] * len(input_ids)
     position_ids = list(range(len(input_ids)))
+    if training_example.loss_branch not in {"root", "semantic_child"}:
+        raise ValueError(f"Unsupported loss branch: {training_example.loss_branch!r}")
+    loss_branches = [1 if training_example.loss_branch == "semantic_child" else 0] * len(input_ids)
 
     # Per-token temperatures: prompt tokens use first completion temp (masked out anyway)
     # Default to 1.0 if completion is empty (e.g., model generated only tool calls with no text)
@@ -31,6 +34,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         position_ids = position_ids[:seq_len]
         advantages = advantages[:seq_len]
         temperatures = temperatures[:seq_len]
+        loss_branches = loss_branches[:seq_len]
         if teacher_logprobs is not None:
             teacher_logprobs = teacher_logprobs[:seq_len]
         if routed_experts is not None:
@@ -43,6 +47,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         == len(position_ids)
         == len(inference_logprobs)
         == len(temperatures)
+        == len(loss_branches)
     ), (
         f"input_ids: {len(input_ids)}, advantages: {len(advantages)}, loss_mask: {len(loss_mask)}, position_ids: {len(position_ids)}, inference_logprobs: {len(inference_logprobs)}, temperatures: {len(temperatures)}"
     )
@@ -63,6 +68,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         teacher_logprobs=teacher_logprobs,
         temperatures=temperatures,
         routed_experts=routed_experts,
+        loss_branches=loss_branches,
         # Multimodal fields (Qwen3-VL) - passed through without modification
         pixel_values=training_example.pixel_values,
         pixel_values_shape=training_example.pixel_values_shape,
@@ -121,6 +127,9 @@ def packed_samples_into_micro_bs(
                         bin_content.routed_experts = []
                     bin_content.routed_experts.extend(sample.routed_experts)
                 bin_content.position_ids.extend(sample.position_ids)
+                if bin_content.loss_branches is None:
+                    bin_content.loss_branches = [0] * (len(bin_content.input_ids) - len(sample.input_ids))
+                bin_content.loss_branches.extend(sample.loss_branches or [0] * len(sample.input_ids))
                 bin_content.lora_num_tokens[idx] += len(sample.input_ids)
                 break
         else:
@@ -154,6 +163,8 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
     micro_batch.inference_logprobs.extend([0.0] * padding_size)
     # Use temperature 1.0 for padding tokens (doesn't matter since loss_mask is False)
     micro_batch.temperatures.extend([1.0] * padding_size)
+    if micro_batch.loss_branches is not None:
+        micro_batch.loss_branches.extend([0] * padding_size)
     if micro_batch.teacher_logprobs is not None:
         micro_batch.teacher_logprobs.extend([0.0] * padding_size)
     micro_batch.lora_num_tokens[-1] += (
