@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.rlm_rlvr.generate_semantic_delegation_v6_configs import (  # noqa: E402
     BASE_CONFIG,
     DATASET_ID,
+    DATASET_REVISION,
     FILENAME,
     OUT_DIR,
     RUN_ID,
@@ -35,6 +36,7 @@ def test_semantic_delegation_v6_config_uses_packet_credit_and_fixed_eval() -> No
     assert config["wandb"]["entity"] == "lsteno-university-of-twente"
     train_args = config["orchestrator"]["env"][0]["args"]
     assert train_args["dataset_id"] == DATASET_ID
+    assert train_args["dataset_revision"] == DATASET_REVISION
     assert train_args["efficiency_penalty_mode"] == "accuracy_stratified_group"
     assert train_args["efficiency_tie_break_max"] == 0.05
     assert train_args["efficiency_root_token_multiplier"] == 8.0
@@ -65,6 +67,7 @@ def test_semantic_delegation_v6_config_uses_packet_credit_and_fixed_eval() -> No
     ]
     evals = {item["name"]: item for item in config["orchestrator"]["eval"]["env"]}
     assert evals["semantic_eval"]["args"]["dataset_eval_split"] == "semantic_eval"
+    assert evals["semantic_eval"]["args"]["dataset_revision"] == DATASET_REVISION
     assert evals["semantic_eval"]["num_examples"] == 64
     assert evals["mixed_eval"]["args"]["dataset_eval_split"] == "eval"
     assert evals["mixed_eval"]["num_examples"] == 32

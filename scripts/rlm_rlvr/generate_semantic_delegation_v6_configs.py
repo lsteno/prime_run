@@ -17,6 +17,7 @@ BASE_CONFIG = next(
 )
 OUT_DIR = ROOT / "configs/rlm_rlvr/semantic_delegation_v6_packet_credit"
 DATASET_ID = "lsteno/BEEG-agents-semantic-delegation-v6"
+DATASET_REVISION = "4e8536b2f55165e05003ad803101b524969401d9"
 OLD_RUN_ID = "rlm-rlvr-qwen3-4b-depth1-h100-r4-a8-lr1e-4-s30-semantic-delegation-v5-natural-credit-rootrollout-betamin01-pilot"
 RUN_ID = "rlm-rlvr-qwen3-4b-depth1-h100-r4-a8-lr1e-4-s50-semantic-delegation-v6-packet-credit-tiebreak005-root60-pilot"
 FILENAME = (
@@ -58,7 +59,7 @@ def build_config(base: str) -> str:
     )
     text = text.replace(
         'dataset_id = "lsteno/BEEG-agents-semantic-delegation-v5"',
-        f'dataset_id = "{DATASET_ID}"',
+        f'dataset_id = "{DATASET_ID}"\ndataset_revision = "{DATASET_REVISION}"',
     )
     text = _replace_once(
         text,
@@ -159,6 +160,7 @@ def main() -> None:
         "efficiency_penalty_mode": "accuracy_stratified_group",
         "efficiency_tie_break_max": 0.05,
         "dataset_id": DATASET_ID,
+        "dataset_revision": DATASET_REVISION,
         "wandb_entity": "lsteno-university-of-twente",
         "wandb_project": "rlm-rlvr",
         "config_path": path.relative_to(ROOT).as_posix(),

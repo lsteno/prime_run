@@ -174,6 +174,7 @@ worker_count = 32
 
 [orchestrator.env.args]
 dataset_id = "lsteno/BEEG-agents-semantic-delegation-v6"
+dataset_revision = "4e8536b2f55165e05003ad803101b524969401d9"
 dataset_train_split = "train"
 dataset_eval_split = "eval"
 seed = 42
@@ -242,6 +243,7 @@ rollouts_per_example = 1
 
 [orchestrator.eval.env.args]
 dataset_id = "lsteno/BEEG-agents-semantic-delegation-v6"
+dataset_revision = "4e8536b2f55165e05003ad803101b524969401d9"
 dataset_train_split = "train"
 dataset_eval_split = "semantic_eval"
 seed = 42
@@ -294,6 +296,7 @@ rollouts_per_example = 1
 
 [orchestrator.eval.env.args]
 dataset_id = "lsteno/BEEG-agents-semantic-delegation-v6"
+dataset_revision = "4e8536b2f55165e05003ad803101b524969401d9"
 dataset_train_split = "train"
 dataset_eval_split = "eval"
 seed = 42
