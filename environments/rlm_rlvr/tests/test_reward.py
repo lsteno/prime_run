@@ -14,6 +14,7 @@ from rlm_rlvr.reward import (
     _is_oversized_judge_exception,
     _parse_binary_judge_score,
     _score_oolong_pairs,
+    _score_oolong_semantic_aggregation,
     _segment_rollout_token_breakdown,
     _segment_rollout_token_totals,
     _weighted_turn_token_cost,
@@ -82,6 +83,69 @@ def test_oolong_pairs_rubric_skips_llm_judge(monkeypatch) -> None:
     assert state["reward_correctness"] == 0.8
     assert state["judge_raw_response"] == "[oolong_pairs_f1]"
     assert state["oolong_pairs_f1"] == 0.8
+
+
+def test_oolong_semantic_scoring_handles_basic_answer_types() -> None:
+    assert _score_oolong_semantic_aggregation(
+        "Count: 1,208",
+        ["1208"],
+        answer_type="ANSWER_TYPE.NUMERIC",
+    ) == (1.0, "[oolong_semantic_exact]", None)
+    assert _score_oolong_semantic_aggregation(
+        "Label: Positive",
+        ["positive"],
+        answer_type="ANSWER_TYPE.LABEL",
+    ) == (1.0, "[oolong_semantic_exact]", None)
+    assert _score_oolong_semantic_aggregation(
+        'Here is the result: {"positive": 4, "negative": 2}',
+        ['{"negative":2,"positive":4}'],
+        answer_type="ANSWER_TYPE.JSON",
+    ) == (1.0, "[oolong_semantic_exact]", None)
+
+
+def test_oolong_semantic_rubric_skips_llm_judge(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    async def _judge_should_not_run(*args, **kwargs):
+        raise AssertionError("Semantic Oolong aggregation should use deterministic scoring")
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    monkeypatch.setattr(reward_module, "_call_binary_judge", _judge_should_not_run)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+    )
+    reward_fn = rubric.funcs[0]
+    state = {
+        "final_answer": "Count: 42",
+        "efficiency_penalty_coef": 0.0,
+        "rlm_segments": [],
+        "trajectory": [],
+    }
+
+    score = asyncio.run(
+        reward_fn(
+            state,
+            [],
+            "42",
+            {
+                "question": "Count positive records.",
+                "dataset_name": "oolong",
+                "source_task": "TASK_TYPE.SEMANTIC_COUNT_LABEL",
+                "answer_type": "ANSWER_TYPE.NUMERIC",
+                "acceptable_answers": ["42"],
+                "metadata": {"derived_dataset": "oolong_semantic_agg_v2"},
+            },
+        )
+    )
+
+    assert score == 1.0
+    assert state["reward_correctness"] == 1.0
+    assert state["judge_raw_response"] == "[oolong_semantic_exact]"
+    assert state["oolong_semantic_exact"] == 1.0
 
 
 def test_extract_message_text_falls_back_to_reasoning() -> None:

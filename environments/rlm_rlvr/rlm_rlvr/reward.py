@@ -294,6 +294,111 @@ def _record_oolong_pairs_metrics(state: vf.State, stats: dict[str, float]) -> No
     state["oolong_pairs_expected_count"] = stats["expected_pairs"]
 
 
+def _is_oolong_semantic_aggregation_task(info: dict[str, Any] | None) -> bool:
+    if not info:
+        return False
+    source_task = str(info.get("source_task") or "")
+    metadata = info.get("metadata") if isinstance(info.get("metadata"), dict) else {}
+    derived_dataset = str(metadata.get("derived_dataset") or "")
+    return derived_dataset == "oolong_semantic_agg_v2" or source_task.startswith("TASK_TYPE.SEMANTIC_")
+
+
+def _strip_answer_prefix(text: str) -> str:
+    text = _normalize_text(text)
+    match = re.match(r"^(?:count|label|user|month|answer)\s*:\s*(.+)$", text, flags=re.IGNORECASE)
+    if match:
+        return _normalize_text(match.group(1))
+    return text
+
+
+def _extract_numeric_answer(text: str) -> str | None:
+    stripped = _strip_answer_prefix(text)
+    direct = _canonicalize_number(stripped)
+    if direct is not None:
+        return direct
+    matches = re.findall(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", stripped.replace(",", ""))
+    if len(matches) == 1:
+        return _canonicalize_number(matches[0])
+    return None
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    stripped = _normalize_text(text)
+    candidates = [stripped]
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(stripped[start : end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _canonical_histogram(value: dict[str, Any]) -> dict[str, int] | None:
+    result: dict[str, int] = {}
+    for key, raw_count in value.items():
+        number = _canonicalize_number(str(raw_count))
+        if number is None:
+            return None
+        try:
+            decimal = Decimal(number)
+        except InvalidOperation:
+            return None
+        if decimal != decimal.to_integral_value():
+            return None
+        result[_normalize_text(key)] = int(decimal)
+    return result
+
+
+def _score_oolong_semantic_aggregation(
+    predicted_answer: str,
+    expected_answers: list[str],
+    *,
+    answer_type: str,
+) -> tuple[float, str, str | None]:
+    if answer_type == "ANSWER_TYPE.JSON":
+        predicted_json = _extract_json_object(predicted_answer)
+        if predicted_json is None:
+            return 0.0, "[oolong_semantic_json_mismatch]", "invalid_json"
+        predicted_histogram = _canonical_histogram(predicted_json)
+        if predicted_histogram is None:
+            return 0.0, "[oolong_semantic_json_mismatch]", "invalid_histogram"
+        for expected_answer in expected_answers:
+            expected_json = _extract_json_object(expected_answer)
+            if expected_json is None:
+                continue
+            expected_histogram = _canonical_histogram(expected_json)
+            if expected_histogram is not None and predicted_histogram == expected_histogram:
+                return 1.0, "[oolong_semantic_exact]", None
+        return 0.0, "[oolong_semantic_json_mismatch]", None
+
+    if answer_type == "ANSWER_TYPE.NUMERIC":
+        predicted_number = _extract_numeric_answer(predicted_answer)
+        if predicted_number is None:
+            return 0.0, "[oolong_semantic_numeric_mismatch]", "invalid_numeric"
+        for expected_answer in expected_answers:
+            expected_number = _extract_numeric_answer(expected_answer)
+            if expected_number is not None and predicted_number == expected_number:
+                return 1.0, "[oolong_semantic_exact]", None
+        return 0.0, "[oolong_semantic_numeric_mismatch]", None
+
+    predicted_label = _strip_answer_prefix(predicted_answer).casefold()
+    for expected_answer in expected_answers:
+        if predicted_label == _strip_answer_prefix(expected_answer).casefold():
+            return 1.0, "[oolong_semantic_exact]", None
+    return 0.0, "[oolong_semantic_label_mismatch]", None
+
+
+def _record_oolong_semantic_metrics(state: vf.State, score: float) -> None:
+    state["oolong_semantic_score"] = float(score)
+    state["oolong_semantic_exact"] = 1.0 if score >= 1.0 else 0.0
+
+
 def _extract_message_text(message: Any) -> str:
     content = getattr(message, "content", None)
     if isinstance(content, str) and content.strip():
@@ -821,6 +926,30 @@ async def _score_correctness(
         )
         return result
 
+    if _is_oolong_semantic_aggregation_task(info):
+        score, raw_response, parse_error = _score_oolong_semantic_aggregation(
+            predicted_answer,
+            expected_answers,
+            answer_type=str((info or {}).get("answer_type") or ""),
+        )
+        _record_oolong_semantic_metrics(state, score)
+        result = CorrectnessResult(
+            predicted_answer=predicted_answer,
+            expected_answers=expected_answers,
+            score=score,
+            raw_response=raw_response,
+            parse_error=parse_error,
+        )
+        _record_judge_payload(
+            state,
+            predicted_answer=result.predicted_answer,
+            expected_answers=result.expected_answers,
+            score=result.score,
+            raw_response=result.raw_response,
+            parse_error=result.parse_error,
+        )
+        return result
+
     if _is_exact_match(predicted_answer, expected_answers):
         result = CorrectnessResult(
             predicted_answer=predicted_answer,
@@ -1224,6 +1353,14 @@ async def oolong_pairs_f1_metric(state: vf.State) -> float:
     return float(state.get("oolong_pairs_f1", 0.0))
 
 
+async def oolong_semantic_score_metric(state: vf.State) -> float:
+    return float(state.get("oolong_semantic_score", 0.0))
+
+
+async def oolong_semantic_exact_metric(state: vf.State) -> float:
+    return float(state.get("oolong_semantic_exact", 0.0))
+
+
 async def efficiency_penalty_metric(state: vf.State) -> float:
     return float(state.get("reward_efficiency_penalty", 0.0))
 
@@ -1338,6 +1475,8 @@ def add_metrics(rubric: vf.Rubric) -> vf.Rubric:
     rubric.add_metric(oolong_pairs_precision_metric)
     rubric.add_metric(oolong_pairs_recall_metric)
     rubric.add_metric(oolong_pairs_f1_metric)
+    rubric.add_metric(oolong_semantic_score_metric)
+    rubric.add_metric(oolong_semantic_exact_metric)
     rubric.add_metric(efficiency_penalty_metric)
     rubric.add_metric(incorrect_cost_penalty_metric)
     rubric.add_metric(max_turn_penalty_metric)
