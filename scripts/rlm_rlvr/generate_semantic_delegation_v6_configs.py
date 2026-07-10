@@ -17,7 +17,7 @@ BASE_CONFIG = next(
 )
 OUT_DIR = ROOT / "configs/rlm_rlvr/semantic_delegation_v6_packet_credit"
 DATASET_ID = "lsteno/BEEG-agents-semantic-delegation-v6"
-DATASET_REVISION = "4e8536b2f55165e05003ad803101b524969401d9"
+DATASET_REVISION = "41cc499e239e4465c7c5cbda8fcf4ed065109f74"
 OLD_RUN_ID = "rlm-rlvr-qwen3-4b-depth1-h100-r4-a8-lr1e-4-s30-semantic-delegation-v5-natural-credit-rootrollout-betamin01-pilot"
 RUN_ID = "rlm-rlvr-qwen3-4b-depth1-h100-r4-a8-lr1e-4-s50-semantic-delegation-v6-packet-credit-tiebreak005-root60-pilot"
 FILENAME = (
