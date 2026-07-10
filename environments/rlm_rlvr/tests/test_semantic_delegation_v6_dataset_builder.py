@@ -137,3 +137,29 @@ def test_v6_large_macos_guard_remains_active(tmp_path: Path, monkeypatch) -> Non
         builder._guard_large_local_inputs(
             [path], allow_large_local=False, local_guard_bytes=1
         )
+
+
+def test_v6_cross_split_deduplication_ignores_source_name() -> None:
+    train = _pool("sst2", ("negative", "positive"), "train")
+    eval_pool = _pool("rotten_tomatoes", ("negative", "positive"), "eval")
+    duplicate = train.examples_by_label["positive"][0]
+    eval_examples = dict(eval_pool.examples_by_label)
+    eval_examples["positive"] = (
+        builder.LabeledExample("different-source-id", duplicate.text, "positive"),
+        *eval_examples["positive"],
+    )
+    eval_pool = builder.SemanticPool(
+        source_name=eval_pool.source_name,
+        source_split=eval_pool.source_split,
+        description=eval_pool.description,
+        label_space=eval_pool.label_space,
+        examples_by_label=eval_examples,
+    )
+
+    cleaned, removed = builder._drop_cross_split_duplicates([train], [eval_pool])
+
+    assert removed == 1
+    assert all(
+        example.text != duplicate.text
+        for example in cleaned[0].examples_by_label["positive"]
+    )

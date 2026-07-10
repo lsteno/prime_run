@@ -109,7 +109,7 @@ class SemanticPool:
     @property
     def source_hashes(self) -> set[str]:
         return {
-            example.source_id
+            _text_hash(example.text)
             for examples in self.examples_by_label.values()
             for example in examples
         }
@@ -345,7 +345,9 @@ def _drop_cross_split_duplicates(
         by_label: dict[str, tuple[LabeledExample, ...]] = {}
         for label, examples in pool.examples_by_label.items():
             kept = tuple(
-                example for example in examples if example.source_id not in train_hashes
+                example
+                for example in examples
+                if _text_hash(example.text) not in train_hashes
             )
             removed += len(examples) - len(kept)
             by_label[label] = kept
