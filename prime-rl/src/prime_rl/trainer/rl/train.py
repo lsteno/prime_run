@@ -315,31 +315,43 @@ def train(config: TrainerConfig):
         loss_scale = max(loss_scale, 1)
 
         global_branch_counts: tuple[int, int] | None = None
+        global_branch_weight_sums: tuple[float, float] | None = None
         global_trainable_tokens: int | None = None
         branch_dp_scale = 1
         if isinstance(config.loss, DefaultLossConfig) and config.loss.normalization == "branch_sequence":
-            local_stats = torch.zeros(3, dtype=torch.int64, device="cuda")
+            local_stats = torch.zeros(5, dtype=torch.float64, device="cuda")
             for micro_batch in micro_batches:
                 lengths = get_response_lengths(micro_batch["position_ids"])
                 masks = micro_batch["loss_mask"].squeeze().split(lengths)
                 branches = micro_batch["loss_branches"].squeeze().split(lengths)
-                for mask, branch_values in zip(masks, branches, strict=True):
+                weights = micro_batch["sequence_loss_weights"].squeeze().split(lengths)
+                for mask, branch_values, sequence_weights in zip(masks, branches, weights, strict=True):
                     if not mask.any():
                         continue
                     branch = int(torch.unique(branch_values[mask]).item())
                     if branch not in {0, 1}:
                         raise ValueError(f"Unsupported loss branch id: {branch}")
+                    unique_weights = torch.unique(sequence_weights[mask])
+                    if unique_weights.numel() != 1 or float(unique_weights.item()) < 0.0:
+                        raise ValueError("Each training sequence must have one non-negative policy weight")
                     local_stats[branch] += 1
                     local_stats[2] += mask.sum()
+                    local_stats[3 + branch] += unique_weights.item()
             dp_mesh = parallel_dims.get_mesh("dp")
             branch_dp_scale = dp_mesh.size()
             if branch_dp_scale > 1:
                 dist.all_reduce(local_stats, op=dist.ReduceOp.SUM, group=dp_mesh.get_group())
             global_branch_counts = (int(local_stats[0].item()), int(local_stats[1].item()))
             global_trainable_tokens = int(local_stats[2].item())
+            global_branch_weight_sums = (float(local_stats[3].item()), float(local_stats[4].item()))
 
         logger.debug(f"Starting forward and backward pass ({batch_size=})")
         tensors = Tensors()  # Used to accumulate tensor statistics across micro-batches and ranks for logging
+        branch_policy_contributions = (
+            torch.zeros(2, dtype=torch.float64, device="cuda")
+            if isinstance(config.loss, DefaultLossConfig) and config.loss.normalization == "branch_sequence"
+            else None
+        )
         cp_enabled = parallel_dims.cp_enabled
         cp_rank = parallel_dims.world_mesh["cp"].get_local_rank() if cp_enabled else 0
         cp_group = parallel_dims.world_mesh["cp"].get_group() if cp_enabled else None
@@ -351,6 +363,7 @@ def train(config: TrainerConfig):
             advantages = micro_batch["advantages"].to("cuda")
             loss_mask = micro_batch["loss_mask"].to("cuda")
             loss_branches = micro_batch["loss_branches"].to("cuda")
+            sequence_loss_weights = micro_batch["sequence_loss_weights"].to("cuda")
             inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
             teacher_logprobs = (
                 micro_batch["teacher_logprobs"].to("cuda") if micro_batch["teacher_logprobs"] is not None else None
@@ -462,11 +475,13 @@ def train(config: TrainerConfig):
                 loss_fn=loss_fn,
                 loss_scale=loss_scale,
                 loss_branches=loss_branches.squeeze().split(response_lengths),
+                sequence_loss_weights=sequence_loss_weights.squeeze().split(response_lengths),
                 normalization=config.loss.normalization if isinstance(config.loss, DefaultLossConfig) else "token",
                 semantic_child_fraction=(
                     config.loss.semantic_child_fraction if isinstance(config.loss, DefaultLossConfig) else 0.5
                 ),
                 global_branch_counts=global_branch_counts,
+                global_branch_weight_sums=global_branch_weight_sums,
                 global_trainable_tokens=global_trainable_tokens,
                 dp_scale=branch_dp_scale,
             )
@@ -489,6 +504,13 @@ def train(config: TrainerConfig):
 
             # Add loss tensors to tensor dict for logging purposes
             for key, loss_tensor in loss_tensors.items():
+                if branch_policy_contributions is not None and key in {
+                    "branch_root_policy_contribution",
+                    "branch_child_policy_contribution",
+                }:
+                    branch_index = 0 if key == "branch_root_policy_contribution" else 1
+                    branch_policy_contributions[branch_index] += loss_tensor.detach().sum().double()
+                    continue
                 loss_tensor = loss_tensor.detach().to("cpu")
                 tensors[key].append(loss_tensor)
 
@@ -528,6 +550,16 @@ def train(config: TrainerConfig):
 
         # Synchronize the tensor metrics across all steps and ranks
         tensor_stats = tensors.compute_stats()
+        if branch_policy_contributions is not None:
+            if branch_dp_scale > 1:
+                dist.all_reduce(
+                    branch_policy_contributions,
+                    op=dist.ReduceOp.SUM,
+                    group=parallel_dims.get_mesh("dp").get_group(),
+                )
+                branch_policy_contributions /= branch_dp_scale
+            tensor_stats["branch_root_policy_contribution/mean"] = branch_policy_contributions[0].item()
+            tensor_stats["branch_child_policy_contribution/mean"] = branch_policy_contributions[1].item()
 
         # Compute step metrics
         num_local_tokens = seq_len * batch_size

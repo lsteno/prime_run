@@ -65,6 +65,8 @@ def _segment_summary(segment: dict[str, Any]) -> dict[str, Any]:
         "semantic_local_coverage",
         "semantic_local_schema_valid",
         "semantic_local_advantage",
+        "semantic_terminal_fallback_eligible",
+        "semantic_local_fallback_reason",
     )
     summary.update({key: segment[key] for key in semantic_keys if segment.get(key) is not None})
     return summary

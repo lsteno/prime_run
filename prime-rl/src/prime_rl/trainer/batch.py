@@ -16,6 +16,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     if training_example.loss_branch not in {"root", "semantic_child"}:
         raise ValueError(f"Unsupported loss branch: {training_example.loss_branch!r}")
     loss_branches = [1 if training_example.loss_branch == "semantic_child" else 0] * len(input_ids)
+    sequence_loss_weights = [float(training_example.sequence_loss_weight)] * len(input_ids)
 
     # Per-token temperatures: prompt tokens use first completion temp (masked out anyway)
     # Default to 1.0 if completion is empty (e.g., model generated only tool calls with no text)
@@ -35,6 +36,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         advantages = advantages[:seq_len]
         temperatures = temperatures[:seq_len]
         loss_branches = loss_branches[:seq_len]
+        sequence_loss_weights = sequence_loss_weights[:seq_len]
         if teacher_logprobs is not None:
             teacher_logprobs = teacher_logprobs[:seq_len]
         if routed_experts is not None:
@@ -48,6 +50,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         == len(inference_logprobs)
         == len(temperatures)
         == len(loss_branches)
+        == len(sequence_loss_weights)
     ), (
         f"input_ids: {len(input_ids)}, advantages: {len(advantages)}, loss_mask: {len(loss_mask)}, position_ids: {len(position_ids)}, inference_logprobs: {len(inference_logprobs)}, temperatures: {len(temperatures)}"
     )
@@ -69,6 +72,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         temperatures=temperatures,
         routed_experts=routed_experts,
         loss_branches=loss_branches,
+        sequence_loss_weights=sequence_loss_weights,
         # Multimodal fields (Qwen3-VL) - passed through without modification
         pixel_values=training_example.pixel_values,
         pixel_values_shape=training_example.pixel_values_shape,
@@ -130,6 +134,13 @@ def packed_samples_into_micro_bs(
                 if bin_content.loss_branches is None:
                     bin_content.loss_branches = [0] * (len(bin_content.input_ids) - len(sample.input_ids))
                 bin_content.loss_branches.extend(sample.loss_branches or [0] * len(sample.input_ids))
+                if bin_content.sequence_loss_weights is None:
+                    bin_content.sequence_loss_weights = [1.0] * (
+                        len(bin_content.input_ids) - len(sample.input_ids)
+                    )
+                bin_content.sequence_loss_weights.extend(
+                    sample.sequence_loss_weights or [1.0] * len(sample.input_ids)
+                )
                 bin_content.lora_num_tokens[idx] += len(sample.input_ids)
                 break
         else:
@@ -165,6 +176,8 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
     micro_batch.temperatures.extend([1.0] * padding_size)
     if micro_batch.loss_branches is not None:
         micro_batch.loss_branches.extend([0] * padding_size)
+    if micro_batch.sequence_loss_weights is not None:
+        micro_batch.sequence_loss_weights.extend([0.0] * padding_size)
     if micro_batch.teacher_logprobs is not None:
         micro_batch.teacher_logprobs.extend([0.0] * padding_size)
     micro_batch.lora_num_tokens[-1] += (

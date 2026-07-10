@@ -23,6 +23,7 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
 
     routed_experts: list[list[list[int]]] | None = None  # [seq_len, layers, topk]
     loss_branch: str = "root"
+    sequence_loss_weight: float = 1.0
 
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
@@ -53,3 +54,4 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     # image_grid_thw: grid dimensions [num_images, 3] where each entry is [temporal, height, width]
     image_grid_thw: list[list[int]] | None = None
     loss_branches: list[int] | None = None
+    sequence_loss_weights: list[float] | None = None

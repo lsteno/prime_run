@@ -4,6 +4,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
 import rlm_rlvr.reward as reward_module
 from rlm_rlvr.reward import (
     _annotate_semantic_child_segments,
@@ -23,7 +24,7 @@ from rlm_rlvr.reward import (
     _weighted_turn_token_cost,
     build_rubric,
 )
-from rlm_rlvr.semantic_evidence import parse_semantic_prompt_evidence
+from rlm_rlvr.semantic_evidence import parse_semantic_prompt_evidence, record_text_hash
 
 
 def _semantic_v3_info(*, task_type: str = "chunk_map") -> dict:
@@ -98,6 +99,54 @@ def _v4_segment(prompt: str, response: str) -> dict:
         "semantic_prompt_record_hashes": evidence.record_hashes,
         "semantic_prompt_duplicate_record_ids": list(evidence.duplicate_record_ids),
         "semantic_prompt_malformed_record_lines": evidence.malformed_record_lines,
+        "response_text": response,
+    }
+
+
+def _semantic_v5_info() -> dict:
+    records = {
+        "good one": ("positive", "chunk_001"),
+        "good two": ("positive", "chunk_001"),
+        "bad one": ("negative", "chunk_001"),
+        "bad two": ("negative", "chunk_002"),
+        "bad three": ("negative", "chunk_002"),
+        "good three": ("positive", "chunk_002"),
+    }
+    labels_by_hash = {record_text_hash(text): label for text, (label, _) in records.items()}
+    chunks_by_hash = {record_text_hash(text): chunk for text, (_, chunk) in records.items()}
+    return {
+        "context": "\n".join(
+            [
+                "### chunk_001",
+                "- good one",
+                "- good two",
+                "- bad one",
+                "### chunk_002",
+                "- bad two",
+                "- bad three",
+                "- good three",
+            ]
+        ),
+        "question": "Classify every section.",
+        "dataset_name": "oolong",
+        "source_task": "TASK_TYPE.SEMANTIC_CHUNK_MAP",
+        "answer_type": "ANSWER_TYPE.JSON",
+        "acceptable_answers": ['{"chunk_001":"positive","chunk_002":"negative"}'],
+        "metadata": {
+            "derived_dataset": "oolong_semantic_delegation_v5",
+            "semantic_task_type": "chunk_map",
+            "label_space": ["negative", "positive"],
+            "record_labels_by_text_hash": labels_by_hash,
+            "record_chunks_by_text_hash": chunks_by_hash,
+            "chunk_labels": {"chunk_001": "positive", "chunk_002": "negative"},
+        },
+    }
+
+
+def _v5_segment(texts: list[str], response: str) -> dict:
+    return {
+        "kind": "plain_query",
+        "semantic_prompt_matched_text_hashes": [record_text_hash(text) for text in texts],
         "response_text": response,
     }
 
@@ -274,6 +323,72 @@ def test_semantic_v4_invalid_record_map_output_gets_full_negative_advantage() ->
     assert segment["semantic_local_schema_valid"] is False
     assert segment["semantic_local_accuracy"] == 0.0
     assert segment["semantic_local_advantage"] == -1.0
+
+
+def test_semantic_v5_grades_natural_majority_for_visible_mixed_section_text() -> None:
+    info = _semantic_v5_info()
+    state = {
+        "rlm_segments": [
+            _v5_segment(["good one", "good two", "bad two"], "The reviews are mixed, but overall positive.")
+        ]
+    }
+
+    _annotate_semantic_child_segments(state, info)
+
+    segment = state["rlm_segments"][0]
+    assert segment["semantic_local_signal"] is True
+    assert segment["semantic_primary_chunk_id"] is None
+    assert segment["semantic_local_contract"] == "natural_majority"
+    assert segment["semantic_local_accuracy"] == 1.0
+    assert segment["semantic_local_advantage"] == 1.0
+    assert segment["semantic_terminal_fallback_eligible"] is True
+
+
+def test_semantic_v5_wrong_natural_conclusion_gets_negative_local_advantage() -> None:
+    state = {"rlm_segments": [_v5_segment(["bad two", "bad three", "good three"], "mostly positive")]}
+
+    _annotate_semantic_child_segments(state, _semantic_v5_info())
+
+    segment = state["rlm_segments"][0]
+    assert segment["semantic_local_signal"] is True
+    assert segment["semantic_local_accuracy"] == 0.0
+    assert segment["semantic_local_advantage"] == -1.0
+
+
+def test_semantic_v5_tie_and_ambiguous_answer_fall_back_to_terminal_credit() -> None:
+    state = {
+        "rlm_segments": [
+            _v5_segment(["good one", "bad one"], "overall positive"),
+            _v5_segment(["good one", "good two", "bad one"], "Some are positive and some are negative."),
+        ]
+    }
+
+    _annotate_semantic_child_segments(state, _semantic_v5_info())
+
+    tie, ambiguous = state["rlm_segments"]
+    assert tie["semantic_local_signal"] is False
+    assert tie["semantic_local_fallback_reason"] == "visible_label_tie"
+    assert ambiguous["semantic_local_signal"] is False
+    assert ambiguous["semantic_local_fallback_reason"] == "ambiguous_answer"
+    assert state["semantic_child_local_signal_rate"] == 0.0
+    assert state["semantic_child_terminal_fallback_rate"] == 1.0
+
+
+def test_semantic_v5_local_accuracy_excludes_terminal_fallback_calls() -> None:
+    state = {
+        "rlm_segments": [
+            _v5_segment(["good one", "good two", "bad one"], "positive"),
+            _v5_segment([], "negative"),
+        ]
+    }
+
+    _annotate_semantic_child_segments(state, _semantic_v5_info())
+
+    assert state["semantic_child_local_accuracy"] == 1.0
+    assert state["semantic_child_local_signal_rate"] == 0.5
+    assert state["semantic_child_terminal_fallback_rate"] == 0.5
+    assert state["semantic_child_input_match_rate"] == 0.5
+    assert state["semantic_child_natural_answer_parse_rate"] == 1.0
 
 
 def test_semantic_adaptive_reward_uses_continuous_progress_and_correct_only_cost(monkeypatch) -> None:
@@ -621,6 +736,34 @@ def test_adaptive_beta_ramps_after_solve_rate_floor() -> None:
         0.05 * ((0.5 - 0.25) / 0.75) ** 2
     )
     assert _adaptive_beta_for_solve_rate(solve_rate=1.0, beta_max=0.05, gamma=2.0, solve_rate_floor=0.25) == 0.05
+
+
+def test_adaptive_beta_min_applies_below_floor_and_interpolates_to_max() -> None:
+    assert (
+        _adaptive_beta_for_solve_rate(
+            solve_rate=0.0,
+            beta_min=0.1,
+            beta_max=1.0,
+            gamma=2.0,
+            solve_rate_floor=0.25,
+        )
+        == 0.1
+    )
+    expected = 0.1 + 0.9 * ((0.5 - 0.25) / 0.75) ** 2
+    assert _adaptive_beta_for_solve_rate(
+        solve_rate=0.5,
+        beta_min=0.1,
+        beta_max=1.0,
+        gamma=2.0,
+        solve_rate_floor=0.25,
+    ) == pytest.approx(expected)
+    assert _adaptive_beta_for_solve_rate(
+        solve_rate=1.0,
+        beta_min=0.1,
+        beta_max=1.0,
+        gamma=2.0,
+        solve_rate_floor=0.25,
+    ) == 1.0
 
 
 def test_build_rubric_applies_cost_penalty_on_exact_match(monkeypatch) -> None:
@@ -1206,6 +1349,38 @@ def test_adaptive_group_all_wrong_keeps_beta_zero_even_with_all_rollouts_penalty
     assert scores == [0.0, 0.0, 0.0, 0.0]
     assert all(state["reward_adaptive_beta"] == 0.0 for state in states)
     assert all(state["reward_incorrect_cost_penalty"] == 0.0 for state in states)
+
+
+def test_adaptive_group_beta_floor_penalizes_expensive_incorrect_rollouts(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    async def _judge_zero(*args, **kwargs):
+        del args, kwargs
+        return 0.0, "0", None
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    monkeypatch.setattr(reward_module, "_call_binary_judge", _judge_zero)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+        efficiency_penalty_mode="adaptive_group",
+        adaptive_efficiency_beta_min=0.1,
+        adaptive_efficiency_beta_max=1.0,
+        efficiency_penalty_applies_to="all_rollouts",
+        reward_clip_min=-0.5,
+        reward_clip_max=1.0,
+    )
+    reward_fn = rubric.funcs[0]
+    states = [_adaptive_test_state("wrong", total_tokens) for total_tokens in (20, 40, 80, 100)]
+
+    scores = asyncio.run(reward_fn(states))
+
+    assert scores == pytest.approx([0.0, -0.025, -0.075, -0.1])
+    assert all(state["reward_adaptive_beta"] == 0.1 for state in states)
+    assert states[-1]["reward_incorrect_cost_penalty"] == 0.1
 
 
 def test_adaptive_group_all_correct_compresses_cost(monkeypatch) -> None:

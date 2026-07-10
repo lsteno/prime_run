@@ -381,6 +381,145 @@ def test_semantic_child_without_recognized_local_signal_is_not_trained() -> None
     assert result.eligible_llm_subcalls == 0
 
 
+def test_semantic_v5_ungradable_child_uses_terminal_fallback_branch() -> None:
+    child = _trainable_subcall(1)
+    child.update(
+        {
+            "semantic_child_segment": True,
+            "semantic_local_signal": False,
+            "semantic_terminal_fallback_eligible": True,
+        }
+    )
+    rollout = {
+        "example_id": 1,
+        "reward": 0.5,
+        "error": None,
+        "sampling_args": {"temperature": 0.8},
+        "rlm_segments": [child],
+    }
+
+    result = rollout_to_training_sample_result(rollout)
+
+    assert result.samples is not None
+    assert len(result.samples) == 1
+    assert result.samples[0].loss_branch == "semantic_child"
+    assert result.samples[0].sequence_loss_weight == 1.0
+    assert result.sample_local_advantages == [None]
+
+
+def test_semantic_v5_selection_prefers_local_signal_then_distinct_fallback_section() -> None:
+    local = _trainable_subcall(1)
+    local.update(
+        {
+            "semantic_child_segment": True,
+            "semantic_local_signal": True,
+            "semantic_local_advantage": 1.0,
+            "semantic_primary_chunk_id": "chunk_001",
+        }
+    )
+    duplicate_fallback = _trainable_subcall(2)
+    duplicate_fallback.update(
+        {
+            "semantic_child_segment": True,
+            "semantic_local_signal": False,
+            "semantic_terminal_fallback_eligible": True,
+            "semantic_primary_chunk_id": "chunk_001",
+        }
+    )
+    distinct_fallback = _trainable_subcall(3)
+    distinct_fallback.update(
+        {
+            "semantic_child_segment": True,
+            "semantic_local_signal": False,
+            "semantic_terminal_fallback_eligible": True,
+            "semantic_primary_chunk_id": "chunk_002",
+        }
+    )
+    rollout = {
+        "example_id": 1,
+        "reward": 0.5,
+        "error": None,
+        "sampling_args": {"temperature": 0.8},
+        "rlm_segments": [local, duplicate_fallback, distinct_fallback],
+    }
+
+    result = rollout_to_training_sample_result(
+        rollout,
+        cache_key=1,
+        max_trainable_llm_subcalls_per_rollout=2,
+        selection_seed=42,
+        selection_step=1,
+    )
+
+    assert result.samples is not None
+    assert {sample.prompt_ids[0] for sample in result.samples} == {101, 103}
+    assert result.sample_local_advantages == [1.0, None]
+
+
+def test_semantic_v5_child_only_rollout_excludes_terminal_fallback_child() -> None:
+    local = _trainable_subcall(1)
+    local.update(
+        {
+            "semantic_child_segment": True,
+            "semantic_local_signal": True,
+            "semantic_local_advantage": 1.0,
+        }
+    )
+    fallback = _trainable_subcall(2)
+    fallback.update(
+        {
+            "semantic_child_segment": True,
+            "semantic_local_signal": False,
+            "semantic_terminal_fallback_eligible": True,
+        }
+    )
+    rollout = {
+        "example_id": 1,
+        "reward": 0.0,
+        "error": None,
+        "sampling_args": {"temperature": 0.8},
+        "rlm_child_only_training": True,
+        "rlm_segments": [local, fallback],
+    }
+
+    result = rollout_to_training_sample_result(rollout)
+
+    assert result.samples is not None
+    assert [sample.prompt_ids for sample in result.samples] == [[101]]
+    assert result.sample_local_advantages == [1.0]
+
+
+def test_root_sequence_weights_sum_to_one_per_rollout() -> None:
+    root_segments = []
+    for order in range(4):
+        root_segments.append(
+            {
+                "order": order,
+                "kind": "root_turn",
+                "train_scope": "root_turn",
+                "is_trainable_rlm_turn": True,
+                "prompt_ids": [order + 1],
+                "completion_ids": [order + 11],
+                "completion_logprobs": [-0.1],
+                "completion_mask": [True],
+                "temperature": 0.8,
+            }
+        )
+    rollout = {
+        "example_id": 1,
+        "reward": 1.0,
+        "error": None,
+        "sampling_args": {"temperature": 0.8},
+        "rlm_segments": root_segments,
+    }
+
+    result = rollout_to_training_sample_result(rollout)
+
+    assert result.samples is not None
+    assert [sample.sequence_loss_weight for sample in result.samples] == [0.25] * 4
+    assert sum(sample.sequence_loss_weight for sample in result.samples) == 1.0
+
+
 def test_semantic_advantage_blend_is_80_percent_local() -> None:
     assert blend_segment_advantage(
         terminal_advantage=0.5, local_advantage=-1.0, local_weight=0.8

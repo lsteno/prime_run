@@ -17,7 +17,7 @@ from .live_trace import write_live_trace
 from .parsing import extract_final_answer
 from .prompt_variants import DEFAULT_PROMPT_VARIANT
 from .repl import create_repl
-from .semantic_evidence import parse_semantic_prompt_evidence
+from .semantic_evidence import match_natural_semantic_evidence, parse_semantic_prompt_evidence
 from .trace import append_step_trace, make_call_trace, make_segment, prompt_provenance
 
 
@@ -799,17 +799,20 @@ class RecursiveRuntime:
             self.state["rlm_call_counter"] = call_id + 1
             return call_id
 
-    @staticmethod
-    def _semantic_prompt_evidence(messages: list[dict[str, str]]) -> dict[str, Any]:
+    def _semantic_prompt_evidence(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         text = "\n".join(str(message.get("content", "")) for message in messages)
         chunk_ids = list(dict.fromkeys(re.findall(r"\b(chunk_\d{3})\b", text, flags=re.IGNORECASE)))
         evidence = parse_semantic_prompt_evidence(text)
+        natural_evidence = match_natural_semantic_evidence(text, str(self.state.get("_root_context") or ""))
         return {
             "semantic_prompt_record_ids": list(evidence.record_hashes),
             "semantic_prompt_record_hashes": evidence.record_hashes,
             "semantic_prompt_duplicate_record_ids": list(evidence.duplicate_record_ids),
             "semantic_prompt_malformed_record_lines": evidence.malformed_record_lines,
             "semantic_prompt_chunk_ids": [value.casefold() for value in chunk_ids],
+            "semantic_prompt_matched_text_hashes": list(natural_evidence.matched_text_hashes),
+            "semantic_prompt_line_match_count": natural_evidence.line_match_count,
+            "semantic_prompt_substring_match_count": natural_evidence.substring_match_count,
         }
 
     def _append_segment(

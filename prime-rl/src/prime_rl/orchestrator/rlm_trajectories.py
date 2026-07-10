@@ -46,20 +46,36 @@ def _select_semantic_subcalls(
 ) -> set[int]:
     if limit <= 0:
         return set()
-    by_chunk: dict[str, list[int]] = {}
-    fallback: list[int] = []
-    for position in positions:
-        chunk_id = ordered_segments[position].get("semantic_primary_chunk_id")
-        if chunk_id:
-            by_chunk.setdefault(str(chunk_id), []).append(position)
-        else:
-            fallback.append(position)
-
     selected: list[int] = []
-    chunk_ids = list(by_chunk)
-    rng.shuffle(chunk_ids)
-    for chunk_id in chunk_ids[:limit]:
-        selected.append(rng.choice(by_chunk[chunk_id]))
+    selected_chunks: set[str] = set()
+    for require_local_signal in (True, False):
+        candidates = [
+            position
+            for position in positions
+            if position not in selected
+            and bool(ordered_segments[position].get("semantic_local_signal")) is require_local_signal
+        ]
+        by_chunk: dict[str, list[int]] = {}
+        without_chunk: list[int] = []
+        for position in candidates:
+            chunk_id = ordered_segments[position].get("semantic_primary_chunk_id")
+            if chunk_id:
+                by_chunk.setdefault(str(chunk_id), []).append(position)
+            else:
+                without_chunk.append(position)
+        chunk_ids = list(by_chunk)
+        rng.shuffle(chunk_ids)
+        for chunk_id in chunk_ids:
+            if len(selected) >= limit:
+                break
+            if chunk_id in selected_chunks:
+                continue
+            selected.append(rng.choice(by_chunk[chunk_id]))
+            selected_chunks.add(chunk_id)
+        if len(selected) < limit and without_chunk:
+            selected.extend(rng.sample(without_chunk, k=min(limit - len(selected), len(without_chunk))))
+        if len(selected) >= limit:
+            break
     remaining = [position for position in positions if position not in selected]
     if len(selected) < limit and remaining:
         selected.extend(rng.sample(remaining, k=min(limit - len(selected), len(remaining))))
@@ -105,7 +121,11 @@ def rollout_to_training_sample_result(
         for idx, segment in enumerate(ordered_segments)
         if _segment_is_trainable(segment)
         and _segment_is_plain_llm_subcall(segment)
-        and (not semantic_rollout or bool(segment.get("semantic_local_signal")))
+        and (
+            not semantic_rollout
+            or bool(segment.get("semantic_local_signal"))
+            or bool(segment.get("semantic_terminal_fallback_eligible"))
+        )
     ]
     eligible_llm_subcalls = len(trainable_llm_subcall_positions)
     selected_llm_subcall_positions = set(trainable_llm_subcall_positions)
@@ -135,6 +155,14 @@ def rollout_to_training_sample_result(
     sample_local_advantages: list[float | None] = []
     selected_llm_subcalls = 0
     child_only_training = bool(output.get("rlm_child_only_training", False))
+    trainable_root_positions = [
+        idx
+        for idx, segment in enumerate(ordered_segments)
+        if _segment_is_trainable(segment)
+        and not _segment_is_plain_llm_subcall(segment)
+        and not child_only_training
+    ]
+    root_sequence_weight = 1.0 / len(trainable_root_positions) if trainable_root_positions else 1.0
     for idx, segment in enumerate(ordered_segments):
         if not _segment_is_trainable(segment):
             continue
@@ -161,9 +189,10 @@ def rollout_to_training_sample_result(
             advantage=None,
             loss_branch=(
                 "semantic_child"
-                if bool(segment.get("semantic_child_segment")) and bool(segment.get("semantic_local_signal"))
+                if bool(segment.get("semantic_child_segment"))
                 else "root"
             ),
+            sequence_loss_weight=(1.0 if _segment_is_plain_llm_subcall(segment) else root_sequence_weight),
         )
         samples.append(sample)
         local_advantage = segment.get("semantic_local_advantage")

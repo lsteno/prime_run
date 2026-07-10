@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable
 from openai import AsyncOpenAI
 import verifiers as vf
 
+from .live_trace import write_live_trace
 from .semantic_evidence import parse_semantic_prompt_evidence
 
 JUDGE_PROMPT = """You are a binary grader.
@@ -315,7 +316,12 @@ def _is_oolong_semantic_aggregation_task(info: dict[str, Any] | None) -> bool:
     derived_dataset = str(metadata.get("derived_dataset") or "")
     return derived_dataset == "oolong_semantic_agg_v2" or (
         source_task.startswith("TASK_TYPE.SEMANTIC_")
-        and derived_dataset not in {"oolong_semantic_delegation_v3", "oolong_semantic_delegation_v4"}
+        and derived_dataset
+        not in {
+            "oolong_semantic_delegation_v3",
+            "oolong_semantic_delegation_v4",
+            "oolong_semantic_delegation_v5",
+        }
     )
 
 
@@ -328,6 +334,7 @@ def _semantic_delegation_metadata(info: dict[str, Any] | None) -> dict[str, Any]
     if metadata.get("derived_dataset") not in {
         "oolong_semantic_delegation_v3",
         "oolong_semantic_delegation_v4",
+        "oolong_semantic_delegation_v5",
     }:
         return None
     return metadata
@@ -711,14 +718,180 @@ def _annotate_semantic_child_segments_v4(state: vf.State, info: dict[str, Any]) 
     state["semantic_child_input_rejections"] = rejection_counts
 
 
+def _extract_natural_semantic_label(response_text: str, label_space: list[str]) -> str | None:
+    candidate = _strip_answer_prefix(response_text).strip()
+    normalized = _normalize_semantic_label(candidate, label_space)
+    if normalized is not None:
+        return normalized
+
+    parsed = _extract_json_object(candidate)
+    if parsed:
+        parsed_labels = {
+            label
+            for value in parsed.values()
+            if (label := _normalize_semantic_label(value, label_space)) is not None
+        }
+        if len(parsed_labels) == 1:
+            return next(iter(parsed_labels))
+
+    normalized_labels = {_normalize_text(label).casefold(): label for label in label_space}
+    label_pattern = "|".join(
+        re.escape(label) for label in sorted(normalized_labels, key=len, reverse=True)
+    )
+    if not label_pattern:
+        return None
+    conclusion_pattern = re.compile(
+        rf"\b(?:overall|majority|mostly|predominantly|conclusion|answer|label)\b"
+        rf"[^.\n:;]{{0,32}}\b(?P<label>{label_pattern})\b",
+        flags=re.IGNORECASE,
+    )
+    conclusion_matches = list(conclusion_pattern.finditer(_normalize_text(candidate)))
+    if conclusion_matches:
+        return normalized_labels[_normalize_text(conclusion_matches[-1].group("label")).casefold()]
+
+    mentioned = {
+        normalized_label: label
+        for normalized_label, label in normalized_labels.items()
+        if re.search(rf"\b{re.escape(normalized_label)}\b", _normalize_text(candidate), flags=re.IGNORECASE)
+    }
+    return next(iter(mentioned.values())) if len(mentioned) == 1 else None
+
+
+def _annotate_semantic_child_segments_v5(state: vf.State, info: dict[str, Any]) -> None:
+    metadata = _semantic_delegation_metadata(info)
+    assert metadata is not None
+    labels_by_hash = {
+        str(text_hash): str(label)
+        for text_hash, label in (metadata.get("record_labels_by_text_hash") or {}).items()
+    }
+    chunks_by_hash = {
+        str(text_hash): str(chunk_id)
+        for text_hash, chunk_id in (metadata.get("record_chunks_by_text_hash") or {}).items()
+    }
+    label_space = [str(label) for label in metadata.get("label_space") or []]
+    chunk_labels = metadata.get("chunk_labels") or {}
+    segments = state.get("rlm_segments")
+    if not isinstance(segments, list):
+        return
+
+    child_count = 0
+    matched_call_count = 0
+    parsed_answer_count = 0
+    local_signal_count = 0
+    local_correct_count = 0
+    total_matched_records = 0
+    all_matched_hashes: set[str] = set()
+    covered_chunks: set[str] = set()
+    fallback_reasons: dict[str, int] = {}
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        if segment.get("kind") != "plain_query" and segment.get("train_scope") != "llm_subcall":
+            continue
+
+        child_count += 1
+        segment["semantic_child_segment"] = True
+        segment["semantic_terminal_fallback_eligible"] = True
+        matched_hashes = list(
+            dict.fromkeys(
+                str(text_hash)
+                for text_hash in (segment.get("semantic_prompt_matched_text_hashes") or [])
+                if str(text_hash) in labels_by_hash
+            )
+        )
+        matched_chunks = sorted(
+            {chunks_by_hash[text_hash] for text_hash in matched_hashes if text_hash in chunks_by_hash}
+        )
+        segment["semantic_recognized_record_count"] = len(matched_hashes)
+        segment["semantic_recognized_chunk_ids"] = matched_chunks
+        segment["semantic_primary_chunk_id"] = matched_chunks[0] if len(matched_chunks) == 1 else None
+        segment["semantic_input_verified"] = bool(matched_hashes)
+        total_matched_records += len(matched_hashes)
+        all_matched_hashes.update(matched_hashes)
+        covered_chunks.update(matched_chunks)
+        if matched_hashes:
+            matched_call_count += 1
+
+        prediction = _extract_natural_semantic_label(str(segment.get("response_text") or ""), label_space)
+        if prediction is not None:
+            parsed_answer_count += 1
+
+        label_counts = {label: 0 for label in label_space}
+        for text_hash in matched_hashes:
+            label = labels_by_hash[text_hash]
+            if label in label_counts:
+                label_counts[label] += 1
+        ordered_counts = sorted(label_counts.values(), reverse=True)
+        target = None
+        if matched_hashes and len(ordered_counts) >= 2 and ordered_counts[0] > ordered_counts[1]:
+            target = max(label_counts, key=label_counts.get)
+
+        if not matched_hashes:
+            fallback_reason = "no_matched_records"
+        elif target is None:
+            fallback_reason = "visible_label_tie"
+        elif prediction is None:
+            fallback_reason = "ambiguous_answer"
+        else:
+            fallback_reason = None
+
+        if fallback_reason is not None:
+            segment["semantic_local_signal"] = False
+            segment["semantic_local_schema_valid"] = prediction is not None
+            segment["semantic_local_fallback_reason"] = fallback_reason
+            fallback_reasons[fallback_reason] = fallback_reasons.get(fallback_reason, 0) + 1
+            continue
+
+        accuracy = float(prediction == target)
+        local_signal_count += 1
+        local_correct_count += int(accuracy)
+        segment.update(
+            {
+                "semantic_local_signal": True,
+                "semantic_local_contract": "natural_majority",
+                "semantic_local_accuracy": accuracy,
+                "semantic_local_coverage": 1.0,
+                "semantic_local_schema_valid": True,
+                "semantic_local_advantage": 2.0 * accuracy - 1.0,
+                "semantic_local_exact": accuracy,
+                "semantic_local_prediction_count": 1,
+            }
+        )
+
+    denominator = child_count or 1
+    signal_denominator = local_signal_count or 1
+    state["semantic_child_scored_segments"] = float(local_signal_count)
+    state["semantic_child_local_accuracy"] = local_correct_count / signal_denominator
+    state["semantic_child_local_coverage"] = local_signal_count / denominator
+    state["semantic_child_exact_rate"] = local_correct_count / signal_denominator
+    state["semantic_child_local_signal_rate"] = local_signal_count / denominator
+    state["semantic_child_terminal_fallback_rate"] = (child_count - local_signal_count) / denominator
+    state["semantic_child_input_match_rate"] = matched_call_count / denominator
+    state["semantic_child_natural_answer_parse_rate"] = parsed_answer_count / denominator
+    state["semantic_child_verified_input_rate"] = matched_call_count / denominator
+    state["semantic_child_invalid_input_rate"] = (child_count - matched_call_count) / denominator
+    state["semantic_child_valid_output_rate"] = parsed_answer_count / denominator
+    state["semantic_child_chunk_contract_rate"] = 0.0
+    state["semantic_child_record_contract_rate"] = 0.0
+    state["semantic_records_per_subcall"] = total_matched_records / denominator
+    state["semantic_record_coverage"] = len(all_matched_hashes) / len(labels_by_hash) if labels_by_hash else 0.0
+    state["semantic_duplicate_coverage"] = 0.0
+    state["semantic_verified_full_chunk_coverage"] = 0.0
+    state["semantic_section_diversity"] = len(covered_chunks) / len(chunk_labels) if chunk_labels else 0.0
+    state["semantic_child_input_rejections"] = fallback_reasons
+
+
 def _annotate_semantic_child_segments(state: vf.State, info: dict[str, Any] | None) -> None:
     metadata = _semantic_delegation_metadata(info)
     if metadata is None:
         return
-    if metadata.get("derived_dataset") == "oolong_semantic_delegation_v4":
+    if metadata.get("derived_dataset") == "oolong_semantic_delegation_v5":
+        _annotate_semantic_child_segments_v5(state, info or {})
+    elif metadata.get("derived_dataset") == "oolong_semantic_delegation_v4":
         _annotate_semantic_child_segments_v4(state, info or {})
     else:
         _annotate_semantic_child_segments_v3(state, info)
+    write_live_trace(state, event="semantic_scored")
 
 
 def _record_semantic_delegation_metrics(state: vf.State, score: SemanticDelegationScore) -> None:
@@ -1515,13 +1688,15 @@ async def _score_correctness_with_protocol(
     )
 
 
-def _adaptive_beta_for_solve_rate(*, solve_rate: float, beta_max: float, gamma: float, solve_rate_floor: float) -> float:
+def _adaptive_beta_for_solve_rate(
+    *, solve_rate: float, beta_max: float, gamma: float, solve_rate_floor: float, beta_min: float = 0.0
+) -> float:
     if solve_rate <= solve_rate_floor:
-        return 0.0
+        return beta_min
     if solve_rate_floor >= 1.0:
         return beta_max
     ramp = (solve_rate - solve_rate_floor) / (1.0 - solve_rate_floor)
-    return beta_max * (ramp**gamma)
+    return beta_min + (beta_max - beta_min) * (ramp**gamma)
 
 
 def _weighted_turn_token_cost(
@@ -1578,6 +1753,7 @@ def build_rubric(
     judge_vertex_location: str = "global",
     judge_thinking_level: str | None = "medium",
     efficiency_penalty_mode: str = "static_per_1k",
+    adaptive_efficiency_beta_min: float = 0.0,
     adaptive_efficiency_beta_max: float = 0.05,
     adaptive_efficiency_gamma: float = 2.0,
     adaptive_efficiency_solve_rate_floor: float = 0.25,
@@ -1602,8 +1778,10 @@ def build_rubric(
         raise ValueError(f"efficiency_penalty_applies_to must be one of {sorted(_VALID_EFFICIENCY_PENALTY_SCOPES)}")
     if reward_clip_min > reward_clip_max:
         raise ValueError("reward_clip_min must be <= reward_clip_max")
-    if adaptive_efficiency_beta_max < 0.0:
-        raise ValueError("adaptive_efficiency_beta_max must be >= 0.0")
+    if adaptive_efficiency_beta_min < 0.0:
+        raise ValueError("adaptive_efficiency_beta_min must be >= 0.0")
+    if adaptive_efficiency_beta_max < adaptive_efficiency_beta_min:
+        raise ValueError("adaptive_efficiency_beta_max must be >= adaptive_efficiency_beta_min")
     if adaptive_efficiency_gamma <= 0.0:
         raise ValueError("adaptive_efficiency_gamma must be > 0.0")
     if not 0.0 <= adaptive_efficiency_solve_rate_floor < 1.0:
@@ -1717,6 +1895,7 @@ def build_rubric(
         solve_rate = sum(progress_scores) / len(progress_scores) if progress_scores else 0.0
         beta = _adaptive_beta_for_solve_rate(
             solve_rate=solve_rate,
+            beta_min=adaptive_efficiency_beta_min,
             beta_max=adaptive_efficiency_beta_max,
             gamma=adaptive_efficiency_gamma,
             solve_rate_floor=adaptive_efficiency_solve_rate_floor,
@@ -1824,6 +2003,26 @@ async def semantic_child_invalid_input_rate_metric(state: vf.State) -> float:
 
 async def semantic_child_valid_output_rate_metric(state: vf.State) -> float:
     return float(state.get("semantic_child_valid_output_rate", 0.0))
+
+
+async def semantic_child_local_signal_rate_metric(state: vf.State) -> float:
+    return float(state.get("semantic_child_local_signal_rate", 0.0))
+
+
+async def semantic_child_terminal_fallback_rate_metric(state: vf.State) -> float:
+    return float(state.get("semantic_child_terminal_fallback_rate", 0.0))
+
+
+async def semantic_child_input_match_rate_metric(state: vf.State) -> float:
+    return float(state.get("semantic_child_input_match_rate", 0.0))
+
+
+async def semantic_child_natural_answer_parse_rate_metric(state: vf.State) -> float:
+    return float(state.get("semantic_child_natural_answer_parse_rate", 0.0))
+
+
+async def semantic_section_diversity_metric(state: vf.State) -> float:
+    return float(state.get("semantic_section_diversity", 0.0))
 
 
 async def semantic_child_chunk_contract_rate_metric(state: vf.State) -> float:
@@ -2002,6 +2201,11 @@ def add_metrics(rubric: vf.Rubric) -> vf.Rubric:
     rubric.add_metric(semantic_child_verified_input_rate_metric)
     rubric.add_metric(semantic_child_invalid_input_rate_metric)
     rubric.add_metric(semantic_child_valid_output_rate_metric)
+    rubric.add_metric(semantic_child_local_signal_rate_metric)
+    rubric.add_metric(semantic_child_terminal_fallback_rate_metric)
+    rubric.add_metric(semantic_child_input_match_rate_metric)
+    rubric.add_metric(semantic_child_natural_answer_parse_rate_metric)
+    rubric.add_metric(semantic_section_diversity_metric)
     rubric.add_metric(semantic_child_chunk_contract_rate_metric)
     rubric.add_metric(semantic_child_record_contract_rate_metric)
     rubric.add_metric(semantic_verified_full_chunk_coverage_metric)

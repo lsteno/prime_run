@@ -115,6 +115,8 @@ def _compact_segment(segment: dict[str, Any]) -> dict[str, Any]:
         "semantic_local_coverage": segment.get("semantic_local_coverage"),
         "semantic_local_schema_valid": segment.get("semantic_local_schema_valid"),
         "semantic_local_advantage": segment.get("semantic_local_advantage"),
+        "semantic_terminal_fallback_eligible": segment.get("semantic_terminal_fallback_eligible"),
+        "semantic_local_fallback_reason": segment.get("semantic_local_fallback_reason"),
     }
 
 

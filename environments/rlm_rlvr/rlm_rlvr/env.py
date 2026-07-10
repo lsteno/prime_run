@@ -106,6 +106,7 @@ class RLMRLVREnv(vf.MultiTurnEnv):
 
         state["efficiency_penalty_coef"] = getattr(self, "efficiency_penalty_coef", 0.02)
         state["efficiency_penalty_mode"] = getattr(self, "efficiency_penalty_mode", "static_per_1k")
+        state["adaptive_efficiency_beta_min"] = getattr(self, "adaptive_efficiency_beta_min", 0.0)
         state["adaptive_efficiency_beta_max"] = getattr(self, "adaptive_efficiency_beta_max", 0.05)
         state["adaptive_efficiency_gamma"] = getattr(self, "adaptive_efficiency_gamma", 2.0)
         state["adaptive_efficiency_solve_rate_floor"] = getattr(self, "adaptive_efficiency_solve_rate_floor", 0.25)
@@ -419,6 +420,7 @@ def load_environment(
     judge_vertex_location: str | None = "global",
     judge_thinking_level: str | None = "medium",
     efficiency_penalty_mode: str = "static_per_1k",
+    adaptive_efficiency_beta_min: float = 0.0,
     adaptive_efficiency_beta_max: float = 0.05,
     adaptive_efficiency_gamma: float = 2.0,
     adaptive_efficiency_solve_rate_floor: float = 0.25,
@@ -483,8 +485,10 @@ def load_environment(
     valid_efficiency_penalty_modes = {"static_per_1k", "adaptive_group"}
     if efficiency_penalty_mode not in valid_efficiency_penalty_modes:
         raise ValueError(f"efficiency_penalty_mode must be one of {sorted(valid_efficiency_penalty_modes)}")
-    if adaptive_efficiency_beta_max < 0.0:
-        raise ValueError("adaptive_efficiency_beta_max must be >= 0.0")
+    if adaptive_efficiency_beta_min < 0.0:
+        raise ValueError("adaptive_efficiency_beta_min must be >= 0.0")
+    if adaptive_efficiency_beta_max < adaptive_efficiency_beta_min:
+        raise ValueError("adaptive_efficiency_beta_max must be >= adaptive_efficiency_beta_min")
     if adaptive_efficiency_gamma <= 0.0:
         raise ValueError("adaptive_efficiency_gamma must be > 0.0")
     if not 0.0 <= adaptive_efficiency_solve_rate_floor < 1.0:
@@ -649,6 +653,7 @@ def load_environment(
         judge_vertex_location=judge_vertex_location or os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
         judge_thinking_level=judge_thinking_level,
         efficiency_penalty_mode=efficiency_penalty_mode,
+        adaptive_efficiency_beta_min=adaptive_efficiency_beta_min,
         adaptive_efficiency_beta_max=adaptive_efficiency_beta_max,
         adaptive_efficiency_gamma=adaptive_efficiency_gamma,
         adaptive_efficiency_solve_rate_floor=adaptive_efficiency_solve_rate_floor,
@@ -674,6 +679,7 @@ def load_environment(
         runtime_config=runtime_config,
         efficiency_penalty_coef=efficiency_penalty_coef,
         efficiency_penalty_mode=efficiency_penalty_mode,
+        adaptive_efficiency_beta_min=adaptive_efficiency_beta_min,
         adaptive_efficiency_beta_max=adaptive_efficiency_beta_max,
         adaptive_efficiency_gamma=adaptive_efficiency_gamma,
         adaptive_efficiency_solve_rate_floor=adaptive_efficiency_solve_rate_floor,

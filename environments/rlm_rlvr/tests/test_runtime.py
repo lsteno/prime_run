@@ -15,6 +15,7 @@ from rlm_rlvr.env import RLMRLVREnv, load_environment
 from rlm_rlvr.prompt_variants import DEFAULT_PROMPT_VARIANT
 from rlm_rlvr.repl import RecursiveLocalRepl, code_uses_subcalls
 from rlm_rlvr.runtime import RecursiveRuntime, RuntimeConfig, SubcallPromptTooLargeError, SyncInferenceSession, TokenPayload, VertexGeminiSession
+from rlm_rlvr.semantic_evidence import record_text_hash
 from rlm_rlvr.trace import make_call_trace
 
 
@@ -112,6 +113,29 @@ def _runtime_state(**overrides):
     }
     state.update(overrides)
     return state
+
+
+def test_runtime_privately_matches_natural_child_excerpt_without_visible_ids() -> None:
+    runtime = object.__new__(RecursiveRuntime)
+    runtime.state = _runtime_state(
+        _root_context="### chunk_001\n- a genuinely moving review\n- painfully dull and predictable"
+    )
+
+    evidence = runtime._semantic_prompt_evidence(
+        [
+            {
+                "role": "user",
+                "content": "Assess the overall sentiment.\na genuinely moving review\nContext: painfully dull and predictable",
+            }
+        ]
+    )
+
+    assert set(evidence["semantic_prompt_matched_text_hashes"]) == {
+        record_text_hash("a genuinely moving review"),
+        record_text_hash("painfully dull and predictable"),
+    }
+    assert evidence["semantic_prompt_line_match_count"] == 1
+    assert evidence["semantic_prompt_substring_match_count"] == 1
 
 
 def test_generate_falls_back_when_token_metadata_is_missing() -> None:

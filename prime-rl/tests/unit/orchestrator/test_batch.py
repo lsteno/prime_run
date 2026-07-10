@@ -81,6 +81,7 @@ def test_prepare_batch_packs_different_temperatures(make_training_example):
 
 def test_prepare_batch_preserves_root_and_semantic_child_loss_branches(make_training_example):
     root = make_training_example()
+    root.sequence_loss_weight = 0.25
     child = make_training_example()
     child.loss_branch = "semantic_child"
 
@@ -94,6 +95,7 @@ def test_prepare_batch_preserves_root_and_semantic_child_loss_branches(make_trai
 
     packed = batches[0][0]
     assert packed.loss_branches == [0, 0, 0, 0, 1, 1, 1, 1]
+    assert packed.sequence_loss_weights == [0.25, 0.25, 0.25, 0.25, 1.0, 1.0, 1.0, 1.0]
 
 
 def test_prepare_sample_with_routed_experts():
