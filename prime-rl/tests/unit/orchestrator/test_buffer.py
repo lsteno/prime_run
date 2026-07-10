@@ -1,3 +1,4 @@
+import json
 import random
 from unittest.mock import MagicMock
 
@@ -397,6 +398,111 @@ def test_buffer_env_ratios_validation():
 
     with pytest.raises(ValidationError, match="All env_ratios must be positive"):
         BufferConfig(env_ratios=[0.5, -0.3, 0.2])
+
+
+def test_buffer_uses_configured_continuous_difficulty_metric(dummy_env_group, make_rollouts):
+    dataset = dummy_env_group.get_dataset()
+    buffer = Buffer(
+        dataset,
+        dummy_env_group.env_names,
+        BufferConfig(
+            online_difficulty_filtering=True,
+            difficulty_metric="semantic_progress_metric",
+        ),
+    )
+    rollouts = make_rollouts(dataset.select(range(1)), rewards=[0.0], correctness=[0.0])
+    for rollout in rollouts:
+        rollout["metrics"]["semantic_progress_metric"] = 0.5
+
+    buffer.update(rollouts)
+
+    assert len(buffer.rollout_buffer) == 2
+
+
+def test_buffer_retains_hard_semantic_groups_as_child_only(dummy_env_group, make_rollouts):
+    dataset = dummy_env_group.get_dataset()
+    buffer = Buffer(
+        dataset,
+        dummy_env_group.env_names,
+        BufferConfig(
+            online_difficulty_filtering=True,
+            online_filter_hard=True,
+            hard_threshold=0.0,
+            hard_cooldown_steps=5,
+        ),
+    )
+    rollouts = make_rollouts(dataset.select(range(1)), rewards=[0.0], correctness=[0.0])
+    for rollout in rollouts:
+        rollout["rlm_segments"] = [{"kind": "plain_query", "semantic_local_signal": True}]
+
+    buffer.update(rollouts, step=3)
+
+    assert len(buffer.rollout_buffer) == 2
+    assert all(rollout["rlm_child_only_training"] for rollout in buffer.rollout_buffer)
+    assert len(buffer.hard_examples) == 1
+    metrics = buffer.get_metrics()
+    assert metrics["buffer/retained_hard_local_groups"] == 1
+    assert metrics["buffer/filtered_hard_groups"] == 0
+
+
+def _curriculum_dataset() -> Dataset:
+    rows = []
+    for bucket in ("base", "semantic_4", "semantic_8", "semantic_16", "semantic_global"):
+        for index in range(20):
+            rows.append(
+                {
+                    "example_id": len(rows),
+                    "task": "env",
+                    "prompt": f"{bucket}-{index}",
+                    "info": json.dumps({"metadata": {"curriculum_bucket": bucket}}),
+                }
+            )
+    return Dataset.from_list(rows)
+
+
+def test_buffer_curriculum_transitions_and_renormalizes_seeded_sampling() -> None:
+    from prime_rl.configs.orchestrator import CurriculumPhaseConfig
+
+    config = BufferConfig(
+        seed=17,
+        curriculum_bucket_path="metadata.curriculum_bucket",
+        curriculum_phases=[
+            CurriculumPhaseConfig(start_step=0, end_step=29, weights={"base": 0.65, "semantic_4": 0.35}),
+            CurriculumPhaseConfig(
+                start_step=30,
+                end_step=79,
+                weights={"base": 0.65, "semantic_4": 0.0875, "semantic_8": 0.2625},
+            ),
+            CurriculumPhaseConfig(
+                start_step=80,
+                end_step=149,
+                weights={
+                    "base": 0.65,
+                    "semantic_4": 0.035,
+                    "semantic_8": 0.07,
+                    "semantic_16": 0.21,
+                    "semantic_global": 0.035,
+                },
+            ),
+        ],
+    )
+    dataset = _curriculum_dataset()
+
+    def sample(step: int) -> list[str]:
+        buffer = Buffer(dataset, ["env"], config)
+        return [buffer._curriculum_bucket(example) for example in buffer.sample_examples(2000, step=step)]
+
+    phase_one = sample(0)
+    assert set(phase_one) == {"base", "semantic_4"}
+    assert 0.61 <= phase_one.count("base") / len(phase_one) <= 0.69
+    assert phase_one == sample(0)
+
+    phase_two = sample(30)
+    assert set(phase_two) == {"base", "semantic_4", "semantic_8"}
+
+    phase_three = sample(80)
+    assert set(phase_three) == {"base", "semantic_4", "semantic_8", "semantic_16", "semantic_global"}
+    assert 0.61 <= phase_three.count("base") / len(phase_three) <= 0.69
 
 
 def test_buffer_no_cross_env_pool_assignment(mock_openai_client, tmp_path):

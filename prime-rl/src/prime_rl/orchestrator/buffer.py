@@ -31,6 +31,7 @@ class Buffer:
         self.env_names = env_names
         self.config = buffer_config
         self.logger = get_logger()
+        self.current_step = 0
 
         if self.config.seed is not None:
             random.seed(self.config.seed)
@@ -207,7 +208,58 @@ class Buffer:
         else:
             self.logger.debug("No easy/ hard examples or rollouts found in checkpoint")
 
-    def sample_examples(self, n: int) -> list[dict]:
+    @staticmethod
+    def _value_at_path(value: object, path: str) -> object | None:
+        current = value
+        for part in path.split("."):
+            if not isinstance(current, dict) or part not in current:
+                return None
+            current = current[part]
+        return current
+
+    def _curriculum_bucket(self, example: dict) -> str:
+        path = self.config.curriculum_bucket_path
+        if not path:
+            return self.config.curriculum_base_bucket
+        value = self._value_at_path(example, path)
+        if value is None:
+            info = example.get("info")
+            if isinstance(info, str):
+                try:
+                    info = json.loads(info)
+                except json.JSONDecodeError:
+                    info = None
+            value = self._value_at_path(info, path)
+        return str(value) if value not in (None, "") else self.config.curriculum_base_bucket
+
+    def _curriculum_weights(self, step: int) -> dict[str, float] | None:
+        for phase in self.config.curriculum_phases:
+            if step >= phase.start_step and (phase.end_step is None or step <= phase.end_step):
+                return phase.weights
+        return None
+
+    def _sample_env_example(self, env: str, *, step: int) -> dict:
+        examples = list(self.example_buffer[env].values())
+        configured_weights = self._curriculum_weights(step)
+        if not configured_weights:
+            sampled = random.choice(examples)
+        else:
+            by_bucket: dict[str, list[dict]] = defaultdict(list)
+            for example in examples:
+                by_bucket[self._curriculum_bucket(example)].append(example)
+            buckets = [
+                bucket
+                for bucket, weight in configured_weights.items()
+                if weight > 0.0 and by_bucket.get(bucket)
+            ]
+            if not buckets:
+                raise ValueError(f"No non-empty curriculum buckets available at step {step} for environment {env}.")
+            bucket = random.choices(buckets, weights=[configured_weights[bucket] for bucket in buckets], k=1)[0]
+            sampled = random.choice(by_bucket[bucket])
+        self.curriculum_samples_per_step[self._curriculum_bucket(sampled)] += 1
+        return sampled
+
+    def sample_examples(self, n: int, step: int | None = None) -> list[dict]:
         """Samples n examples from the buffer, respecting env ratios."""
 
         non_empty_envs = [env for env, examples in self.example_buffer.items() if examples]
@@ -217,8 +269,9 @@ class Buffer:
 
         non_empty_env_probs = [self.env_probs[env] for env in non_empty_envs]
         sampled_examples = []
+        resolved_step = self.current_step if step is None else step
         for sampled_env in random.choices(non_empty_envs, weights=non_empty_env_probs, k=n):
-            sampled_example = random.choice(list(self.example_buffer[sampled_env].values()))
+            sampled_example = self._sample_env_example(sampled_env, step=resolved_step)
             sampled_examples.append(sampled_example)
 
         return sampled_examples
@@ -257,8 +310,7 @@ class Buffer:
         self.num_examples_per_step[env_name]["hard"] += 1
         return True
 
-    @staticmethod
-    def _difficulty_score(example_rollouts: list[vf.RolloutOutput]) -> float:
+    def _difficulty_score(self, example_rollouts: list[vf.RolloutOutput]) -> float:
         """Use binary correctness for difficulty filtering when available.
 
         Shaped rewards may be negative after cost penalties, but hard/easy filtering
@@ -267,13 +319,26 @@ class Buffer:
         correctness_values: list[float] = []
         for rollout in example_rollouts:
             metrics = rollout.get("metrics") or {}
-            if "correctness_metric" not in metrics:
+            metric_key = self.config.difficulty_metric
+            metric_value = metrics.get(metric_key)
+            if metric_value is None and metric_key != "correctness_metric":
+                metric_value = metrics.get("correctness_metric")
+            if metric_value is None:
                 return mean([r["reward"] for r in example_rollouts])
             try:
-                correctness_values.append(float(metrics["correctness_metric"]))
+                correctness_values.append(float(metric_value))
             except (TypeError, ValueError):
                 return mean([r["reward"] for r in example_rollouts])
         return mean(correctness_values)
+
+    @staticmethod
+    def _has_semantic_child_signal(example_rollouts: list[vf.RolloutOutput]) -> bool:
+        return any(
+            bool(segment.get("semantic_local_signal"))
+            for rollout in example_rollouts
+            for segment in (rollout.get("rlm_segments") or [])
+            if isinstance(segment, dict)
+        )
 
     def update(self, rollouts: list[vf.RolloutOutput], step: int | None = None):
         """Updates the buffer state with completed rollouts."""
@@ -314,6 +379,13 @@ class Buffer:
             self.num_examples_per_step[env_name][filtered_pool or pool] += 1
             if self.config.online_difficulty_filtering:
                 if filtered_pool == "hard":
+                    if self._has_semantic_child_signal(example_rollouts):
+                        for rollout in example_rollouts:
+                            rollout["rlm_child_only_training"] = True
+                        self.num_rollouts_per_step[env_name]["normal"] += len(example_rollouts)
+                        self.retained_hard_local_groups_per_step += 1
+                        self.rollout_buffer.extend(example_rollouts)
+                        continue
                     self.num_rollouts_per_step[env_name]["hard"] += len(example_rollouts)
                     self.filtered_hard_groups_per_step += 1
                     continue
@@ -344,6 +416,8 @@ class Buffer:
         self.filtered_hard_groups_per_step = 0
         self.filtered_easy_groups_per_step = 0
         self.kept_easy_groups_per_step = 0
+        self.retained_hard_local_groups_per_step = 0
+        self.curriculum_samples_per_step: dict[str, int] = defaultdict(int)
 
     def get_metrics(self) -> dict[str, float]:
         """Returns the buffer metrics for the current step."""
@@ -352,7 +426,13 @@ class Buffer:
             "buffer/filtered_hard_groups": self.filtered_hard_groups_per_step,
             "buffer/filtered_easy_groups": self.filtered_easy_groups_per_step,
             "buffer/kept_easy_groups": self.kept_easy_groups_per_step,
+            "buffer/retained_hard_local_groups": self.retained_hard_local_groups_per_step,
         }
+        curriculum_total = sum(self.curriculum_samples_per_step.values())
+        for bucket, count in self.curriculum_samples_per_step.items():
+            metrics[f"curriculum/sampled_count/{bucket}"] = float(count)
+            if curriculum_total:
+                metrics[f"curriculum/sampled_ratio/{bucket}"] = count / curriculum_total
 
         # sum over envs (e.g. log globally)
         num_examples_per_step_per_pool = {

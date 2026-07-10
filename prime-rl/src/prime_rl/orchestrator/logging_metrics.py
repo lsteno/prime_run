@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import verifiers as vf
 
 COMMON_STOP_CONDITIONS = (
     "has_final_env_response",
@@ -9,6 +10,19 @@ COMMON_STOP_CONDITIONS = (
     "prompt_too_long",
     "generation_truncated",
 )
+
+
+def rollout_curriculum_bucket(rollout: vf.RolloutOutput, *, base_bucket: str) -> str:
+    trajectory = rollout.get("trajectory") or []
+    if trajectory:
+        extras = trajectory[-1].get("extras") or {}
+        debug = extras.get("rlm_debug") or {}
+        sample_metadata = debug.get("sample_metadata") or {}
+        metadata = sample_metadata.get("metadata") or {}
+        bucket = metadata.get("curriculum_bucket") if isinstance(metadata, dict) else None
+        if bucket not in (None, ""):
+            return str(bucket)
+    return base_bucket
 
 
 def _numeric_metric_series(metrics_df: pd.DataFrame, metric: str, index: pd.Index) -> pd.Series:

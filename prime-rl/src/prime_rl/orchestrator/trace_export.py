@@ -29,7 +29,7 @@ def _segment_summary(segment: dict[str, Any]) -> dict[str, Any]:
     is_trainable = bool(segment.get("is_trainable_rlm_turn", False))
     prompt_token_count = segment.get("prompt_token_count")
     completion_token_count = segment.get("completion_token_count")
-    return {
+    summary = {
         "order": int(segment.get("order", 0)),
         "call_id": segment.get("call_id"),
         "parent_call_id": segment.get("parent_call_id"),
@@ -52,6 +52,18 @@ def _segment_summary(segment: dict[str, Any]) -> dict[str, Any]:
         else len(segment.get("completion_ids", [])),
         "trainable_token_count": sum(completion_mask) if is_trainable else 0,
     }
+    semantic_keys = (
+        "semantic_recognized_record_count",
+        "semantic_recognized_chunk_ids",
+        "semantic_primary_chunk_id",
+        "semantic_local_signal",
+        "semantic_local_accuracy",
+        "semantic_local_coverage",
+        "semantic_local_schema_valid",
+        "semantic_local_advantage",
+    )
+    summary.update({key: segment[key] for key in semantic_keys if segment.get(key) is not None})
+    return summary
 
 
 def _rollout_answer(rollout: vf.RolloutOutput) -> str | None:

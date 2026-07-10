@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import rlm_rlvr.reward as reward_module
 from rlm_rlvr.reward import (
+    _annotate_semantic_child_segments,
     _adaptive_beta_for_solve_rate,
     _adaptive_cost_value,
     _efficiency_penalty_from_state,
@@ -15,11 +17,207 @@ from rlm_rlvr.reward import (
     _parse_binary_judge_score,
     _score_oolong_pairs,
     _score_oolong_semantic_aggregation,
+    _score_semantic_delegation_v3,
     _segment_rollout_token_breakdown,
     _segment_rollout_token_totals,
     _weighted_turn_token_cost,
     build_rubric,
 )
+
+
+def _semantic_v3_info(*, task_type: str = "chunk_map") -> dict:
+    chunk_labels = {
+        "chunk_001": "positive",
+        "chunk_002": "negative",
+        "chunk_003": "positive",
+        "chunk_004": "negative",
+    }
+    return {
+        "question": "Classify every chunk.",
+        "dataset_name": "oolong",
+        "source_task": "TASK_TYPE.SEMANTIC_CHUNK_MAP",
+        "answer_type": "ANSWER_TYPE.JSON",
+        "acceptable_answers": [json.dumps(chunk_labels)],
+        "metadata": {
+            "derived_dataset": "oolong_semantic_delegation_v3",
+            "semantic_task_type": task_type,
+            "label_space": ["negative", "positive"],
+            "record_labels": {
+                "r00001": "positive",
+                "r00002": "negative",
+                "r00003": "positive",
+            },
+            "record_chunks": {
+                "r00001": "chunk_001",
+                "r00002": "chunk_001",
+                "r00003": "chunk_002",
+            },
+            "chunk_labels": chunk_labels,
+            "global_outcome": "same",
+        },
+    }
+
+
+def test_semantic_delegation_chunk_scoring_shape() -> None:
+    info = _semantic_v3_info()
+    exact, _, error = _score_semantic_delegation_v3(
+        'Result: {"chunk_001":"positive","chunk_002":"negative","chunk_003":"positive","chunk_004":"negative"}',
+        info,
+    )
+    assert error is None
+    assert exact.task_score == 1.0
+    assert exact.chunk_accuracy == 1.0
+    assert exact.progress == 1.0
+    assert exact.exact == 1.0
+
+    partial, _, _ = _score_semantic_delegation_v3(
+        '{"chunk_001":"positive","chunk_002":"negative","chunk_003":"positive"}', info
+    )
+    assert partial.chunk_accuracy == 0.75
+    assert partial.progress == 0.5
+    assert partial.task_score == 0.25
+    assert partial.exact == 0.0
+
+    chance, _, _ = _score_semantic_delegation_v3(
+        '{"chunk_001":"positive","chunk_002":"negative"}', info
+    )
+    assert chance.chunk_accuracy == 0.5
+    assert chance.progress == 0.0
+    assert chance.task_score == 0.0
+
+
+def test_semantic_delegation_accepts_python_mapping_format() -> None:
+    info = _semantic_v3_info()
+    score, _, error = _score_semantic_delegation_v3(
+        "{'chunk_001': 'positive', 'chunk_002': 'negative', "
+        "'chunk_003': 'positive', 'chunk_004': 'negative'}",
+        info,
+    )
+
+    assert error is None
+    assert score.task_score == 1.0
+    assert score.exact == 1.0
+
+
+def test_semantic_delegation_chunk_scoring_handles_schema_edges() -> None:
+    info = _semantic_v3_info()
+    missing, _, _ = _score_semantic_delegation_v3('{"chunk_001":"positive"}', info)
+    assert missing.chunk_accuracy == 0.25
+    assert missing.task_score == 0.0
+
+    extra, _, _ = _score_semantic_delegation_v3(
+        '{"chunk_001":"positive","chunk_002":"negative","chunk_003":"positive",'
+        '"chunk_004":"negative","chunk_999":"positive"}',
+        info,
+    )
+    assert extra.chunk_accuracy == 1.0
+    assert extra.progress == 1.0
+    assert extra.exact == 0.0
+    assert extra.task_score == 0.5
+    assert extra.extra_keys == 1
+
+    malformed, _, error = _score_semantic_delegation_v3("not json", info)
+    assert malformed.task_score == 0.0
+    assert malformed.schema_valid == 0.0
+    assert error == "invalid_json"
+
+
+def test_semantic_delegation_global_scoring() -> None:
+    info = _semantic_v3_info(task_type="global_comparison")
+    exact, _, _ = _score_semantic_delegation_v3("Label: same", info)
+    wrong, _, _ = _score_semantic_delegation_v3("positive", info)
+    assert exact.task_score == exact.progress == exact.exact == 1.0
+    assert wrong.task_score == wrong.progress == wrong.exact == 0.0
+
+
+def test_semantic_child_local_credit_is_conditioned_on_visible_records() -> None:
+    state = {
+        "rlm_segments": [
+            {
+                "kind": "plain_query",
+                "semantic_prompt_record_ids": ["r00001", "r00002"],
+                "response_text": '{"r00001":"positive","r00002":"positive","unrelated":"negative"}',
+            },
+            {
+                "kind": "plain_query",
+                "semantic_prompt_record_ids": ["r00003"],
+                "response_text": "{'r00003': 'positive'}",
+            },
+            {
+                "kind": "plain_query",
+                "semantic_prompt_record_ids": ["r99999"],
+                "response_text": "positive",
+            },
+        ]
+    }
+    _annotate_semantic_child_segments(state, _semantic_v3_info())
+
+    first, second, third = state["rlm_segments"]
+    assert first["semantic_local_accuracy"] == 0.5
+    assert first["semantic_local_coverage"] == 1.0
+    assert first["semantic_local_advantage"] == 0.0
+    assert second["semantic_local_accuracy"] == 1.0
+    assert second["semantic_local_advantage"] == 1.0
+    assert third["semantic_local_signal"] is False
+    assert state["semantic_child_local_accuracy"] == 2 / 3
+    assert state["semantic_record_coverage"] == 1.0
+
+
+def test_semantic_adaptive_reward_uses_continuous_progress_and_correct_only_cost(monkeypatch) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+        efficiency_penalty_mode="adaptive_group",
+        adaptive_efficiency_beta_max=1.0,
+        adaptive_efficiency_gamma=2.0,
+        adaptive_efficiency_solve_rate_floor=0.25,
+        adaptive_efficiency_cost_basis="weighted_turn_tokens",
+        efficiency_root_token_multiplier=8.0,
+        efficiency_plain_subcall_token_multiplier=1.0,
+        efficiency_penalty_applies_to="correct_only",
+        reward_clip_min=-0.5,
+    )
+    answers = [
+        '{"chunk_001":"positive","chunk_002":"negative","chunk_003":"positive","chunk_004":"negative"}',
+        '{"chunk_001":"positive","chunk_002":"negative","chunk_003":"positive"}',
+        '{"chunk_001":"positive","chunk_002":"negative"}',
+        "{}",
+    ]
+    states = []
+    for index, final_answer in enumerate(answers):
+        info = _semantic_v3_info()
+        states.append(
+            {
+                "final_answer": final_answer,
+                "completion": [],
+                "answer": info["acceptable_answers"][0],
+                "info": info,
+                "rlm_segments": [
+                    {
+                        "kind": "root_turn",
+                        "prompt_token_count": 100 + index * 100,
+                        "completion_token_count": 10,
+                    }
+                ],
+                "trajectory": [],
+            }
+        )
+
+    rewards = asyncio.run(rubric.funcs[0](states))
+
+    expected_progress_mean = (1.0 + 0.5) / 4
+    expected_beta = ((expected_progress_mean - 0.25) / 0.75) ** 2
+    assert states[0]["reward_group_solve_rate"] == expected_progress_mean
+    assert states[0]["reward_adaptive_beta"] == expected_beta
+    assert states[2]["reward_adaptive_cost_penalty"] == 0.0
+    assert states[3]["reward_adaptive_cost_penalty"] == 0.0
+    assert rewards[1] <= 0.25
 
 
 def test_is_exact_match_handles_numeric_normalization() -> None:

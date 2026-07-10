@@ -1466,6 +1466,65 @@ def test_batch_fanout_limit_does_not_mark_budget_exhausted_when_calls_remain() -
     assert runtime.state["subcall_budget_exhausted"] is False
 
 
+def test_reject_overflow_mode_is_atomic_and_consumes_no_budget() -> None:
+    runtime = RecursiveRuntime(
+        _runtime_state(
+            _sync_session=SimpleNamespace(model_name="fake-model"),
+            subcall_budget_enabled=True,
+            subcall_budget_total=10,
+            subcall_budget_remaining=10,
+        ),
+        RuntimeConfig(
+            subcall_budget_enabled=True,
+            max_total_subcalls=10,
+            max_batched_subcalls=2,
+            subcall_batch_overflow_mode="reject",
+            max_prompt_tokens=4096,
+            live_trace_dir=None,
+        ),
+    )
+    calls = []
+
+    def fake_plain_query(prompt: str, model: str | None = None, consume_budget: bool = True) -> dict[str, object]:
+        calls.append((prompt, model, consume_budget))
+        return {}
+
+    runtime._plain_query = fake_plain_query  # type: ignore[method-assign]
+    payloads = runtime.run_plain_query_batch(["alpha", "beta", "gamma"])
+
+    assert calls == []
+    assert runtime.state["subcall_budget_remaining"] == 10
+    assert runtime.state["subcall_batch_attempts"] == 1
+    assert runtime.state["subcall_batch_rejections"] == 1
+    assert len(payloads) == 3
+    assert all(payload["batch_rejected"] is True for payload in payloads)
+    assert "requested=3, allowed=2, remaining=10" in payloads[0]["response"]
+
+
+def test_reject_overflow_mode_accounts_for_remaining_budget() -> None:
+    runtime = RecursiveRuntime(
+        _runtime_state(
+            _sync_session=SimpleNamespace(model_name="fake-model"),
+            subcall_budget_enabled=True,
+            subcall_budget_total=10,
+            subcall_budget_remaining=2,
+        ),
+        RuntimeConfig(
+            subcall_budget_enabled=True,
+            max_total_subcalls=10,
+            max_batched_subcalls=16,
+            subcall_batch_overflow_mode="reject",
+            max_prompt_tokens=4096,
+            live_trace_dir=None,
+        ),
+    )
+
+    payloads = runtime.run_plain_query_batch(["alpha", "beta", "gamma"])
+
+    assert runtime.state["subcall_budget_remaining"] == 2
+    assert "requested=3, allowed=2, remaining=2" in payloads[0]["response"]
+
+
 def test_budget_feedback_message_is_numeric_only() -> None:
     runtime = RecursiveRuntime(
         _runtime_state(

@@ -33,6 +33,8 @@ class RLMRLVREnv(vf.MultiTurnEnv):
                 "language",
                 "n_docs",
                 "n_wiki",
+                "curriculum_bucket",
+                "semantic_task_type",
             )
             if key in metadata
         }
@@ -66,6 +68,8 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             "subcall_budget_total": int(state.get("subcall_budget_total", 0)),
             "subcall_budget_remaining": int(state.get("subcall_budget_remaining", 0)),
             "subcall_budget_exhausted": bool(state.get("subcall_budget_exhausted", False)),
+            "subcall_batch_attempts": int(state.get("subcall_batch_attempts", 0)),
+            "subcall_batch_rejections": int(state.get("subcall_batch_rejections", 0)),
             "final_answer": state.get("final_answer"),
             "used_forced_finalize_prompt": bool(state.get("used_forced_finalize_prompt", False)),
             "hit_max_turn_without_final": bool(state.get("hit_max_turn_without_final", False)),
@@ -123,6 +127,8 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         state["subcall_budget_total"] = int(self.runtime_config.max_total_subcalls)
         state["subcall_budget_remaining"] = int(self.runtime_config.max_total_subcalls)
         state["subcall_budget_exhausted"] = False
+        state["subcall_batch_attempts"] = 0
+        state["subcall_batch_rejections"] = 0
         state["total_model_tokens"] = 0.0
         state["total_env_tokens"] = 0.0
         state["total_prompt_tokens"] = 0.0
@@ -382,6 +388,7 @@ def load_environment(
     max_total_subcalls: int = 80,
     max_batched_subcalls: int = 80,
     subcall_batch_max_workers: int | None = None,
+    subcall_batch_overflow_mode: str = "partial",
     train_plain_llm_subcalls: bool = False,
     include_budget_reminder: bool = True,
     efficiency_penalty_coef: float = 0.02,
@@ -448,6 +455,9 @@ def load_environment(
         raise ValueError("max_batched_subcalls must be >= 1")
     if subcall_batch_max_workers is not None and subcall_batch_max_workers < 1:
         raise ValueError("subcall_batch_max_workers must be >= 1 when set")
+    subcall_batch_overflow_mode = subcall_batch_overflow_mode.lower()
+    if subcall_batch_overflow_mode not in {"partial", "reject"}:
+        raise ValueError("subcall_batch_overflow_mode must be one of ['partial', 'reject']")
     if llm_subcall_empty_response_max_attempts < 1:
         raise ValueError("llm_subcall_empty_response_max_attempts must be >= 1")
     if llm_subcall_empty_response_base_retry_seconds < 0:
@@ -607,6 +617,7 @@ def load_environment(
         max_total_subcalls=max_total_subcalls,
         max_batched_subcalls=max_batched_subcalls,
         subcall_batch_max_workers=subcall_batch_max_workers,
+        subcall_batch_overflow_mode=subcall_batch_overflow_mode,
         train_plain_llm_subcalls=train_plain_llm_subcalls,
         include_budget_reminder=include_budget_reminder,
         recursive_rlm_batch_mode=recursive_rlm_batch_mode,

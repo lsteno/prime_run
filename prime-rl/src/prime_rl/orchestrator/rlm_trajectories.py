@@ -13,9 +13,18 @@ from prime_rl.transport import TrainingSample
 @dataclass(frozen=True)
 class RlmTrainingSampleResult:
     samples: list[TrainingSample] | None
+    sample_local_advantages: list[float | None] | None = None
     eligible_llm_subcalls: int = 0
     selected_llm_subcalls: int = 0
     dropped_llm_subcalls: int = 0
+
+
+def blend_segment_advantage(
+    *, terminal_advantage: float, local_advantage: float | None, local_weight: float
+) -> float:
+    if local_advantage is None:
+        return terminal_advantage
+    return local_weight * local_advantage + (1.0 - local_weight) * terminal_advantage
 
 
 def _segment_is_trainable(segment: dict) -> bool:
@@ -26,6 +35,35 @@ def _segment_is_trainable(segment: dict) -> bool:
 
 def _segment_is_plain_llm_subcall(segment: dict) -> bool:
     return segment.get("train_scope") == "llm_subcall" or segment.get("kind") == "plain_query"
+
+
+def _select_semantic_subcalls(
+    *,
+    positions: list[int],
+    ordered_segments: list[dict],
+    limit: int,
+    rng: random.Random,
+) -> set[int]:
+    if limit <= 0:
+        return set()
+    by_chunk: dict[str, list[int]] = {}
+    fallback: list[int] = []
+    for position in positions:
+        chunk_id = ordered_segments[position].get("semantic_primary_chunk_id")
+        if chunk_id:
+            by_chunk.setdefault(str(chunk_id), []).append(position)
+        else:
+            fallback.append(position)
+
+    selected: list[int] = []
+    chunk_ids = list(by_chunk)
+    rng.shuffle(chunk_ids)
+    for chunk_id in chunk_ids[:limit]:
+        selected.append(rng.choice(by_chunk[chunk_id]))
+    remaining = [position for position in positions if position not in selected]
+    if len(selected) < limit and remaining:
+        selected.extend(rng.sample(remaining, k=min(limit - len(selected), len(remaining))))
+    return set(selected)
 
 
 def _selection_rng(
@@ -57,10 +95,17 @@ def rollout_to_training_sample_result(
     has_error = output.get("error") is not None
     default_temperature = float((output.get("sampling_args") or {}).get("temperature", 1.0))
     ordered_segments = sorted(segments, key=lambda item: int(item.get("order", 0)))
+    semantic_rollout = any(
+        bool(segment.get("semantic_child_segment"))
+        for segment in ordered_segments
+        if _segment_is_plain_llm_subcall(segment)
+    )
     trainable_llm_subcall_positions = [
         idx
         for idx, segment in enumerate(ordered_segments)
-        if _segment_is_trainable(segment) and _segment_is_plain_llm_subcall(segment)
+        if _segment_is_trainable(segment)
+        and _segment_is_plain_llm_subcall(segment)
+        and (not semantic_rollout or bool(segment.get("semantic_local_signal")))
     ]
     eligible_llm_subcalls = len(trainable_llm_subcall_positions)
     selected_llm_subcall_positions = set(trainable_llm_subcall_positions)
@@ -74,14 +119,28 @@ def rollout_to_training_sample_result(
             cache_key=cache_key,
             example_id=output.get("example_id"),
         )
-        selected_llm_subcall_positions = set(
-            rng.sample(trainable_llm_subcall_positions, k=max_trainable_llm_subcalls_per_rollout)
-        )
+        if semantic_rollout:
+            selected_llm_subcall_positions = _select_semantic_subcalls(
+                positions=trainable_llm_subcall_positions,
+                ordered_segments=ordered_segments,
+                limit=max_trainable_llm_subcalls_per_rollout,
+                rng=rng,
+            )
+        else:
+            selected_llm_subcall_positions = set(
+                rng.sample(trainable_llm_subcall_positions, k=max_trainable_llm_subcalls_per_rollout)
+            )
 
     samples: list[TrainingSample] = []
+    sample_local_advantages: list[float | None] = []
     selected_llm_subcalls = 0
+    child_only_training = bool(output.get("rlm_child_only_training", False))
     for idx, segment in enumerate(ordered_segments):
         if not _segment_is_trainable(segment):
+            continue
+        if child_only_training and not (
+            _segment_is_plain_llm_subcall(segment) and bool(segment.get("semantic_local_signal"))
+        ):
             continue
         if _segment_is_plain_llm_subcall(segment):
             if idx not in selected_llm_subcall_positions:
@@ -102,9 +161,12 @@ def rollout_to_training_sample_result(
             advantage=None,
         )
         samples.append(sample)
+        local_advantage = segment.get("semantic_local_advantage")
+        sample_local_advantages.append(float(local_advantage) if local_advantage is not None else None)
 
     return RlmTrainingSampleResult(
         samples=samples,
+        sample_local_advantages=sample_local_advantages,
         eligible_llm_subcalls=eligible_llm_subcalls,
         selected_llm_subcalls=selected_llm_subcalls,
         dropped_llm_subcalls=eligible_llm_subcalls - selected_llm_subcalls,

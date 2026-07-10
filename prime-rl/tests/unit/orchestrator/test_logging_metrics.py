@@ -3,8 +3,26 @@ import pandas as pd
 from prime_rl.orchestrator.logging_metrics import (
     rlm_cost_subcall_metrics,
     rlm_protocol_metrics,
+    rollout_curriculum_bucket,
     stable_stop_condition_metrics,
 )
+
+
+def test_rollout_curriculum_bucket_reads_safe_trace_metadata() -> None:
+    rollout = {
+        "trajectory": [
+            {
+                "extras": {
+                    "rlm_debug": {
+                        "sample_metadata": {"metadata": {"curriculum_bucket": "semantic_8"}}
+                    }
+                }
+            }
+        ]
+    }
+
+    assert rollout_curriculum_bucket(rollout, base_bucket="base") == "semantic_8"
+    assert rollout_curriculum_bucket({}, base_bucket="base") == "base"
 
 
 def test_stable_stop_condition_metrics_emit_zero_defaults() -> None:

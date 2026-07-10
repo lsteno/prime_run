@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import random
@@ -74,6 +75,16 @@ class TokenBreakdown:
     trainable_tokens: int
     rlm_turn_tokens: int
     plain_subcall_tokens: int
+
+
+@dataclass(frozen=True)
+class SemanticDelegationScore:
+    task_score: float
+    chunk_accuracy: float
+    progress: float
+    exact: float
+    schema_valid: float
+    extra_keys: int = 0
 
 
 def _truncate_for_judge(text: str, *, max_chars: int) -> str:
@@ -300,7 +311,209 @@ def _is_oolong_semantic_aggregation_task(info: dict[str, Any] | None) -> bool:
     source_task = str(info.get("source_task") or "")
     metadata = info.get("metadata") if isinstance(info.get("metadata"), dict) else {}
     derived_dataset = str(metadata.get("derived_dataset") or "")
-    return derived_dataset == "oolong_semantic_agg_v2" or source_task.startswith("TASK_TYPE.SEMANTIC_")
+    return derived_dataset == "oolong_semantic_agg_v2" or (
+        source_task.startswith("TASK_TYPE.SEMANTIC_")
+        and derived_dataset != "oolong_semantic_delegation_v3"
+    )
+
+
+def _semantic_delegation_metadata(info: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not info:
+        return None
+    metadata = info.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("derived_dataset") != "oolong_semantic_delegation_v3":
+        return None
+    return metadata
+
+
+def _normalize_semantic_label(value: Any, label_space: list[str]) -> str | None:
+    candidate = _strip_answer_prefix(str(value)).strip()
+    final_match = re.fullmatch(r"FINAL\((.*)\)", candidate, flags=re.IGNORECASE | re.DOTALL)
+    if final_match:
+        candidate = _normalize_text(final_match.group(1))
+    by_normalized = {_normalize_text(label).casefold(): label for label in label_space}
+    return by_normalized.get(_normalize_text(candidate).casefold())
+
+
+def _score_semantic_delegation_v3(
+    predicted_answer: str,
+    info: dict[str, Any] | None,
+) -> tuple[SemanticDelegationScore, str, str | None]:
+    metadata = _semantic_delegation_metadata(info)
+    if metadata is None:
+        raise ValueError("Semantic delegation v3 scoring requires verifier metadata.")
+    label_space = [str(label) for label in metadata.get("label_space") or []]
+    task_type = str(metadata.get("semantic_task_type") or "")
+
+    if task_type == "global_comparison":
+        expected = str(metadata.get("global_outcome") or "")
+        candidate = _strip_answer_prefix(predicted_answer)
+        normalized = _normalize_semantic_label(candidate, [*label_space, "same"])
+        exact = 1.0 if normalized == expected else 0.0
+        return (
+            SemanticDelegationScore(
+                task_score=exact,
+                chunk_accuracy=exact,
+                progress=exact,
+                exact=exact,
+                schema_valid=1.0 if normalized is not None else 0.0,
+            ),
+            "[semantic_delegation_global_exact]" if exact else "[semantic_delegation_global_mismatch]",
+            None if normalized is not None else "invalid_global_label",
+        )
+
+    expected_map = {
+        str(chunk_id): str(label)
+        for chunk_id, label in (metadata.get("chunk_labels") or {}).items()
+    }
+    if not expected_map:
+        return SemanticDelegationScore(0.0, 0.0, 0.0, 0.0, 0.0), "[semantic_delegation_missing_gold]", "missing_gold"
+    parsed = _extract_json_object(predicted_answer)
+    if parsed is None:
+        return SemanticDelegationScore(0.0, 0.0, 0.0, 0.0, 0.0), "[semantic_delegation_invalid_json]", "invalid_json"
+
+    normalized_keys = {str(key).casefold(): str(key) for key in expected_map}
+    predicted_map: dict[str, str] = {}
+    schema_valid = True
+    extra_keys = 0
+    for raw_key, raw_label in parsed.items():
+        expected_key = normalized_keys.get(str(raw_key).casefold())
+        if expected_key is None:
+            extra_keys += 1
+            continue
+        normalized_label = _normalize_semantic_label(raw_label, label_space)
+        if normalized_label is None:
+            schema_valid = False
+            continue
+        predicted_map[expected_key] = normalized_label
+
+    correct = sum(predicted_map.get(chunk_id) == expected_label for chunk_id, expected_label in expected_map.items())
+    chunk_accuracy = correct / len(expected_map)
+    progress = max(0.0, 2.0 * chunk_accuracy - 1.0)
+    exact = float(correct == len(expected_map) and extra_keys == 0 and schema_valid)
+    task_score = 0.5 * exact + 0.5 * progress
+    return (
+        SemanticDelegationScore(
+            task_score=task_score,
+            chunk_accuracy=chunk_accuracy,
+            progress=progress,
+            exact=exact,
+            schema_valid=float(schema_valid),
+            extra_keys=extra_keys,
+        ),
+        "[semantic_delegation_exact]" if exact else "[semantic_delegation_partial]",
+        None if schema_valid else "invalid_chunk_label",
+    )
+
+
+def _annotate_semantic_child_segments(state: vf.State, info: dict[str, Any] | None) -> None:
+    metadata = _semantic_delegation_metadata(info)
+    if metadata is None:
+        return
+    gold_labels = {
+        str(record_id): str(label)
+        for record_id, label in (metadata.get("record_labels") or {}).items()
+    }
+    record_chunks = {
+        str(record_id): str(chunk_id)
+        for record_id, chunk_id in (metadata.get("record_chunks") or {}).items()
+    }
+    label_space = [str(label) for label in metadata.get("label_space") or []]
+    segments = state.get("rlm_segments")
+    if not isinstance(segments, list):
+        return
+
+    total_expected = 0
+    total_correct = 0
+    total_predictions = 0
+    queried_ids: list[str] = []
+    locally_scored_segments = 0
+    exact_segments = 0
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        if segment.get("kind") != "plain_query" and segment.get("train_scope") != "llm_subcall":
+            continue
+        segment["semantic_child_segment"] = True
+        prompt_ids = [
+            str(record_id)
+            for record_id in segment.get("semantic_prompt_record_ids") or []
+            if str(record_id) in gold_labels
+        ]
+        prompt_ids = list(dict.fromkeys(prompt_ids))
+        chunks = sorted({record_chunks[record_id] for record_id in prompt_ids if record_id in record_chunks})
+        segment["semantic_recognized_record_count"] = len(prompt_ids)
+        segment["semantic_recognized_chunk_ids"] = chunks
+        segment["semantic_primary_chunk_id"] = chunks[0] if len(chunks) == 1 else None
+        queried_ids.extend(prompt_ids)
+        if not prompt_ids:
+            segment["semantic_local_signal"] = False
+            segment["semantic_local_schema_valid"] = False
+            continue
+
+        response_text = str(segment.get("response_text") or "")
+        parsed = _extract_json_object(response_text)
+        predictions: dict[str, str] = {}
+        schema_valid = parsed is not None
+        if parsed is not None:
+            prompt_lookup = {record_id.casefold(): record_id for record_id in prompt_ids}
+            for raw_id, raw_label in parsed.items():
+                record_id = prompt_lookup.get(str(raw_id).casefold())
+                if record_id is None:
+                    continue
+                label = _normalize_semantic_label(raw_label, label_space)
+                if label is not None:
+                    predictions[record_id] = label
+        elif len(prompt_ids) == 1:
+            label = _normalize_semantic_label(response_text, label_space)
+            if label is not None:
+                predictions[prompt_ids[0]] = label
+                schema_valid = True
+
+        correct = sum(predictions.get(record_id) == gold_labels[record_id] for record_id in prompt_ids)
+        local_accuracy = correct / len(prompt_ids)
+        coverage = len(predictions) / len(prompt_ids)
+        local_advantage = 2.0 * local_accuracy - 1.0
+        local_exact = float(correct == len(prompt_ids) and len(predictions) == len(prompt_ids))
+        segment.update(
+            {
+                "semantic_local_signal": True,
+                "semantic_local_accuracy": local_accuracy,
+                "semantic_local_coverage": coverage,
+                "semantic_local_schema_valid": bool(schema_valid),
+                "semantic_local_advantage": local_advantage,
+                "semantic_local_exact": local_exact,
+                "semantic_local_prediction_count": len(predictions),
+            }
+        )
+        locally_scored_segments += 1
+        exact_segments += int(local_exact)
+        total_expected += len(prompt_ids)
+        total_correct += correct
+        total_predictions += len(predictions)
+
+    unique_queried = set(queried_ids)
+    state["semantic_child_scored_segments"] = float(locally_scored_segments)
+    state["semantic_child_local_accuracy"] = total_correct / total_expected if total_expected else 0.0
+    state["semantic_child_local_coverage"] = total_predictions / total_expected if total_expected else 0.0
+    state["semantic_child_exact_rate"] = exact_segments / locally_scored_segments if locally_scored_segments else 0.0
+    state["semantic_records_per_subcall"] = total_expected / locally_scored_segments if locally_scored_segments else 0.0
+    state["semantic_record_coverage"] = len(unique_queried) / len(gold_labels) if gold_labels else 0.0
+    state["semantic_duplicate_coverage"] = (
+        (len(queried_ids) - len(unique_queried)) / len(queried_ids) if queried_ids else 0.0
+    )
+
+
+def _record_semantic_delegation_metrics(state: vf.State, score: SemanticDelegationScore) -> None:
+    state["semantic_task_score"] = score.task_score
+    state["semantic_chunk_accuracy"] = score.chunk_accuracy
+    state["semantic_progress"] = score.progress
+    state["semantic_exact"] = score.exact
+    state["semantic_schema_valid"] = score.schema_valid
+    state["semantic_extra_keys"] = float(score.extra_keys)
+    state["correctness_metric_value"] = score.exact
 
 
 def _strip_answer_prefix(text: str) -> str:
@@ -333,7 +546,10 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
         try:
             parsed = json.loads(candidate)
         except json.JSONDecodeError:
-            continue
+            try:
+                parsed = ast.literal_eval(candidate)
+            except (SyntaxError, ValueError):
+                continue
         if isinstance(parsed, dict):
             return parsed
     return None
@@ -926,6 +1142,27 @@ async def _score_correctness(
         )
         return result
 
+    if _semantic_delegation_metadata(info) is not None:
+        _annotate_semantic_child_segments(state, info)
+        semantic_score, raw_response, parse_error = _score_semantic_delegation_v3(predicted_answer, info)
+        _record_semantic_delegation_metrics(state, semantic_score)
+        result = CorrectnessResult(
+            predicted_answer=predicted_answer,
+            expected_answers=expected_answers,
+            score=semantic_score.task_score,
+            raw_response=raw_response,
+            parse_error=parse_error,
+        )
+        _record_judge_payload(
+            state,
+            predicted_answer=result.predicted_answer,
+            expected_answers=result.expected_answers,
+            score=result.score,
+            raw_response=result.raw_response,
+            parse_error=result.parse_error,
+        )
+        return result
+
     if _is_oolong_semantic_aggregation_task(info):
         score, raw_response, parse_error = _score_oolong_semantic_aggregation(
             predicted_answer,
@@ -1028,6 +1265,7 @@ async def _score_correctness_with_protocol(
     judge_expected_max_chars: int,
     missing_final_at_max_turn_zero_reward: bool,
 ) -> CorrectnessResult:
+    _annotate_semantic_child_segments(state, info)
     if missing_final_at_max_turn_zero_reward and _missing_formal_final_at_max_turn(state):
         predicted_answer = _get_predicted_answer(state, completion).strip()
         result = CorrectnessResult(
@@ -1256,8 +1494,12 @@ def build_rubric(
                 for state in states
             )
         )
-        correctness_scores = [1.0 if result.score > 0.0 else 0.0 for result in correctness_results]
-        solve_rate = sum(correctness_scores) / len(correctness_scores) if correctness_scores else 0.0
+        task_scores = [float(result.score) for result in correctness_results]
+        progress_scores = [
+            float(state.get("semantic_progress", task_score))
+            for state, task_score in zip(states, task_scores, strict=True)
+        ]
+        solve_rate = sum(progress_scores) / len(progress_scores) if progress_scores else 0.0
         beta = _adaptive_beta_for_solve_rate(
             solve_rate=solve_rate,
             beta_max=adaptive_efficiency_beta_max,
@@ -1274,7 +1516,7 @@ def build_rubric(
             )
             for state in states
         ]
-        correct_costs = [cost for cost, correctness in zip(costs, correctness_scores, strict=True) if correctness > 0.0]
+        correct_costs = [cost for cost, progress in zip(costs, progress_scores, strict=True) if progress > 0.0]
         if efficiency_penalty_applies_to == "all_rollouts":
             normalization_costs = costs
         else:
@@ -1283,7 +1525,7 @@ def build_rubric(
         max_cost = max(normalization_costs) if len(normalization_costs) >= 2 else 0
 
         rewards: list[float] = []
-        for state, correctness, cost in zip(states, correctness_scores, costs, strict=True):
+        for state, task_score, progress, cost in zip(states, task_scores, progress_scores, costs, strict=True):
             breakdown = _segment_rollout_token_breakdown(state)
             weighted_tokens = _weighted_turn_token_cost(
                 breakdown,
@@ -1291,24 +1533,24 @@ def build_rubric(
                 plain_subcall_token_multiplier=efficiency_plain_subcall_token_multiplier,
             )
             normalized_cost = 0.0
-            applies_to_rollout = correctness > 0.0 or efficiency_penalty_applies_to == "all_rollouts"
+            applies_to_rollout = progress > 0.0 or efficiency_penalty_applies_to == "all_rollouts"
             if applies_to_rollout:
                 normalized_cost = _min_max_normalized(cost, min_value=min_cost, max_value=max_cost)
             adaptive_cost_penalty = beta * normalized_cost if applies_to_rollout else 0.0
             terminal_penalty = _max_turn_penalty_from_state(
                 state,
-                correctness=correctness,
+                correctness=task_score,
                 max_turn_penalty_enabled=max_turn_penalty_enabled,
                 max_turn_penalty=max_turn_penalty,
             )
             total_reward = _clip_reward(
-                correctness - terminal_penalty - adaptive_cost_penalty,
+                task_score - terminal_penalty - adaptive_cost_penalty,
                 reward_clip_min=reward_clip_min,
                 reward_clip_max=reward_clip_max,
             )
             _record_reward_breakdown(
                 state,
-                correctness=correctness,
+                correctness=task_score,
                 efficiency_penalty=adaptive_cost_penalty,
                 total_reward=total_reward,
                 prompt_tokens=breakdown.prompt_tokens,
@@ -1322,7 +1564,7 @@ def build_rubric(
                 adaptive_beta=beta,
                 adaptive_normalized_cost=normalized_cost,
                 adaptive_cost_penalty=adaptive_cost_penalty,
-                incorrect_cost_penalty=adaptive_cost_penalty if correctness <= 0.0 else 0.0,
+                incorrect_cost_penalty=adaptive_cost_penalty if progress <= 0.0 else 0.0,
                 max_turn_penalty=terminal_penalty,
             )
             rewards.append(total_reward)
@@ -1334,7 +1576,49 @@ def build_rubric(
 
 
 async def correctness_metric(state: vf.State) -> float:
-    return float(state.get("reward_correctness", 0.0))
+    return float(state.get("correctness_metric_value", state.get("reward_correctness", 0.0)))
+
+
+async def semantic_progress_metric(state: vf.State) -> float:
+    return float(state.get("semantic_progress", state.get("reward_correctness", 0.0)))
+
+
+async def semantic_chunk_accuracy_metric(state: vf.State) -> float:
+    return float(state.get("semantic_chunk_accuracy", 0.0))
+
+
+async def semantic_exact_metric(state: vf.State) -> float:
+    return float(state.get("semantic_exact", 0.0))
+
+
+async def semantic_child_local_accuracy_metric(state: vf.State) -> float:
+    return float(state.get("semantic_child_local_accuracy", 0.0))
+
+
+async def semantic_child_local_coverage_metric(state: vf.State) -> float:
+    return float(state.get("semantic_child_local_coverage", 0.0))
+
+
+async def semantic_records_per_subcall_metric(state: vf.State) -> float:
+    return float(state.get("semantic_records_per_subcall", 0.0))
+
+
+async def semantic_record_coverage_metric(state: vf.State) -> float:
+    return float(state.get("semantic_record_coverage", 0.0))
+
+
+async def semantic_duplicate_coverage_metric(state: vf.State) -> float:
+    return float(state.get("semantic_duplicate_coverage", 0.0))
+
+
+async def subcall_batch_rejection_rate_metric(state: vf.State) -> float:
+    attempts = float(state.get("subcall_batch_attempts", 0.0))
+    rejections = float(state.get("subcall_batch_rejections", 0.0))
+    return rejections / attempts if attempts > 0.0 else 0.0
+
+
+async def subcall_budget_exhausted_metric(state: vf.State) -> float:
+    return 1.0 if state.get("subcall_budget_exhausted") else 0.0
 
 
 async def judge_score_metric(state: vf.State) -> float:
@@ -1471,6 +1755,16 @@ async def finalized_on_forced_prompt_metric(state: vf.State) -> float:
 
 def add_metrics(rubric: vf.Rubric) -> vf.Rubric:
     rubric.add_metric(correctness_metric)
+    rubric.add_metric(semantic_progress_metric)
+    rubric.add_metric(semantic_chunk_accuracy_metric)
+    rubric.add_metric(semantic_exact_metric)
+    rubric.add_metric(semantic_child_local_accuracy_metric)
+    rubric.add_metric(semantic_child_local_coverage_metric)
+    rubric.add_metric(semantic_records_per_subcall_metric)
+    rubric.add_metric(semantic_record_coverage_metric)
+    rubric.add_metric(semantic_duplicate_coverage_metric)
+    rubric.add_metric(subcall_batch_rejection_rate_metric)
+    rubric.add_metric(subcall_budget_exhausted_metric)
     rubric.add_metric(judge_score_metric)
     rubric.add_metric(oolong_pairs_precision_metric)
     rubric.add_metric(oolong_pairs_recall_metric)

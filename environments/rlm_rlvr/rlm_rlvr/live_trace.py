@@ -107,6 +107,14 @@ def _compact_segment(segment: dict[str, Any]) -> dict[str, Any]:
         else None,
         "temperature": segment.get("temperature"),
         "response_text": segment.get("response_text"),
+        "semantic_recognized_record_count": segment.get("semantic_recognized_record_count"),
+        "semantic_recognized_chunk_ids": segment.get("semantic_recognized_chunk_ids"),
+        "semantic_primary_chunk_id": segment.get("semantic_primary_chunk_id"),
+        "semantic_local_signal": segment.get("semantic_local_signal"),
+        "semantic_local_accuracy": segment.get("semantic_local_accuracy"),
+        "semantic_local_coverage": segment.get("semantic_local_coverage"),
+        "semantic_local_schema_valid": segment.get("semantic_local_schema_valid"),
+        "semantic_local_advantage": segment.get("semantic_local_advantage"),
     }
 
 
@@ -127,6 +135,8 @@ def _sample_metadata(state: dict[str, Any]) -> dict[str, Any]:
             "language",
             "n_docs",
             "n_wiki",
+            "curriculum_bucket",
+            "semantic_task_type",
         )
         if key in metadata
     }
@@ -172,6 +182,8 @@ def write_live_trace(
             "subcall_budget_total": int(state.get("subcall_budget_total", 0)),
             "subcall_budget_remaining": int(state.get("subcall_budget_remaining", 0)),
             "subcall_budget_exhausted": bool(state.get("subcall_budget_exhausted", False)),
+            "subcall_batch_attempts": int(state.get("subcall_batch_attempts", 0)),
+            "subcall_batch_rejections": int(state.get("subcall_batch_rejections", 0)),
             "final_answer": state.get("final_answer"),
             "total_model_tokens": float(state.get("total_model_tokens", 0.0)),
             "total_env_tokens": float(state.get("total_env_tokens", 0.0)),

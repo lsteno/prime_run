@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import random
+import re
 import threading
 import time
 from typing import Any, Callable, TypeVar
@@ -59,6 +60,7 @@ class RuntimeConfig:
     max_total_subcalls: int = 80
     max_batched_subcalls: int = 80
     subcall_batch_max_workers: int | None = None
+    subcall_batch_overflow_mode: str = "partial"
     train_plain_llm_subcalls: bool = False
     capture_prompt_messages: bool = False
     include_budget_reminder: bool = True
@@ -68,6 +70,9 @@ class RuntimeConfig:
     def __post_init__(self) -> None:
         if self.subcall_batch_max_workers is not None and self.subcall_batch_max_workers < 1:
             raise ValueError("subcall_batch_max_workers must be >= 1 when set")
+        self.subcall_batch_overflow_mode = self.subcall_batch_overflow_mode.lower()
+        if self.subcall_batch_overflow_mode not in {"partial", "reject"}:
+            raise ValueError("subcall_batch_overflow_mode must be one of ['partial', 'reject']")
         if self.train_plain_llm_subcalls and self.llm_subcall_model is not None:
             raise ValueError("train_plain_llm_subcalls requires same-root plain subcalls; omit llm_subcall_model")
         self.recursive_rlm_batch_mode = self.recursive_rlm_batch_mode.lower()
@@ -793,6 +798,13 @@ class RecursiveRuntime:
             self.state["rlm_call_counter"] = call_id + 1
             return call_id
 
+    @staticmethod
+    def _semantic_prompt_ids(messages: list[dict[str, str]]) -> tuple[list[str], list[str]]:
+        text = "\n".join(str(message.get("content", "")) for message in messages)
+        record_ids = list(dict.fromkeys(re.findall(r"\b(r\d{5})\b", text, flags=re.IGNORECASE)))
+        chunk_ids = list(dict.fromkeys(re.findall(r"\b(chunk_\d{3})\b", text, flags=re.IGNORECASE)))
+        return [value.casefold() for value in record_ids], [value.casefold() for value in chunk_ids]
+
     def _append_segment(
         self,
         *,
@@ -846,6 +858,10 @@ class RecursiveRuntime:
             }
         if payload.metadata:
             segment.update(payload.metadata)
+        if kind == "plain_query":
+            record_ids, chunk_ids = self._semantic_prompt_ids(messages)
+            segment["semantic_prompt_record_ids"] = record_ids
+            segment["semantic_prompt_chunk_ids"] = chunk_ids
         with self._state_lock:
             self.state["rlm_segments"].append(segment)
             prompt_token_count = float(payload.prompt_token_count if payload.prompt_token_count is not None else len(payload.prompt_ids))
@@ -873,11 +889,28 @@ class RecursiveRuntime:
             else:
                 raise ValueError(f"Unsupported subcall kind: {kind}")
 
-    def _budget_error_payload(self, *, prompt: str, model: str | None, kind: str) -> dict[str, Any]:
+    def _budget_error_payload(
+        self,
+        *,
+        prompt: str,
+        model: str | None,
+        kind: str,
+        requested: int | None = None,
+        allowed: int | None = None,
+        remaining: int | None = None,
+        batch_rejected: bool = False,
+    ) -> dict[str, Any]:
         with self._state_lock:
-            remaining = int(self.state.get("subcall_budget_remaining", 0))
+            current_remaining = int(self.state.get("subcall_budget_remaining", 0))
             total = int(self.state.get("subcall_budget_total", self.config.max_total_subcalls))
-        if remaining > 0:
+        remaining = current_remaining if remaining is None else int(remaining)
+        if batch_rejected:
+            message = (
+                "Error: entire subcall batch rejected before execution: "
+                f"requested={requested}, allowed={allowed}, remaining={remaining}. "
+                "Reduce batch fanout and retry; no subcall budget was consumed."
+            )
+        elif remaining > 0:
             message = (
                 f"Error: subcall batch fanout limit reached ({self.config.max_batched_subcalls} prompts maximum; "
                 f"{remaining}/{total} calls remaining)."
@@ -893,7 +926,37 @@ class RecursiveRuntime:
             "kind": kind,
             "execution_time": 0.0,
             "budget_error": True,
+            "batch_rejected": batch_rejected,
         }
+
+    def _reject_overflowing_batch(
+        self,
+        *,
+        prompts: list[str],
+        model: str | None,
+        kind: str,
+    ) -> list[dict[str, Any]] | None:
+        with self._state_lock:
+            self.state["subcall_batch_attempts"] = int(self.state.get("subcall_batch_attempts", 0)) + 1
+            remaining = int(self.state.get("subcall_budget_remaining", self.config.max_total_subcalls))
+            allowed = min(int(self.config.max_batched_subcalls), remaining)
+            if not self.config.subcall_budget_enabled:
+                allowed = int(self.config.max_batched_subcalls)
+            if self.config.subcall_batch_overflow_mode != "reject" or len(prompts) <= allowed:
+                return None
+            self.state["subcall_batch_rejections"] = int(self.state.get("subcall_batch_rejections", 0)) + 1
+        return [
+            self._budget_error_payload(
+                prompt=prompt,
+                model=model,
+                kind=kind,
+                requested=len(prompts),
+                allowed=allowed,
+                remaining=remaining,
+                batch_rejected=True,
+            )
+            for prompt in prompts
+        ]
 
     def _reserve_subcall_budget(self, requested: int) -> int:
         if not self.config.subcall_budget_enabled:
@@ -1001,10 +1064,12 @@ class RecursiveRuntime:
     ) -> list[dict[str, Any]]:
         if not prompts:
             return []
+        self.validate_plain_query_batch(prompts)
+        if rejected := self._reject_overflowing_batch(prompts=prompts, model=model, kind="plain_query"):
+            return rejected
         allowed = self._reserve_subcall_budget(len(prompts))
         scheduled_prompts = prompts[:allowed]
         skipped_prompts = prompts[allowed:]
-        self.validate_plain_query_batch(scheduled_prompts)
         payloads: list[dict[str, Any]] = []
         if scheduled_prompts:
             workers = self.batch_max_workers(len(scheduled_prompts), requested_max_workers=max_workers)
@@ -1029,10 +1094,12 @@ class RecursiveRuntime:
     ) -> list[dict[str, Any]]:
         if not prompts:
             return []
+        self.validate_recursive_query_batch(prompts, max_depth=max_depth)
+        if rejected := self._reject_overflowing_batch(prompts=prompts, model=model, kind="recursive_query"):
+            return rejected
         allowed = self._reserve_subcall_budget(len(prompts))
         scheduled_prompts = prompts[:allowed]
         skipped_prompts = prompts[allowed:]
-        self.validate_recursive_query_batch(scheduled_prompts, max_depth=max_depth)
         payloads: list[dict[str, Any]] = []
         if scheduled_prompts:
             if self.config.recursive_rlm_batch_mode == "thread":

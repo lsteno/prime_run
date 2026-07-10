@@ -466,6 +466,24 @@ class CheckpointConfig(BaseConfig):
     ] = False
 
 
+class CurriculumPhaseConfig(BaseConfig):
+    """Step range and bucket weights for buffer sampling."""
+
+    start_step: Annotated[int, Field(ge=0)]
+    end_step: Annotated[int | None, Field(ge=0)] = None
+    weights: dict[str, float]
+
+    @model_validator(mode="after")
+    def validate_phase(self):
+        if self.end_step is not None and self.end_step < self.start_step:
+            raise ValueError("curriculum phase end_step must be >= start_step")
+        if not self.weights or any(weight < 0.0 for weight in self.weights.values()):
+            raise ValueError("curriculum phase weights must be non-empty and non-negative")
+        if sum(self.weights.values()) <= 0.0:
+            raise ValueError("curriculum phase weights must have positive total mass")
+        return self
+
+
 class BufferConfig(BaseConfig):
     """Configures the buffer for the orchestrator."""
 
@@ -557,6 +575,29 @@ class BufferConfig(BaseConfig):
         ),
     ] = True
 
+    difficulty_metric: Annotated[
+        str,
+        Field(
+            description=(
+                "Rollout metric used for hard/easy group classification. Falls back to correctness_metric, then reward, "
+                "when the configured metric is absent."
+            )
+        ),
+    ] = "correctness_metric"
+
+    curriculum_bucket_path: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional dotted path used to assign examples to curriculum buckets. The path is resolved from the "
+                "example first and then from its JSON info payload."
+            )
+        ),
+    ] = None
+
+    curriculum_base_bucket: str = "base"
+    curriculum_phases: list[CurriculumPhaseConfig] = []
+
     hash_keys: Annotated[
         list[str],
         Field(
@@ -575,6 +616,16 @@ class BufferConfig(BaseConfig):
     def validate_env_ratios(self):
         if self.env_ratios is not None:
             assert all(ratio > 0 for ratio in self.env_ratios), "All env_ratios must be positive."
+        return self
+
+    @model_validator(mode="after")
+    def validate_curriculum(self):
+        if self.curriculum_phases and not self.curriculum_bucket_path:
+            raise ValueError("curriculum_bucket_path is required when curriculum_phases are configured")
+        ordered = sorted(self.curriculum_phases, key=lambda phase: phase.start_step)
+        for previous, current in zip(ordered, ordered[1:]):
+            if previous.end_step is None or previous.end_step >= current.start_step:
+                raise ValueError("curriculum phases must be ordered, bounded, and non-overlapping")
         return self
 
 
@@ -1120,6 +1171,18 @@ class OrchestratorConfig(BaseConfig):
             ),
         ),
     ] = None
+
+    semantic_child_local_advantage_weight: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Weight assigned to deterministic child-local advantage for annotated semantic RLM subcalls. "
+                "The remaining weight uses the rollout's terminal group-relative advantage."
+            ),
+        ),
+    ] = 0.8
 
     max_async_level: Annotated[
         int,

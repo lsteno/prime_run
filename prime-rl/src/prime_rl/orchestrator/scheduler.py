@@ -1624,6 +1624,7 @@ class Scheduler:
     async def generate_batch(self, step: int) -> list[vf.RolloutOutput]:
         """Continuously generates a batch of rollouts."""
         self.step = step
+        self.buffer.current_step = step
 
         # Cancel the previous update policy task to avoid concurrent updates
         if self.update_policy_task is not None:

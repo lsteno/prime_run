@@ -11,8 +11,12 @@ from prime_rl.orchestrator.advantage import compute_advantages
 from prime_rl.orchestrator.eval_utils import compute_eval_ckpt_step, get_eval_sampling_args
 from prime_rl.orchestrator.event_loop_lag import EventLoopLagMonitor
 from prime_rl.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
-from prime_rl.orchestrator.rlm_trajectories import RlmTrainingSampleResult, rollout_to_training_sample_result
-from prime_rl.orchestrator.trajectories import build_vlm_image_cache, interleave_rollout, offload_images_to_disk
+from prime_rl.orchestrator.rlm_trajectories import (
+    RlmTrainingSampleResult,
+    blend_segment_advantage,
+    rollout_to_training_sample_result,
+)
+from prime_rl.orchestrator.trajectories import build_vlm_image_cache, offload_images_to_disk
 from prime_rl.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
 from prime_rl.utils.pathing import get_log_dir
 
@@ -37,6 +41,7 @@ from prime_rl.orchestrator.filters import apply_filters, setup_filters
 from prime_rl.orchestrator.logging_metrics import (
     rlm_cost_subcall_metrics,
     rlm_protocol_metrics,
+    rollout_curriculum_bucket,
     stable_stop_condition_metrics,
 )
 from prime_rl.orchestrator.scheduler import Scheduler
@@ -541,7 +546,7 @@ async def orchestrate(config: OrchestratorConfig):
                 logger.info("Cancelling in-flight training rollouts before starting evals to avoid congestion.")
                 await scheduler.cancel_inflight_rollouts()
 
-            results = await asyncio.gather(
+            await asyncio.gather(
                 *[
                     evaluate_env(
                         env=eval_env,
@@ -668,8 +673,14 @@ async def orchestrate(config: OrchestratorConfig):
             samples = sample_result.samples
             if samples is not None:
                 rollout_samples_per_rollout.append(len(samples))
-                for sample in samples:
-                    sample.advantage = advantage
+                local_advantages = sample_result.sample_local_advantages or [None] * len(samples)
+                assert len(local_advantages) == len(samples)
+                for sample, local_advantage in zip(samples, local_advantages, strict=True):
+                    sample.advantage = blend_segment_advantage(
+                        terminal_advantage=advantage,
+                        local_advantage=local_advantage,
+                        local_weight=config.semantic_child_local_advantage_weight,
+                    )
                     sample.reward = rollout["reward"]
                     sample_decode_tokens = sum(sample.completion_mask)
                     sample_prefill_tokens = len(sample.prompt_ids) + len(sample.completion_mask) - sample_decode_tokens
@@ -734,6 +745,10 @@ async def orchestrate(config: OrchestratorConfig):
             {
                 "example_id": [rollout["example_id"] for rollout in train_rollouts],
                 "task": [rollout["task"] for rollout in train_rollouts],
+                "curriculum_bucket": [
+                    rollout_curriculum_bucket(rollout, base_bucket=config.buffer.curriculum_base_bucket)
+                    for rollout in train_rollouts
+                ],
                 "reward": [rollout["reward"] for rollout in train_rollouts],
                 "is_truncated": [rollout["is_truncated"] for rollout in train_rollouts],
                 "stop_condition": [rollout.get("stop_condition") for rollout in train_rollouts],
@@ -905,6 +920,16 @@ async def orchestrate(config: OrchestratorConfig):
             for metric in metrics_df.columns:
                 to_log[f"metrics/{env}/{metric}"] = env_metrics_df.groupby(env_df["example_id"])[metric].mean().mean()
 
+        for bucket, bucket_df in results_df.groupby("curriculum_bucket"):
+            bucket_name = str(bucket).replace("/", "_")
+            bucket_metrics_df = metrics_df.loc[bucket_df.index]
+            to_log[f"batch/curriculum/{bucket_name}"] = len(bucket_df) / len(results_df)
+            to_log[f"reward/curriculum/{bucket_name}/mean"] = bucket_df.groupby("example_id").reward.mean().mean()
+            for metric in metrics_df.columns:
+                to_log[f"metrics/curriculum/{bucket_name}/{metric}"] = (
+                    bucket_metrics_df.groupby(bucket_df["example_id"])[metric].mean().mean()
+                )
+
         # Optionally, add val metrics
         if val_results_df is not None:
             val_by_example = val_results_df.groupby("example_id")
@@ -956,7 +981,7 @@ async def orchestrate(config: OrchestratorConfig):
 
     if config.eval:
         logger.info("Running final evals")
-        results = await asyncio.gather(
+        await asyncio.gather(
             *[
                 evaluate_env(
                     env=eval_env,
