@@ -23,6 +23,7 @@ from rlm_rlvr.reward import (
     _segment_rollout_token_totals,
     _weighted_turn_token_cost,
     build_rubric,
+    semantic_chunk_accuracy_metric,
 )
 from rlm_rlvr.semantic_evidence import parse_semantic_prompt_evidence, record_text_hash
 
@@ -70,7 +71,11 @@ def _semantic_v4_info() -> dict:
         for offset in range(10):
             record_number = (chunk_index - 1) * 10 + offset + 1
             record_id = f"r{record_number:05d}"
-            label = chunk_label if offset < 6 else ("negative" if chunk_label == "positive" else "positive")
+            label = (
+                chunk_label
+                if offset < 6
+                else ("negative" if chunk_label == "positive" else "positive")
+            )
             lines.append(f"Record ID: {record_id} || Text: review text {record_number}")
             record_labels[record_id] = label
             record_chunks[record_id] = chunk_id
@@ -112,8 +117,12 @@ def _semantic_v5_info() -> dict:
         "bad three": ("negative", "chunk_002"),
         "good three": ("positive", "chunk_002"),
     }
-    labels_by_hash = {record_text_hash(text): label for text, (label, _) in records.items()}
-    chunks_by_hash = {record_text_hash(text): chunk for text, (_, chunk) in records.items()}
+    labels_by_hash = {
+        record_text_hash(text): label for text, (label, _) in records.items()
+    }
+    chunks_by_hash = {
+        record_text_hash(text): chunk for text, (_, chunk) in records.items()
+    }
     return {
         "context": "\n".join(
             [
@@ -146,9 +155,93 @@ def _semantic_v5_info() -> dict:
 def _v5_segment(texts: list[str], response: str) -> dict:
     return {
         "kind": "plain_query",
-        "semantic_prompt_matched_text_hashes": [record_text_hash(text) for text in texts],
+        "semantic_prompt_matched_text_hashes": [
+            record_text_hash(text) for text in texts
+        ],
         "response_text": response,
     }
+
+
+def _semantic_v6_info() -> tuple[dict, list[str], list[str]]:
+    packet_one = [f"positive packet text {index}" for index in range(12)]
+    packet_two = [f"negative packet text {index}" for index in range(12)]
+    labels_by_hash = {
+        **{
+            record_text_hash(text): ("positive" if index < 9 else "negative")
+            for index, text in enumerate(packet_one)
+        },
+        **{
+            record_text_hash(text): ("negative" if index < 9 else "positive")
+            for index, text in enumerate(packet_two)
+        },
+    }
+    packets_by_hash = {
+        **{record_text_hash(text): "section_001_packet_01" for text in packet_one},
+        **{record_text_hash(text): "section_002_packet_01" for text in packet_two},
+    }
+    sections_by_hash = {
+        **{record_text_hash(text): "section_001" for text in packet_one},
+        **{record_text_hash(text): "section_002" for text in packet_two},
+    }
+    info = _semantic_v3_info()
+    info["metadata"].update(
+        {
+            "derived_dataset": "oolong_semantic_delegation_v6",
+            "record_labels_by_text_hash": labels_by_hash,
+            "record_packets_by_text_hash": packets_by_hash,
+            "record_chunks_by_text_hash": sections_by_hash,
+            "packet_labels": {
+                "section_001_packet_01": "positive",
+                "section_002_packet_01": "negative",
+            },
+        }
+    )
+    return info, packet_one, packet_two
+
+
+def test_semantic_v6_uses_raw_section_accuracy() -> None:
+    info, _, _ = _semantic_v6_info()
+    outputs = [
+        "{}",
+        '{"chunk_001":"positive"}',
+        '{"chunk_001":"positive","chunk_002":"negative"}',
+        '{"chunk_001":"positive","chunk_002":"negative","chunk_003":"positive"}',
+    ]
+
+    scores = [_score_semantic_delegation_v3(output, info)[0] for output in outputs]
+
+    assert [score.task_score for score in scores] == [0.0, 0.25, 0.5, 0.75]
+    assert [score.progress for score in scores] == [0.0, 0.25, 0.5, 0.75]
+
+
+def test_semantic_chunk_accuracy_metric_falls_back_for_base_tasks() -> None:
+    assert (
+        asyncio.run(semantic_chunk_accuracy_metric({"reward_correctness": 1.0})) == 1.0
+    )
+
+
+def test_semantic_v6_grades_only_complete_natural_packets() -> None:
+    info, packet_one, packet_two = _semantic_v6_info()
+    state = {
+        "rlm_segments": [
+            _v5_segment(packet_one, "The packet is mostly positive."),
+            _v5_segment(packet_one[:8], "positive"),
+            _v5_segment([*packet_one[:6], *packet_two[:6]], "negative"),
+        ]
+    }
+
+    _annotate_semantic_child_segments(state, info)
+
+    complete, partial, mixed = state["rlm_segments"]
+    assert complete["semantic_local_signal"] is True
+    assert complete["semantic_local_advantage"] == 1.0
+    assert complete["semantic_primary_chunk_id"] == "section_001"
+    assert complete["semantic_primary_packet_id"] == "section_001_packet_01"
+    assert partial["semantic_local_signal"] is False
+    assert partial["semantic_local_fallback_reason"] == "partial_packet"
+    assert mixed["semantic_local_signal"] is False
+    assert mixed["semantic_local_fallback_reason"] == "mixed_packets"
+    assert state["semantic_complete_packet_call_rate"] == pytest.approx(1 / 3)
 
 
 def test_semantic_delegation_chunk_scoring_shape() -> None:
@@ -259,7 +352,10 @@ def test_semantic_child_local_credit_is_conditioned_on_visible_records() -> None
 def test_semantic_v4_full_chunk_label_is_verified_and_scored() -> None:
     info = _semantic_v4_info()
     chunk = "\n".join(info["context"].splitlines()[2:13])
-    state = {"rlm_segments": [_v4_segment(chunk, '{"chunk_001":"positive"}')], "semantic_record_map_min_records": 8}
+    state = {
+        "rlm_segments": [_v4_segment(chunk, '{"chunk_001":"positive"}')],
+        "semantic_record_map_min_records": 8,
+    }
 
     _annotate_semantic_child_segments(state, info)
 
@@ -279,7 +375,10 @@ def test_semantic_v4_record_map_requires_verified_records_from_one_chunk() -> No
         f"r{index:05d}": info["metadata"]["record_labels"][f"r{index:05d}"]
         for index in range(1, 9)
     }
-    state = {"rlm_segments": [_v4_segment(prompt, json.dumps(expected))], "semantic_record_map_min_records": 8}
+    state = {
+        "rlm_segments": [_v4_segment(prompt, json.dumps(expected))],
+        "semantic_record_map_min_records": 8,
+    }
 
     _annotate_semantic_child_segments(state, info)
 
@@ -305,16 +404,23 @@ def test_semantic_v4_rejects_modified_duplicate_and_mixed_evidence() -> None:
 
     _annotate_semantic_child_segments(state, info)
 
-    reasons = [segment["semantic_input_rejection_reason"] for segment in state["rlm_segments"]]
+    reasons = [
+        segment["semantic_input_rejection_reason"] for segment in state["rlm_segments"]
+    ]
     assert reasons == ["record_text_mismatch", "duplicate_record_id", "mixed_chunks"]
-    assert all(segment["semantic_local_signal"] is False for segment in state["rlm_segments"])
+    assert all(
+        segment["semantic_local_signal"] is False for segment in state["rlm_segments"]
+    )
 
 
 def test_semantic_v4_invalid_record_map_output_gets_full_negative_advantage() -> None:
     info = _semantic_v4_info()
     prompt = "\n".join(info["context"].splitlines()[3:11])
     response = '{"r00001":"positive","unknown":"negative"}'
-    state = {"rlm_segments": [_v4_segment(prompt, response)], "semantic_record_map_min_records": 8}
+    state = {
+        "rlm_segments": [_v4_segment(prompt, response)],
+        "semantic_record_map_min_records": 8,
+    }
 
     _annotate_semantic_child_segments(state, info)
 
@@ -329,7 +435,10 @@ def test_semantic_v5_grades_natural_majority_for_visible_mixed_section_text() ->
     info = _semantic_v5_info()
     state = {
         "rlm_segments": [
-            _v5_segment(["good one", "good two", "bad two"], "The reviews are mixed, but overall positive.")
+            _v5_segment(
+                ["good one", "good two", "bad two"],
+                "The reviews are mixed, but overall positive.",
+            )
         ]
     }
 
@@ -345,7 +454,11 @@ def test_semantic_v5_grades_natural_majority_for_visible_mixed_section_text() ->
 
 
 def test_semantic_v5_wrong_natural_conclusion_gets_negative_local_advantage() -> None:
-    state = {"rlm_segments": [_v5_segment(["bad two", "bad three", "good three"], "mostly positive")]}
+    state = {
+        "rlm_segments": [
+            _v5_segment(["bad two", "bad three", "good three"], "mostly positive")
+        ]
+    }
 
     _annotate_semantic_child_segments(state, _semantic_v5_info())
 
@@ -359,7 +472,10 @@ def test_semantic_v5_tie_and_ambiguous_answer_fall_back_to_terminal_credit() -> 
     state = {
         "rlm_segments": [
             _v5_segment(["good one", "bad one"], "overall positive"),
-            _v5_segment(["good one", "good two", "bad one"], "Some are positive and some are negative."),
+            _v5_segment(
+                ["good one", "good two", "bad one"],
+                "Some are positive and some are negative.",
+            ),
         ]
     }
 
@@ -391,7 +507,9 @@ def test_semantic_v5_local_accuracy_excludes_terminal_fallback_calls() -> None:
     assert state["semantic_child_natural_answer_parse_rate"] == 1.0
 
 
-def test_semantic_adaptive_reward_uses_continuous_progress_and_correct_only_cost(monkeypatch) -> None:
+def test_semantic_adaptive_reward_uses_continuous_progress_and_correct_only_cost(
+    monkeypatch,
+) -> None:
     class _DummyAsyncOpenAI:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
@@ -446,6 +564,62 @@ def test_semantic_adaptive_reward_uses_continuous_progress_and_correct_only_cost
     assert states[2]["reward_adaptive_cost_penalty"] == 0.0
     assert states[3]["reward_adaptive_cost_penalty"] == 0.0
     assert rewards[1] <= 0.25
+
+
+def test_accuracy_stratified_cost_breaks_ties_without_inverting_correctness(
+    monkeypatch,
+) -> None:
+    class _DummyAsyncOpenAI:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+    monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
+    rubric = build_rubric(
+        judge_model="judge-model",
+        judge_base_url="http://judge.local/v1",
+        judge_api_key="EMPTY",
+        efficiency_penalty_mode="accuracy_stratified_group",
+        adaptive_efficiency_cost_basis="weighted_turn_tokens",
+        efficiency_root_token_multiplier=8.0,
+        efficiency_plain_subcall_token_multiplier=1.0,
+        efficiency_tie_break_max=0.05,
+        reward_clip_min=-0.5,
+    )
+    answers = [
+        '{"chunk_001":"positive","chunk_002":"negative","chunk_003":"positive"}',
+        '{"chunk_001":"positive","chunk_002":"negative"}',
+        '{"chunk_001":"positive","chunk_002":"negative"}',
+        '{"chunk_001":"positive"}',
+    ]
+    root_tokens = [2_000, 100, 2_000, 100]
+    states = []
+    for final_answer, tokens in zip(answers, root_tokens, strict=True):
+        info, _, _ = _semantic_v6_info()
+        states.append(
+            {
+                "final_answer": final_answer,
+                "completion": [],
+                "answer": info["acceptable_answers"][0],
+                "info": info,
+                "rlm_segments": [
+                    {
+                        "kind": "root_turn",
+                        "prompt_token_count": tokens,
+                        "completion_token_count": 10,
+                    }
+                ],
+                "trajectory": [],
+            }
+        )
+
+    rewards = asyncio.run(rubric.funcs[0](states))
+
+    assert rewards[0] > rewards[1]
+    assert rewards[1] > rewards[2]
+    assert rewards[2] > rewards[3]
+    assert rewards[1] == 0.5
+    assert rewards[2] == 0.45
+    assert states[1]["reward_accuracy_stratum_size"] == 2.0
 
 
 def test_is_exact_match_handles_numeric_normalization() -> None:
@@ -535,7 +709,9 @@ def test_oolong_semantic_rubric_skips_llm_judge(monkeypatch) -> None:
             del args, kwargs
 
     async def _judge_should_not_run(*args, **kwargs):
-        raise AssertionError("Semantic Oolong aggregation should use deterministic scoring")
+        raise AssertionError(
+            "Semantic Oolong aggregation should use deterministic scoring"
+        )
 
     monkeypatch.setattr(reward_module, "AsyncOpenAI", _DummyAsyncOpenAI)
     monkeypatch.setattr(reward_module, "_call_binary_judge", _judge_should_not_run)
@@ -608,16 +784,18 @@ def test_segment_rollout_token_totals_include_non_trainable_subcalls() -> None:
 
 
 def test_efficiency_penalty_uses_exact_segment_token_totals() -> None:
-    penalty, prompt_tokens, completion_tokens, total_tokens = _efficiency_penalty_from_state(
-        {
-            "efficiency_penalty_coef": 0.02,
-            "rlm_segments": [
-                {
-                    "prompt_ids": list(range(600)),
-                    "completion_ids": list(range(400)),
-                }
-            ],
-        }
+    penalty, prompt_tokens, completion_tokens, total_tokens = (
+        _efficiency_penalty_from_state(
+            {
+                "efficiency_penalty_coef": 0.02,
+                "rlm_segments": [
+                    {
+                        "prompt_ids": list(range(600)),
+                        "completion_ids": list(range(400)),
+                    }
+                ],
+            }
+        )
     )
 
     assert prompt_tokens == 600
@@ -717,25 +895,41 @@ def test_weighted_turn_token_cost_weights_root_more_than_plain_subcalls() -> Non
     }
     breakdown = _segment_rollout_token_breakdown(state)
 
-    assert _weighted_turn_token_cost(
-        breakdown,
-        root_token_multiplier=8.0,
-        plain_subcall_token_multiplier=1.0,
-    ) == 8.0 * 1200 + 500
-    assert _adaptive_cost_value(
-        state,
-        cost_basis="weighted_turn_tokens",
-        root_token_multiplier=8.0,
-        plain_subcall_token_multiplier=1.0,
-    ) == 8.0 * 1200 + 500
+    assert (
+        _weighted_turn_token_cost(
+            breakdown,
+            root_token_multiplier=8.0,
+            plain_subcall_token_multiplier=1.0,
+        )
+        == 8.0 * 1200 + 500
+    )
+    assert (
+        _adaptive_cost_value(
+            state,
+            cost_basis="weighted_turn_tokens",
+            root_token_multiplier=8.0,
+            plain_subcall_token_multiplier=1.0,
+        )
+        == 8.0 * 1200 + 500
+    )
 
 
 def test_adaptive_beta_ramps_after_solve_rate_floor() -> None:
-    assert _adaptive_beta_for_solve_rate(solve_rate=0.25, beta_max=0.05, gamma=2.0, solve_rate_floor=0.25) == 0.0
-    assert _adaptive_beta_for_solve_rate(solve_rate=0.5, beta_max=0.05, gamma=2.0, solve_rate_floor=0.25) == (
-        0.05 * ((0.5 - 0.25) / 0.75) ** 2
+    assert (
+        _adaptive_beta_for_solve_rate(
+            solve_rate=0.25, beta_max=0.05, gamma=2.0, solve_rate_floor=0.25
+        )
+        == 0.0
     )
-    assert _adaptive_beta_for_solve_rate(solve_rate=1.0, beta_max=0.05, gamma=2.0, solve_rate_floor=0.25) == 0.05
+    assert _adaptive_beta_for_solve_rate(
+        solve_rate=0.5, beta_max=0.05, gamma=2.0, solve_rate_floor=0.25
+    ) == (0.05 * ((0.5 - 0.25) / 0.75) ** 2)
+    assert (
+        _adaptive_beta_for_solve_rate(
+            solve_rate=1.0, beta_max=0.05, gamma=2.0, solve_rate_floor=0.25
+        )
+        == 0.05
+    )
 
 
 def test_adaptive_beta_min_applies_below_floor_and_interpolates_to_max() -> None:
@@ -757,13 +951,16 @@ def test_adaptive_beta_min_applies_below_floor_and_interpolates_to_max() -> None
         gamma=2.0,
         solve_rate_floor=0.25,
     ) == pytest.approx(expected)
-    assert _adaptive_beta_for_solve_rate(
-        solve_rate=1.0,
-        beta_min=0.1,
-        beta_max=1.0,
-        gamma=2.0,
-        solve_rate_floor=0.25,
-    ) == 1.0
+    assert (
+        _adaptive_beta_for_solve_rate(
+            solve_rate=1.0,
+            beta_min=0.1,
+            beta_max=1.0,
+            gamma=2.0,
+            solve_rate_floor=0.25,
+        )
+        == 1.0
+    )
 
 
 def test_build_rubric_applies_cost_penalty_on_exact_match(monkeypatch) -> None:
@@ -874,7 +1071,9 @@ def test_build_rubric_no_answer_reward_is_zero_with_cost_penalty(monkeypatch) ->
     assert state["reward_total"] == 0.0
 
 
-def test_build_rubric_incorrect_judge_reward_is_zero_with_cost_penalty(monkeypatch) -> None:
+def test_build_rubric_incorrect_judge_reward_is_zero_with_cost_penalty(
+    monkeypatch,
+) -> None:
     class _DummyAsyncOpenAI:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
@@ -911,7 +1110,9 @@ def test_build_rubric_incorrect_judge_reward_is_zero_with_cost_penalty(monkeypat
     assert state["reward_total"] == 0.0
 
 
-def test_static_cost_penalty_can_make_incorrect_rollout_negative_when_enabled(monkeypatch) -> None:
+def test_static_cost_penalty_can_make_incorrect_rollout_negative_when_enabled(
+    monkeypatch,
+) -> None:
     class _DummyAsyncOpenAI:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
@@ -973,7 +1174,9 @@ def test_build_rubric_zeroes_missing_formal_final_at_max_turn(monkeypatch) -> No
         "trajectory": [],
     }
 
-    score = asyncio.run(reward_fn(state, [{"content": "42"}], "42", {"question": "What is the answer?"}))
+    score = asyncio.run(
+        reward_fn(state, [{"content": "42"}], "42", {"question": "What is the answer?"})
+    )
 
     assert score == 0.0
     assert state["reward_correctness"] == 0.0
@@ -981,7 +1184,9 @@ def test_build_rubric_zeroes_missing_formal_final_at_max_turn(monkeypatch) -> No
     assert state["reward_max_turn_penalty"] == 0.0
 
 
-def test_build_rubric_zeroes_missing_final_from_stop_condition_without_flags(monkeypatch) -> None:
+def test_build_rubric_zeroes_missing_final_from_stop_condition_without_flags(
+    monkeypatch,
+) -> None:
     class _DummyAsyncOpenAI:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
@@ -1003,7 +1208,9 @@ def test_build_rubric_zeroes_missing_final_from_stop_condition_without_flags(mon
         "trajectory": [],
     }
 
-    score = asyncio.run(reward_fn(state, [{"content": "42"}], "42", {"question": "What is the answer?"}))
+    score = asyncio.run(
+        reward_fn(state, [{"content": "42"}], "42", {"question": "What is the answer?"})
+    )
 
     assert score == 0.0
     assert state["reward_correctness"] == 0.0
@@ -1040,7 +1247,9 @@ def test_build_rubric_zeroes_missing_final_from_trajectory_debug(monkeypatch) ->
         ],
     }
 
-    score = asyncio.run(reward_fn(state, [{"content": "42"}], "42", {"question": "What is the answer?"}))
+    score = asyncio.run(
+        reward_fn(state, [{"content": "42"}], "42", {"question": "What is the answer?"})
+    )
 
     assert score == 0.0
     assert state["reward_correctness"] == 0.0
@@ -1105,7 +1314,9 @@ def test_build_rubric_supports_stronger_forced_finalize_penalty(monkeypatch) -> 
     assert state["reward_max_turn_penalty"] == 0.5
 
 
-def _adaptive_test_state(final_answer: str, total_tokens: int, *, answer: str = "42") -> dict:
+def _adaptive_test_state(
+    final_answer: str, total_tokens: int, *, answer: str = "42"
+) -> dict:
     prompt_tokens = max(0, total_tokens - 10)
     completion_tokens = min(10, total_tokens)
     return {
@@ -1156,7 +1367,10 @@ def test_adaptive_group_rubric_uses_group_reward_function(monkeypatch) -> None:
 def test_adaptive_group_all_wrong_returns_zero_and_beta_zero(monkeypatch) -> None:
     rubric = _adaptive_rubric(monkeypatch)
     reward_fn = rubric.funcs[0]
-    states = [_adaptive_test_state("wrong", total_tokens) for total_tokens in (20, 40, 80, 100)]
+    states = [
+        _adaptive_test_state("wrong", total_tokens)
+        for total_tokens in (20, 40, 80, 100)
+    ]
 
     scores = asyncio.run(reward_fn(states))
 
@@ -1166,7 +1380,9 @@ def test_adaptive_group_all_wrong_returns_zero_and_beta_zero(monkeypatch) -> Non
     assert all(state["reward_efficiency_penalty"] == 0.0 for state in states)
 
 
-def test_adaptive_group_single_correct_hard_group_has_no_cost_penalty(monkeypatch) -> None:
+def test_adaptive_group_single_correct_hard_group_has_no_cost_penalty(
+    monkeypatch,
+) -> None:
     rubric = _adaptive_rubric(monkeypatch)
     reward_fn = rubric.funcs[0]
     states = [
@@ -1184,7 +1400,9 @@ def test_adaptive_group_single_correct_hard_group_has_no_cost_penalty(monkeypatc
     assert states[0]["reward_adaptive_normalized_cost"] == 0.0
 
 
-def test_adaptive_group_penalizes_only_correct_rollouts_by_relative_cost_by_default(monkeypatch) -> None:
+def test_adaptive_group_penalizes_only_correct_rollouts_by_relative_cost_by_default(
+    monkeypatch,
+) -> None:
     rubric = _adaptive_rubric(monkeypatch)
     reward_fn = rubric.funcs[0]
     states = [
@@ -1206,7 +1424,9 @@ def test_adaptive_group_penalizes_only_correct_rollouts_by_relative_cost_by_defa
     assert states[3]["reward_efficiency_penalty"] == 0.0
 
 
-def test_adaptive_group_can_penalize_incorrect_rollouts_by_relative_group_cost(monkeypatch) -> None:
+def test_adaptive_group_can_penalize_incorrect_rollouts_by_relative_group_cost(
+    monkeypatch,
+) -> None:
     class _DummyAsyncOpenAI:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
@@ -1245,10 +1465,15 @@ def test_adaptive_group_can_penalize_incorrect_rollouts_by_relative_group_cost(m
     assert scores[3] == 1.0 - expected_beta
     assert states[1]["reward_correctness"] == 0.0
     assert states[1]["reward_efficiency_penalty"] > 0.0
-    assert states[1]["reward_incorrect_cost_penalty"] == states[1]["reward_efficiency_penalty"]
+    assert (
+        states[1]["reward_incorrect_cost_penalty"]
+        == states[1]["reward_efficiency_penalty"]
+    )
 
 
-def _adaptive_root_subcall_state(final_answer: str, *, root_tokens: int, subcall_tokens: int) -> dict:
+def _adaptive_root_subcall_state(
+    final_answer: str, *, root_tokens: int, subcall_tokens: int
+) -> dict:
     return {
         "final_answer": final_answer,
         "answer": "42",
@@ -1319,7 +1544,9 @@ def test_adaptive_group_uses_weighted_turn_tokens_when_configured(monkeypatch) -
     assert scores[3] == 0.65
 
 
-def test_adaptive_group_all_wrong_keeps_beta_zero_even_with_all_rollouts_penalty(monkeypatch) -> None:
+def test_adaptive_group_all_wrong_keeps_beta_zero_even_with_all_rollouts_penalty(
+    monkeypatch,
+) -> None:
     class _DummyAsyncOpenAI:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
@@ -1342,7 +1569,10 @@ def test_adaptive_group_all_wrong_keeps_beta_zero_even_with_all_rollouts_penalty
         reward_clip_max=1.0,
     )
     reward_fn = rubric.funcs[0]
-    states = [_adaptive_test_state("wrong", total_tokens) for total_tokens in (20, 40, 80, 100)]
+    states = [
+        _adaptive_test_state("wrong", total_tokens)
+        for total_tokens in (20, 40, 80, 100)
+    ]
 
     scores = asyncio.run(reward_fn(states))
 
@@ -1351,7 +1581,9 @@ def test_adaptive_group_all_wrong_keeps_beta_zero_even_with_all_rollouts_penalty
     assert all(state["reward_incorrect_cost_penalty"] == 0.0 for state in states)
 
 
-def test_adaptive_group_beta_floor_penalizes_expensive_incorrect_rollouts(monkeypatch) -> None:
+def test_adaptive_group_beta_floor_penalizes_expensive_incorrect_rollouts(
+    monkeypatch,
+) -> None:
     class _DummyAsyncOpenAI:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
@@ -1374,7 +1606,10 @@ def test_adaptive_group_beta_floor_penalizes_expensive_incorrect_rollouts(monkey
         reward_clip_max=1.0,
     )
     reward_fn = rubric.funcs[0]
-    states = [_adaptive_test_state("wrong", total_tokens) for total_tokens in (20, 40, 80, 100)]
+    states = [
+        _adaptive_test_state("wrong", total_tokens)
+        for total_tokens in (20, 40, 80, 100)
+    ]
 
     scores = asyncio.run(reward_fn(states))
 
@@ -1431,7 +1666,9 @@ def test_adaptive_group_penalizes_correct_forced_finalize_turn(monkeypatch) -> N
     assert states[0]["reward_max_turn_penalty"] == 0.25
 
 
-def test_adaptive_group_zeroes_missing_final_and_penalizes_valid_correct_rollouts(monkeypatch) -> None:
+def test_adaptive_group_zeroes_missing_final_and_penalizes_valid_correct_rollouts(
+    monkeypatch,
+) -> None:
     class _DummyAsyncOpenAI:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
@@ -1506,7 +1743,9 @@ def test_oversized_candidate_scores_zero_without_calling_judge(monkeypatch) -> N
     assert state["judge_parse_error"] == "candidate_too_large"
 
 
-def test_oversized_question_and_expected_are_truncated_before_judging(monkeypatch) -> None:
+def test_oversized_question_and_expected_are_truncated_before_judging(
+    monkeypatch,
+) -> None:
     class _DummyAsyncOpenAI:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
@@ -1563,8 +1802,12 @@ def test_vertex_oversized_input_error_scores_zero(monkeypatch) -> None:
         raise RuntimeError("Request contains text fields that are too large")
 
     fake_types = SimpleNamespace(GenerateContentConfig=_FakeGenerateContentConfig)
-    monkeypatch.setattr(reward_module, "_load_google_genai", lambda: (SimpleNamespace(), fake_types))
-    monkeypatch.setattr(reward_module, "_call_vertex_binary_judge", _judge_raises_oversized)
+    monkeypatch.setattr(
+        reward_module, "_load_google_genai", lambda: (SimpleNamespace(), fake_types)
+    )
+    monkeypatch.setattr(
+        reward_module, "_call_vertex_binary_judge", _judge_raises_oversized
+    )
     rubric = build_rubric(
         judge_provider="vertex",
         judge_model="gemini-3-flash-preview",
@@ -1613,8 +1856,15 @@ def test_vertex_judge_calls_generate_content_and_parses_binary(monkeypatch) -> N
             self.aio = SimpleNamespace(models=_FakeAioModels())
             _FakeClient.last_client = self
 
-    fake_types = SimpleNamespace(ThinkingConfig=_FakeThinkingConfig, GenerateContentConfig=_FakeGenerateContentConfig)
-    monkeypatch.setattr(reward_module, "_load_google_genai", lambda: (SimpleNamespace(Client=_FakeClient), fake_types))
+    fake_types = SimpleNamespace(
+        ThinkingConfig=_FakeThinkingConfig,
+        GenerateContentConfig=_FakeGenerateContentConfig,
+    )
+    monkeypatch.setattr(
+        reward_module,
+        "_load_google_genai",
+        lambda: (SimpleNamespace(Client=_FakeClient), fake_types),
+    )
 
     rubric = build_rubric(
         judge_provider="vertex",
@@ -1637,7 +1887,11 @@ def test_vertex_judge_calls_generate_content_and_parses_binary(monkeypatch) -> N
 
     assert score == 1.0
     client = _FakeClient.last_client
-    assert client.kwargs == {"vertexai": True, "project": "test-project", "location": "global"}
+    assert client.kwargs == {
+        "vertexai": True,
+        "project": "test-project",
+        "location": "global",
+    }
     call = client.aio.models.calls[0]
     assert call["model"] == "gemini-3-flash-preview"
     assert call["config"].kwargs["thinking_config"].thinking_level == "medium"
@@ -1661,7 +1915,9 @@ def test_openai_compatible_judge_retries_rate_limits(monkeypatch) -> None:
             self.calls += 1
             if self.calls < 3:
                 raise _FakeRateLimitError("rate limited")
-            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="1"))])
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="1"))]
+            )
 
     completions = _FakeCompletions()
     fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
@@ -1706,8 +1962,13 @@ def test_vertex_judge_retries_resource_exhausted(monkeypatch) -> None:
 
     models = _FakeAioModels()
     fake_client = SimpleNamespace(aio=SimpleNamespace(models=models))
-    fake_types = SimpleNamespace(ThinkingConfig=_FakeThinkingConfig, GenerateContentConfig=_FakeGenerateContentConfig)
-    monkeypatch.setattr(reward_module, "_load_google_genai", lambda: (SimpleNamespace(), fake_types))
+    fake_types = SimpleNamespace(
+        ThinkingConfig=_FakeThinkingConfig,
+        GenerateContentConfig=_FakeGenerateContentConfig,
+    )
+    monkeypatch.setattr(
+        reward_module, "_load_google_genai", lambda: (SimpleNamespace(), fake_types)
+    )
     monkeypatch.setattr(reward_module, "_sleep_before_judge_retry", _no_sleep)
 
     score, raw_response, parse_error = asyncio.run(
@@ -1746,7 +2007,9 @@ def test_vertex_judge_retries_access_token_type_unsupported(monkeypatch) -> None
 
     fake_client = _FakeVertexJudgeClient()
     fake_types = SimpleNamespace(GenerateContentConfig=_FakeGenerateContentConfig)
-    monkeypatch.setattr(reward_module, "_load_google_genai", lambda: (SimpleNamespace(), fake_types))
+    monkeypatch.setattr(
+        reward_module, "_load_google_genai", lambda: (SimpleNamespace(), fake_types)
+    )
     monkeypatch.setattr(reward_module, "_sleep_before_judge_retry", _no_sleep)
 
     score, raw_response, parse_error = asyncio.run(

@@ -55,7 +55,11 @@ _JUDGE_RETRY_MAX_ATTEMPTS = 6
 _JUDGE_RETRY_BASE_SECONDS = 1.0
 _JUDGE_RETRY_MAX_SECONDS = 30.0
 _VERTEX_JUDGE_MAX_OUTPUT_TOKENS = 1024
-_VALID_EFFICIENCY_PENALTY_MODES = {"static_per_1k", "adaptive_group"}
+_VALID_EFFICIENCY_PENALTY_MODES = {
+    "static_per_1k",
+    "adaptive_group",
+    "accuracy_stratified_group",
+}
 _VALID_ADAPTIVE_COST_BASES = {"total_tokens", "weighted_turn_tokens"}
 _VALID_EFFICIENCY_PENALTY_SCOPES = {"correct_only", "all_rollouts"}
 _JUDGE_TRUNCATION_MARKER = "\n\n[truncated before semantic judging]"
@@ -221,7 +225,9 @@ def _parse_binary_judge_score(raw_text: str) -> float:
     match = re.search(r"\b([01])\b", text)
     if match is not None:
         return float(match.group(1))
-    raise ValueError(f"Judge response did not contain a valid binary score: {raw_text!r}")
+    raise ValueError(
+        f"Judge response did not contain a valid binary score: {raw_text!r}"
+    )
 
 
 def _format_expected_answers(answers: list[str]) -> str:
@@ -261,7 +267,9 @@ def _is_oolong_pairs_task(info: dict[str, Any] | None) -> bool:
     dataset_name = str(info.get("dataset_name") or "")
     answer_type = str(info.get("answer_type") or "")
     metadata = info.get("metadata") if isinstance(info.get("metadata"), dict) else {}
-    origin = str(metadata.get("benchmark_origin") or metadata.get("original_benchmark") or "")
+    origin = str(
+        metadata.get("benchmark_origin") or metadata.get("original_benchmark") or ""
+    )
     return (
         dataset_name == "oolong_pairs"
         or origin == "oolong_pairs"
@@ -270,7 +278,9 @@ def _is_oolong_pairs_task(info: dict[str, Any] | None) -> bool:
     )
 
 
-def _score_oolong_pairs(predicted_answer: str, expected_answers: list[str]) -> tuple[float, str, dict[str, float]]:
+def _score_oolong_pairs(
+    predicted_answer: str, expected_answers: list[str]
+) -> tuple[float, str, dict[str, float]]:
     predicted_pairs = _extract_pair_set(predicted_answer)
     expected_pairs: set[tuple[str, str]] = set()
     for answer in expected_answers:
@@ -289,7 +299,11 @@ def _score_oolong_pairs(predicted_answer: str, expected_answers: list[str]) -> t
     true_positive = len(predicted_pairs & expected_pairs)
     precision = true_positive / len(predicted_pairs) if predicted_pairs else 0.0
     recall = true_positive / len(expected_pairs)
-    f1 = (2.0 * precision * recall / (precision + recall)) if precision + recall > 0.0 else 0.0
+    f1 = (
+        (2.0 * precision * recall / (precision + recall))
+        if precision + recall > 0.0
+        else 0.0
+    )
     stats = {
         "precision": precision,
         "recall": recall,
@@ -321,6 +335,7 @@ def _is_oolong_semantic_aggregation_task(info: dict[str, Any] | None) -> bool:
             "oolong_semantic_delegation_v3",
             "oolong_semantic_delegation_v4",
             "oolong_semantic_delegation_v5",
+            "oolong_semantic_delegation_v6",
         }
     )
 
@@ -335,6 +350,7 @@ def _semantic_delegation_metadata(info: dict[str, Any] | None) -> dict[str, Any]
         "oolong_semantic_delegation_v3",
         "oolong_semantic_delegation_v4",
         "oolong_semantic_delegation_v5",
+        "oolong_semantic_delegation_v6",
     }:
         return None
     return metadata
@@ -342,7 +358,9 @@ def _semantic_delegation_metadata(info: dict[str, Any] | None) -> dict[str, Any]
 
 def _normalize_semantic_label(value: Any, label_space: list[str]) -> str | None:
     candidate = _strip_answer_prefix(str(value)).strip()
-    final_match = re.fullmatch(r"FINAL\((.*)\)", candidate, flags=re.IGNORECASE | re.DOTALL)
+    final_match = re.fullmatch(
+        r"FINAL\((.*)\)", candidate, flags=re.IGNORECASE | re.DOTALL
+    )
     if final_match:
         candidate = _normalize_text(final_match.group(1))
     by_normalized = {_normalize_text(label).casefold(): label for label in label_space}
@@ -372,7 +390,9 @@ def _score_semantic_delegation_v3(
                 exact=exact,
                 schema_valid=1.0 if normalized is not None else 0.0,
             ),
-            "[semantic_delegation_global_exact]" if exact else "[semantic_delegation_global_mismatch]",
+            "[semantic_delegation_global_exact]"
+            if exact
+            else "[semantic_delegation_global_mismatch]",
             None if normalized is not None else "invalid_global_label",
         )
 
@@ -381,10 +401,18 @@ def _score_semantic_delegation_v3(
         for chunk_id, label in (metadata.get("chunk_labels") or {}).items()
     }
     if not expected_map:
-        return SemanticDelegationScore(0.0, 0.0, 0.0, 0.0, 0.0), "[semantic_delegation_missing_gold]", "missing_gold"
+        return (
+            SemanticDelegationScore(0.0, 0.0, 0.0, 0.0, 0.0),
+            "[semantic_delegation_missing_gold]",
+            "missing_gold",
+        )
     parsed = _extract_json_object(predicted_answer)
     if parsed is None:
-        return SemanticDelegationScore(0.0, 0.0, 0.0, 0.0, 0.0), "[semantic_delegation_invalid_json]", "invalid_json"
+        return (
+            SemanticDelegationScore(0.0, 0.0, 0.0, 0.0, 0.0),
+            "[semantic_delegation_invalid_json]",
+            "invalid_json",
+        )
 
     normalized_keys = {str(key).casefold(): str(key) for key in expected_map}
     predicted_map: dict[str, str] = {}
@@ -401,11 +429,15 @@ def _score_semantic_delegation_v3(
             continue
         predicted_map[expected_key] = normalized_label
 
-    correct = sum(predicted_map.get(chunk_id) == expected_label for chunk_id, expected_label in expected_map.items())
+    correct = sum(
+        predicted_map.get(chunk_id) == expected_label
+        for chunk_id, expected_label in expected_map.items()
+    )
     chunk_accuracy = correct / len(expected_map)
-    progress = max(0.0, 2.0 * chunk_accuracy - 1.0)
+    is_v6 = metadata.get("derived_dataset") == "oolong_semantic_delegation_v6"
+    progress = chunk_accuracy if is_v6 else max(0.0, 2.0 * chunk_accuracy - 1.0)
     exact = float(correct == len(expected_map) and extra_keys == 0 and schema_valid)
-    task_score = 0.5 * exact + 0.5 * progress
+    task_score = chunk_accuracy if is_v6 else 0.5 * exact + 0.5 * progress
     return (
         SemanticDelegationScore(
             task_score=task_score,
@@ -420,7 +452,9 @@ def _score_semantic_delegation_v3(
     )
 
 
-def _annotate_semantic_child_segments_v3(state: vf.State, info: dict[str, Any] | None) -> None:
+def _annotate_semantic_child_segments_v3(
+    state: vf.State, info: dict[str, Any] | None
+) -> None:
     metadata = _semantic_delegation_metadata(info)
     if metadata is None:
         return
@@ -446,7 +480,10 @@ def _annotate_semantic_child_segments_v3(state: vf.State, info: dict[str, Any] |
     for segment in segments:
         if not isinstance(segment, dict):
             continue
-        if segment.get("kind") != "plain_query" and segment.get("train_scope") != "llm_subcall":
+        if (
+            segment.get("kind") != "plain_query"
+            and segment.get("train_scope") != "llm_subcall"
+        ):
             continue
         segment["semantic_child_segment"] = True
         prompt_ids = [
@@ -455,7 +492,13 @@ def _annotate_semantic_child_segments_v3(state: vf.State, info: dict[str, Any] |
             if str(record_id) in gold_labels
         ]
         prompt_ids = list(dict.fromkeys(prompt_ids))
-        chunks = sorted({record_chunks[record_id] for record_id in prompt_ids if record_id in record_chunks})
+        chunks = sorted(
+            {
+                record_chunks[record_id]
+                for record_id in prompt_ids
+                if record_id in record_chunks
+            }
+        )
         segment["semantic_recognized_record_count"] = len(prompt_ids)
         segment["semantic_recognized_chunk_ids"] = chunks
         segment["semantic_primary_chunk_id"] = chunks[0] if len(chunks) == 1 else None
@@ -470,7 +513,9 @@ def _annotate_semantic_child_segments_v3(state: vf.State, info: dict[str, Any] |
         predictions: dict[str, str] = {}
         schema_valid = parsed is not None
         if parsed is not None:
-            prompt_lookup = {record_id.casefold(): record_id for record_id in prompt_ids}
+            prompt_lookup = {
+                record_id.casefold(): record_id for record_id in prompt_ids
+            }
             for raw_id, raw_label in parsed.items():
                 record_id = prompt_lookup.get(str(raw_id).casefold())
                 if record_id is None:
@@ -484,11 +529,16 @@ def _annotate_semantic_child_segments_v3(state: vf.State, info: dict[str, Any] |
                 predictions[prompt_ids[0]] = label
                 schema_valid = True
 
-        correct = sum(predictions.get(record_id) == gold_labels[record_id] for record_id in prompt_ids)
+        correct = sum(
+            predictions.get(record_id) == gold_labels[record_id]
+            for record_id in prompt_ids
+        )
         local_accuracy = correct / len(prompt_ids)
         coverage = len(predictions) / len(prompt_ids)
         local_advantage = 2.0 * local_accuracy - 1.0
-        local_exact = float(correct == len(prompt_ids) and len(predictions) == len(prompt_ids))
+        local_exact = float(
+            correct == len(prompt_ids) and len(predictions) == len(prompt_ids)
+        )
         segment.update(
             {
                 "semantic_local_signal": True,
@@ -508,13 +558,25 @@ def _annotate_semantic_child_segments_v3(state: vf.State, info: dict[str, Any] |
 
     unique_queried = set(queried_ids)
     state["semantic_child_scored_segments"] = float(locally_scored_segments)
-    state["semantic_child_local_accuracy"] = total_correct / total_expected if total_expected else 0.0
-    state["semantic_child_local_coverage"] = total_predictions / total_expected if total_expected else 0.0
-    state["semantic_child_exact_rate"] = exact_segments / locally_scored_segments if locally_scored_segments else 0.0
-    state["semantic_records_per_subcall"] = total_expected / locally_scored_segments if locally_scored_segments else 0.0
-    state["semantic_record_coverage"] = len(unique_queried) / len(gold_labels) if gold_labels else 0.0
+    state["semantic_child_local_accuracy"] = (
+        total_correct / total_expected if total_expected else 0.0
+    )
+    state["semantic_child_local_coverage"] = (
+        total_predictions / total_expected if total_expected else 0.0
+    )
+    state["semantic_child_exact_rate"] = (
+        exact_segments / locally_scored_segments if locally_scored_segments else 0.0
+    )
+    state["semantic_records_per_subcall"] = (
+        total_expected / locally_scored_segments if locally_scored_segments else 0.0
+    )
+    state["semantic_record_coverage"] = (
+        len(unique_queried) / len(gold_labels) if gold_labels else 0.0
+    )
     state["semantic_duplicate_coverage"] = (
-        (len(queried_ids) - len(unique_queried)) / len(queried_ids) if queried_ids else 0.0
+        (len(queried_ids) - len(unique_queried)) / len(queried_ids)
+        if queried_ids
+        else 0.0
     )
 
 
@@ -529,7 +591,9 @@ def _strict_semantic_input(
 ) -> tuple[str | None, list[str], str | None, bool]:
     prompt_hashes = {
         str(record_id).casefold(): str(text_hash)
-        for record_id, text_hash in (segment.get("semantic_prompt_record_hashes") or {}).items()
+        for record_id, text_hash in (
+            segment.get("semantic_prompt_record_hashes") or {}
+        ).items()
     }
     prompt_ids = list(prompt_hashes)
     if not prompt_ids:
@@ -538,9 +602,15 @@ def _strict_semantic_input(
         return None, [], "malformed_record_line", False
     if segment.get("semantic_prompt_duplicate_record_ids"):
         return None, [], "duplicate_record_id", False
-    if any(record_id not in gold_labels or record_id not in context_hashes for record_id in prompt_ids):
+    if any(
+        record_id not in gold_labels or record_id not in context_hashes
+        for record_id in prompt_ids
+    ):
         return None, [], "unknown_record_id", False
-    if any(prompt_hashes[record_id] != context_hashes[record_id] for record_id in prompt_ids):
+    if any(
+        prompt_hashes[record_id] != context_hashes[record_id]
+        for record_id in prompt_ids
+    ):
         return None, [], "record_text_mismatch", False
 
     chunks = {record_chunks[record_id] for record_id in prompt_ids}
@@ -569,9 +639,13 @@ def _score_strict_semantic_child(
     normalized_chunk_label: str | None = None
     if full_chunk:
         if parsed is not None and set(map(str, parsed)) == {chunk_id}:
-            normalized_chunk_label = _normalize_semantic_label(parsed[chunk_id], label_space)
+            normalized_chunk_label = _normalize_semantic_label(
+                parsed[chunk_id], label_space
+            )
         elif parsed is None:
-            normalized_chunk_label = _normalize_semantic_label(response_text, label_space)
+            normalized_chunk_label = _normalize_semantic_label(
+                response_text, label_space
+            )
     if normalized_chunk_label is not None:
         accuracy = float(normalized_chunk_label == chunk_labels[chunk_id])
         return "chunk_label", accuracy, 1.0, True, 1
@@ -588,7 +662,9 @@ def _score_strict_semantic_child(
                 continue
             predictions[record_id] = label
 
-    correct = sum(predictions.get(record_id) == gold_labels[record_id] for record_id in prompt_ids)
+    correct = sum(
+        predictions.get(record_id) == gold_labels[record_id] for record_id in prompt_ids
+    )
     accuracy = correct / len(prompt_ids) if schema_valid else 0.0
     coverage = len(predictions) / len(prompt_ids)
     return "record_map", accuracy, coverage, schema_valid, len(predictions)
@@ -612,7 +688,9 @@ def _annotate_semantic_child_segments_v4(state: vf.State, info: dict[str, Any]) 
     chunk_records: dict[str, set[str]] = {}
     for record_id, chunk_id in record_chunks.items():
         chunk_records.setdefault(chunk_id, set()).add(record_id)
-    context_hashes = parse_semantic_prompt_evidence(str(info.get("context") or "")).record_hashes
+    context_hashes = parse_semantic_prompt_evidence(
+        str(info.get("context") or "")
+    ).record_hashes
     label_space = [str(label) for label in metadata.get("label_space") or []]
     min_records = int(state.get("semantic_record_map_min_records", 8))
     segments = state.get("rlm_segments")
@@ -635,7 +713,10 @@ def _annotate_semantic_child_segments_v4(state: vf.State, info: dict[str, Any]) 
     for segment in segments:
         if not isinstance(segment, dict):
             continue
-        if segment.get("kind") != "plain_query" and segment.get("train_scope") != "llm_subcall":
+        if (
+            segment.get("kind") != "plain_query"
+            and segment.get("train_scope") != "llm_subcall"
+        ):
             continue
         child_count += 1
         segment["semantic_child_segment"] = True
@@ -656,21 +737,25 @@ def _annotate_semantic_child_segments_v4(state: vf.State, info: dict[str, Any]) 
         if rejection_reason is not None or chunk_id is None:
             segment["semantic_local_signal"] = False
             segment["semantic_local_schema_valid"] = False
-            rejection_counts[rejection_reason or "unknown"] = rejection_counts.get(rejection_reason or "unknown", 0) + 1
+            rejection_counts[rejection_reason or "unknown"] = (
+                rejection_counts.get(rejection_reason or "unknown", 0) + 1
+            )
             continue
 
         verified_count += 1
         queried_ids.extend(prompt_ids)
         if full_chunk:
             verified_full_chunks.add(chunk_id)
-        contract, accuracy, coverage, schema_valid, predictions = _score_strict_semantic_child(
-            str(segment.get("response_text") or ""),
-            chunk_id=chunk_id,
-            prompt_ids=prompt_ids,
-            full_chunk=full_chunk,
-            gold_labels=gold_labels,
-            chunk_labels=chunk_labels,
-            label_space=label_space,
+        contract, accuracy, coverage, schema_valid, predictions = (
+            _score_strict_semantic_child(
+                str(segment.get("response_text") or ""),
+                chunk_id=chunk_id,
+                prompt_ids=prompt_ids,
+                full_chunk=full_chunk,
+                gold_labels=gold_labels,
+                chunk_labels=chunk_labels,
+                label_space=label_space,
+            )
         )
         local_advantage = 2.0 * accuracy - 1.0
         segment.update(
@@ -700,15 +785,23 @@ def _annotate_semantic_child_segments_v4(state: vf.State, info: dict[str, Any]) 
     state["semantic_child_local_accuracy"] = local_accuracy_sum / denominator
     state["semantic_child_local_coverage"] = local_coverage_sum / denominator
     state["semantic_child_exact_rate"] = exact_count / denominator
-    state["semantic_child_verified_input_rate"] = verified_count / child_count if child_count else 0.0
-    state["semantic_child_invalid_input_rate"] = 1.0 - state["semantic_child_verified_input_rate"] if child_count else 0.0
+    state["semantic_child_verified_input_rate"] = (
+        verified_count / child_count if child_count else 0.0
+    )
+    state["semantic_child_invalid_input_rate"] = (
+        1.0 - state["semantic_child_verified_input_rate"] if child_count else 0.0
+    )
     state["semantic_child_valid_output_rate"] = valid_output_count / denominator
     state["semantic_child_chunk_contract_rate"] = chunk_contract_count / denominator
     state["semantic_child_record_contract_rate"] = record_contract_count / denominator
     state["semantic_records_per_subcall"] = len(queried_ids) / denominator
-    state["semantic_record_coverage"] = len(unique_queried) / len(gold_labels) if gold_labels else 0.0
+    state["semantic_record_coverage"] = (
+        len(unique_queried) / len(gold_labels) if gold_labels else 0.0
+    )
     state["semantic_duplicate_coverage"] = (
-        (len(queried_ids) - len(unique_queried)) / len(queried_ids) if queried_ids else 0.0
+        (len(queried_ids) - len(unique_queried)) / len(queried_ids)
+        if queried_ids
+        else 0.0
     )
     state["semantic_verified_full_chunk_coverage"] = (
         len(verified_full_chunks) / len(chunk_labels) if chunk_labels else 0.0
@@ -718,7 +811,9 @@ def _annotate_semantic_child_segments_v4(state: vf.State, info: dict[str, Any]) 
     state["semantic_child_input_rejections"] = rejection_counts
 
 
-def _extract_natural_semantic_label(response_text: str, label_space: list[str]) -> str | None:
+def _extract_natural_semantic_label(
+    response_text: str, label_space: list[str]
+) -> str | None:
     candidate = _strip_answer_prefix(response_text).strip()
     normalized = _normalize_semantic_label(candidate, label_space)
     if normalized is not None:
@@ -734,7 +829,9 @@ def _extract_natural_semantic_label(response_text: str, label_space: list[str]) 
         if len(parsed_labels) == 1:
             return next(iter(parsed_labels))
 
-    normalized_labels = {_normalize_text(label).casefold(): label for label in label_space}
+    normalized_labels = {
+        _normalize_text(label).casefold(): label for label in label_space
+    }
     label_pattern = "|".join(
         re.escape(label) for label in sorted(normalized_labels, key=len, reverse=True)
     )
@@ -747,12 +844,18 @@ def _extract_natural_semantic_label(response_text: str, label_space: list[str]) 
     )
     conclusion_matches = list(conclusion_pattern.finditer(_normalize_text(candidate)))
     if conclusion_matches:
-        return normalized_labels[_normalize_text(conclusion_matches[-1].group("label")).casefold()]
+        return normalized_labels[
+            _normalize_text(conclusion_matches[-1].group("label")).casefold()
+        ]
 
     mentioned = {
         normalized_label: label
         for normalized_label, label in normalized_labels.items()
-        if re.search(rf"\b{re.escape(normalized_label)}\b", _normalize_text(candidate), flags=re.IGNORECASE)
+        if re.search(
+            rf"\b{re.escape(normalized_label)}\b",
+            _normalize_text(candidate),
+            flags=re.IGNORECASE,
+        )
     }
     return next(iter(mentioned.values())) if len(mentioned) == 1 else None
 
@@ -762,11 +865,15 @@ def _annotate_semantic_child_segments_v5(state: vf.State, info: dict[str, Any]) 
     assert metadata is not None
     labels_by_hash = {
         str(text_hash): str(label)
-        for text_hash, label in (metadata.get("record_labels_by_text_hash") or {}).items()
+        for text_hash, label in (
+            metadata.get("record_labels_by_text_hash") or {}
+        ).items()
     }
     chunks_by_hash = {
         str(text_hash): str(chunk_id)
-        for text_hash, chunk_id in (metadata.get("record_chunks_by_text_hash") or {}).items()
+        for text_hash, chunk_id in (
+            metadata.get("record_chunks_by_text_hash") or {}
+        ).items()
     }
     label_space = [str(label) for label in metadata.get("label_space") or []]
     chunk_labels = metadata.get("chunk_labels") or {}
@@ -786,7 +893,10 @@ def _annotate_semantic_child_segments_v5(state: vf.State, info: dict[str, Any]) 
     for segment in segments:
         if not isinstance(segment, dict):
             continue
-        if segment.get("kind") != "plain_query" and segment.get("train_scope") != "llm_subcall":
+        if (
+            segment.get("kind") != "plain_query"
+            and segment.get("train_scope") != "llm_subcall"
+        ):
             continue
 
         child_count += 1
@@ -795,16 +905,24 @@ def _annotate_semantic_child_segments_v5(state: vf.State, info: dict[str, Any]) 
         matched_hashes = list(
             dict.fromkeys(
                 str(text_hash)
-                for text_hash in (segment.get("semantic_prompt_matched_text_hashes") or [])
+                for text_hash in (
+                    segment.get("semantic_prompt_matched_text_hashes") or []
+                )
                 if str(text_hash) in labels_by_hash
             )
         )
         matched_chunks = sorted(
-            {chunks_by_hash[text_hash] for text_hash in matched_hashes if text_hash in chunks_by_hash}
+            {
+                chunks_by_hash[text_hash]
+                for text_hash in matched_hashes
+                if text_hash in chunks_by_hash
+            }
         )
         segment["semantic_recognized_record_count"] = len(matched_hashes)
         segment["semantic_recognized_chunk_ids"] = matched_chunks
-        segment["semantic_primary_chunk_id"] = matched_chunks[0] if len(matched_chunks) == 1 else None
+        segment["semantic_primary_chunk_id"] = (
+            matched_chunks[0] if len(matched_chunks) == 1 else None
+        )
         segment["semantic_input_verified"] = bool(matched_hashes)
         total_matched_records += len(matched_hashes)
         all_matched_hashes.update(matched_hashes)
@@ -812,7 +930,9 @@ def _annotate_semantic_child_segments_v5(state: vf.State, info: dict[str, Any]) 
         if matched_hashes:
             matched_call_count += 1
 
-        prediction = _extract_natural_semantic_label(str(segment.get("response_text") or ""), label_space)
+        prediction = _extract_natural_semantic_label(
+            str(segment.get("response_text") or ""), label_space
+        )
         if prediction is not None:
             parsed_answer_count += 1
 
@@ -823,7 +943,11 @@ def _annotate_semantic_child_segments_v5(state: vf.State, info: dict[str, Any]) 
                 label_counts[label] += 1
         ordered_counts = sorted(label_counts.values(), reverse=True)
         target = None
-        if matched_hashes and len(ordered_counts) >= 2 and ordered_counts[0] > ordered_counts[1]:
+        if (
+            matched_hashes
+            and len(ordered_counts) >= 2
+            and ordered_counts[0] > ordered_counts[1]
+        ):
             target = max(label_counts, key=label_counts.get)
 
         if not matched_hashes:
@@ -839,7 +963,9 @@ def _annotate_semantic_child_segments_v5(state: vf.State, info: dict[str, Any]) 
             segment["semantic_local_signal"] = False
             segment["semantic_local_schema_valid"] = prediction is not None
             segment["semantic_local_fallback_reason"] = fallback_reason
-            fallback_reasons[fallback_reason] = fallback_reasons.get(fallback_reason, 0) + 1
+            fallback_reasons[fallback_reason] = (
+                fallback_reasons.get(fallback_reason, 0) + 1
+            )
             continue
 
         accuracy = float(prediction == target)
@@ -865,27 +991,216 @@ def _annotate_semantic_child_segments_v5(state: vf.State, info: dict[str, Any]) 
     state["semantic_child_local_coverage"] = local_signal_count / denominator
     state["semantic_child_exact_rate"] = local_correct_count / signal_denominator
     state["semantic_child_local_signal_rate"] = local_signal_count / denominator
-    state["semantic_child_terminal_fallback_rate"] = (child_count - local_signal_count) / denominator
+    state["semantic_child_terminal_fallback_rate"] = (
+        child_count - local_signal_count
+    ) / denominator
     state["semantic_child_input_match_rate"] = matched_call_count / denominator
-    state["semantic_child_natural_answer_parse_rate"] = parsed_answer_count / denominator
+    state["semantic_child_natural_answer_parse_rate"] = (
+        parsed_answer_count / denominator
+    )
     state["semantic_child_verified_input_rate"] = matched_call_count / denominator
-    state["semantic_child_invalid_input_rate"] = (child_count - matched_call_count) / denominator
+    state["semantic_child_invalid_input_rate"] = (
+        child_count - matched_call_count
+    ) / denominator
     state["semantic_child_valid_output_rate"] = parsed_answer_count / denominator
     state["semantic_child_chunk_contract_rate"] = 0.0
     state["semantic_child_record_contract_rate"] = 0.0
     state["semantic_records_per_subcall"] = total_matched_records / denominator
-    state["semantic_record_coverage"] = len(all_matched_hashes) / len(labels_by_hash) if labels_by_hash else 0.0
+    state["semantic_record_coverage"] = (
+        len(all_matched_hashes) / len(labels_by_hash) if labels_by_hash else 0.0
+    )
     state["semantic_duplicate_coverage"] = 0.0
     state["semantic_verified_full_chunk_coverage"] = 0.0
-    state["semantic_section_diversity"] = len(covered_chunks) / len(chunk_labels) if chunk_labels else 0.0
+    state["semantic_section_diversity"] = (
+        len(covered_chunks) / len(chunk_labels) if chunk_labels else 0.0
+    )
     state["semantic_child_input_rejections"] = fallback_reasons
 
 
-def _annotate_semantic_child_segments(state: vf.State, info: dict[str, Any] | None) -> None:
+def _annotate_semantic_child_segments_v6(state: vf.State, info: dict[str, Any]) -> None:
+    metadata = _semantic_delegation_metadata(info)
+    assert metadata is not None
+    labels_by_hash = {
+        str(text_hash): str(label)
+        for text_hash, label in (
+            metadata.get("record_labels_by_text_hash") or {}
+        ).items()
+    }
+    packets_by_hash = {
+        str(text_hash): str(packet_id)
+        for text_hash, packet_id in (
+            metadata.get("record_packets_by_text_hash") or {}
+        ).items()
+    }
+    sections_by_hash = {
+        str(text_hash): str(section_id)
+        for text_hash, section_id in (
+            metadata.get("record_chunks_by_text_hash") or {}
+        ).items()
+    }
+    packet_labels = {
+        str(key): str(value)
+        for key, value in (metadata.get("packet_labels") or {}).items()
+    }
+    packet_records: dict[str, set[str]] = {}
+    for text_hash, packet_id in packets_by_hash.items():
+        packet_records.setdefault(packet_id, set()).add(text_hash)
+    label_space = [str(label) for label in metadata.get("label_space") or []]
+    chunk_labels = metadata.get("chunk_labels") or {}
+    segments = state.get("rlm_segments")
+    if not isinstance(segments, list):
+        return
+
+    child_count = 0
+    matched_call_count = 0
+    complete_packet_count = 0
+    parsed_answer_count = 0
+    local_signal_count = 0
+    local_correct_count = 0
+    total_matched_records = 0
+    all_matched_hashes: set[str] = set()
+    complete_packets: set[str] = set()
+    covered_sections: set[str] = set()
+    fallback_reasons: dict[str, int] = {}
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        if (
+            segment.get("kind") != "plain_query"
+            and segment.get("train_scope") != "llm_subcall"
+        ):
+            continue
+
+        child_count += 1
+        segment["semantic_child_segment"] = True
+        segment["semantic_terminal_fallback_eligible"] = True
+        matched_hashes = list(
+            dict.fromkeys(
+                str(text_hash)
+                for text_hash in (
+                    segment.get("semantic_prompt_matched_text_hashes") or []
+                )
+                if str(text_hash) in labels_by_hash
+            )
+        )
+        matched_packets = sorted(
+            {packets_by_hash[text_hash] for text_hash in matched_hashes}
+        )
+        matched_sections = sorted(
+            {sections_by_hash[text_hash] for text_hash in matched_hashes}
+        )
+        complete_packet_id = None
+        if len(matched_packets) == 1 and set(matched_hashes) == packet_records.get(
+            matched_packets[0], set()
+        ):
+            complete_packet_id = matched_packets[0]
+            complete_packets.add(complete_packet_id)
+            complete_packet_count += 1
+        segment["semantic_recognized_record_count"] = len(matched_hashes)
+        segment["semantic_recognized_packet_ids"] = matched_packets
+        segment["semantic_recognized_chunk_ids"] = matched_sections
+        segment["semantic_primary_packet_id"] = complete_packet_id
+        segment["semantic_primary_chunk_id"] = (
+            matched_sections[0]
+            if complete_packet_id and len(matched_sections) == 1
+            else None
+        )
+        segment["semantic_complete_packet"] = complete_packet_id is not None
+        segment["semantic_input_verified"] = complete_packet_id is not None
+        total_matched_records += len(matched_hashes)
+        all_matched_hashes.update(matched_hashes)
+        covered_sections.update(matched_sections)
+        if matched_hashes:
+            matched_call_count += 1
+
+        prediction = _extract_natural_semantic_label(
+            str(segment.get("response_text") or ""), label_space
+        )
+        if prediction is not None:
+            parsed_answer_count += 1
+
+        if not matched_hashes:
+            fallback_reason = "no_matched_records"
+        elif len(matched_packets) != 1:
+            fallback_reason = "mixed_packets"
+        elif complete_packet_id is None:
+            fallback_reason = "partial_packet"
+        elif prediction is None:
+            fallback_reason = "ambiguous_answer"
+        else:
+            fallback_reason = None
+
+        if fallback_reason is not None:
+            segment["semantic_local_signal"] = False
+            segment["semantic_local_schema_valid"] = prediction is not None
+            segment["semantic_local_fallback_reason"] = fallback_reason
+            fallback_reasons[fallback_reason] = (
+                fallback_reasons.get(fallback_reason, 0) + 1
+            )
+            continue
+
+        accuracy = float(prediction == packet_labels[complete_packet_id])
+        local_signal_count += 1
+        local_correct_count += int(accuracy)
+        segment.update(
+            {
+                "semantic_local_signal": True,
+                "semantic_local_contract": "natural_packet_majority",
+                "semantic_local_accuracy": accuracy,
+                "semantic_local_coverage": 1.0,
+                "semantic_local_schema_valid": True,
+                "semantic_local_advantage": 2.0 * accuracy - 1.0,
+                "semantic_local_exact": accuracy,
+                "semantic_local_prediction_count": 1,
+            }
+        )
+
+    denominator = child_count or 1
+    signal_denominator = local_signal_count or 1
+    state["semantic_child_scored_segments"] = float(local_signal_count)
+    state["semantic_child_local_accuracy"] = local_correct_count / signal_denominator
+    state["semantic_child_local_coverage"] = local_signal_count / denominator
+    state["semantic_child_exact_rate"] = local_correct_count / signal_denominator
+    state["semantic_child_local_signal_rate"] = local_signal_count / denominator
+    state["semantic_child_terminal_fallback_rate"] = (
+        child_count - local_signal_count
+    ) / denominator
+    state["semantic_child_input_match_rate"] = matched_call_count / denominator
+    state["semantic_child_natural_answer_parse_rate"] = (
+        parsed_answer_count / denominator
+    )
+    state["semantic_child_verified_input_rate"] = complete_packet_count / denominator
+    state["semantic_child_invalid_input_rate"] = (
+        child_count - complete_packet_count
+    ) / denominator
+    state["semantic_child_valid_output_rate"] = parsed_answer_count / denominator
+    state["semantic_complete_packet_call_rate"] = complete_packet_count / denominator
+    state["semantic_records_per_subcall"] = total_matched_records / denominator
+    state["semantic_record_coverage"] = (
+        len(all_matched_hashes) / len(labels_by_hash) if labels_by_hash else 0.0
+    )
+    state["semantic_packet_coverage"] = (
+        len(complete_packets) / len(packet_records) if packet_records else 0.0
+    )
+    state["semantic_section_diversity"] = (
+        len(covered_sections) / len(chunk_labels) if chunk_labels else 0.0
+    )
+    state["semantic_child_chunk_contract_rate"] = 0.0
+    state["semantic_child_record_contract_rate"] = 0.0
+    state["semantic_verified_full_chunk_coverage"] = 0.0
+    state["semantic_duplicate_coverage"] = 0.0
+    state["semantic_child_input_rejections"] = fallback_reasons
+
+
+def _annotate_semantic_child_segments(
+    state: vf.State, info: dict[str, Any] | None
+) -> None:
     metadata = _semantic_delegation_metadata(info)
     if metadata is None:
         return
-    if metadata.get("derived_dataset") == "oolong_semantic_delegation_v5":
+    if metadata.get("derived_dataset") == "oolong_semantic_delegation_v6":
+        _annotate_semantic_child_segments_v6(state, info or {})
+    elif metadata.get("derived_dataset") == "oolong_semantic_delegation_v5":
         _annotate_semantic_child_segments_v5(state, info or {})
     elif metadata.get("derived_dataset") == "oolong_semantic_delegation_v4":
         _annotate_semantic_child_segments_v4(state, info or {})
@@ -894,7 +1209,9 @@ def _annotate_semantic_child_segments(state: vf.State, info: dict[str, Any] | No
     write_live_trace(state, event="semantic_scored")
 
 
-def _record_semantic_delegation_metrics(state: vf.State, score: SemanticDelegationScore) -> None:
+def _record_semantic_delegation_metrics(
+    state: vf.State, score: SemanticDelegationScore
+) -> None:
     state["semantic_task_score"] = score.task_score
     state["semantic_chunk_accuracy"] = score.chunk_accuracy
     state["semantic_progress"] = score.progress
@@ -906,7 +1223,9 @@ def _record_semantic_delegation_metrics(state: vf.State, score: SemanticDelegati
 
 def _strip_answer_prefix(text: str) -> str:
     text = _normalize_text(text)
-    match = re.match(r"^(?:count|label|user|month|answer)\s*:\s*(.+)$", text, flags=re.IGNORECASE)
+    match = re.match(
+        r"^(?:count|label|user|month|answer)\s*:\s*(.+)$", text, flags=re.IGNORECASE
+    )
     if match:
         return _normalize_text(match.group(1))
     return text
@@ -917,7 +1236,9 @@ def _extract_numeric_answer(text: str) -> str | None:
     direct = _canonicalize_number(stripped)
     if direct is not None:
         return direct
-    matches = re.findall(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", stripped.replace(",", ""))
+    matches = re.findall(
+        r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", stripped.replace(",", "")
+    )
     if len(matches) == 1:
         return _canonicalize_number(matches[0])
     return None
@@ -977,7 +1298,10 @@ def _score_oolong_semantic_aggregation(
             if expected_json is None:
                 continue
             expected_histogram = _canonical_histogram(expected_json)
-            if expected_histogram is not None and predicted_histogram == expected_histogram:
+            if (
+                expected_histogram is not None
+                and predicted_histogram == expected_histogram
+            ):
                 return 1.0, "[oolong_semantic_exact]", None
         return 0.0, "[oolong_semantic_json_mismatch]", None
 
@@ -1106,7 +1430,10 @@ async def _call_judge_with_retries(request: Callable[[], Awaitable[Any]]) -> Any
         try:
             return await request()
         except Exception as exc:
-            if attempt == _JUDGE_RETRY_MAX_ATTEMPTS - 1 or not _is_retryable_judge_exception(exc):
+            if (
+                attempt == _JUDGE_RETRY_MAX_ATTEMPTS - 1
+                or not _is_retryable_judge_exception(exc)
+            ):
                 raise
             await _sleep_before_judge_retry(attempt)
 
@@ -1144,7 +1471,11 @@ class _VertexJudgeClientFactory:
 
     async def generate_content(self, **kwargs: Any) -> Any:
         genai, types = _load_google_genai()
-        client = genai.Client(**_vertex_client_kwargs(project=self.project, location=self.location, types=types))
+        client = genai.Client(
+            **_vertex_client_kwargs(
+                project=self.project, location=self.location, types=types
+            )
+        )
         try:
             return await client.aio.models.generate_content(**kwargs)
         finally:
@@ -1195,7 +1526,10 @@ def _missing_formal_final_at_max_turn(state: vf.State) -> bool:
         return True
     if _state_bool_with_debug_fallback(state, "missing_final"):
         return True
-    return state.get("final_answer") is None and state.get("stop_condition") == "max_turns_reached"
+    return (
+        state.get("final_answer") is None
+        and state.get("stop_condition") == "max_turns_reached"
+    )
 
 
 def _max_turn_penalty_from_state(
@@ -1212,7 +1546,9 @@ def _max_turn_penalty_from_state(
     return 0.0
 
 
-def _segment_token_length(segment: dict[str, Any], *, ids_key: str, count_key: str | None = None) -> int:
+def _segment_token_length(
+    segment: dict[str, Any], *, ids_key: str, count_key: str | None = None
+) -> int:
     if count_key is not None:
         count_value = segment.get(count_key)
         if count_value not in (None, ""):
@@ -1254,7 +1590,10 @@ def _segment_rollout_token_breakdown(state: vf.State) -> TokenBreakdown:
             completion_tokens += segment_completion_tokens
             if bool(segment.get("is_trainable_rlm_turn", False)):
                 trainable_tokens += segment_total_tokens
-            if segment.get("kind") == "plain_query" or segment.get("train_scope") == "llm_subcall":
+            if (
+                segment.get("kind") == "plain_query"
+                or segment.get("train_scope") == "llm_subcall"
+            ):
                 plain_subcall_tokens += segment_total_tokens
             else:
                 rlm_turn_tokens += segment_total_tokens
@@ -1283,9 +1622,21 @@ def _efficiency_penalty_from_state(state: vf.State) -> tuple[float, int, int, in
     breakdown = _segment_rollout_token_breakdown(state)
     penalty_coef = float(state.get("efficiency_penalty_coef", 0.0) or 0.0)
     if penalty_coef <= 0.0 or breakdown.total_tokens <= 0:
-        return 0.0, breakdown.prompt_tokens, breakdown.completion_tokens, breakdown.total_tokens
-    penalty = penalty_coef * (float(breakdown.total_tokens) / _EFFICIENCY_PENALTY_PER_1K_TOKENS)
-    return penalty, breakdown.prompt_tokens, breakdown.completion_tokens, breakdown.total_tokens
+        return (
+            0.0,
+            breakdown.prompt_tokens,
+            breakdown.completion_tokens,
+            breakdown.total_tokens,
+        )
+    penalty = penalty_coef * (
+        float(breakdown.total_tokens) / _EFFICIENCY_PENALTY_PER_1K_TOKENS
+    )
+    return (
+        penalty,
+        breakdown.prompt_tokens,
+        breakdown.completion_tokens,
+        breakdown.total_tokens,
+    )
 
 
 def _record_reward_breakdown(
@@ -1404,7 +1755,7 @@ async def _call_binary_judge(
                     "role": "user",
                     "content": (
                         f"{judge_prompt}\n\n"
-                        f'Your previous response was invalid: {raw_response!r}\n'
+                        f"Your previous response was invalid: {raw_response!r}\n"
                         "Return only 0 or 1."
                     ),
                 },
@@ -1436,7 +1787,9 @@ async def _call_vertex_binary_judge(
             "max_output_tokens": _VERTEX_JUDGE_MAX_OUTPUT_TOKENS,
         }
         if thinking_level:
-            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_level=thinking_level
+            )
         response = await _call_judge_with_retries(
             lambda: _call_vertex_generate_content(
                 judge_client,
@@ -1511,7 +1864,9 @@ async def _score_correctness(
         return result
 
     if _is_oolong_pairs_task(info):
-        score, raw_response, stats = _score_oolong_pairs(predicted_answer, expected_answers)
+        score, raw_response, stats = _score_oolong_pairs(
+            predicted_answer, expected_answers
+        )
         _record_oolong_pairs_metrics(state, stats)
         result = CorrectnessResult(
             predicted_answer=predicted_answer,
@@ -1532,7 +1887,9 @@ async def _score_correctness(
 
     if _semantic_delegation_metadata(info) is not None:
         _annotate_semantic_child_segments(state, info)
-        semantic_score, raw_response, parse_error = _score_semantic_delegation_v3(predicted_answer, info)
+        semantic_score, raw_response, parse_error = _score_semantic_delegation_v3(
+            predicted_answer, info
+        )
         _record_semantic_delegation_metrics(state, semantic_score)
         result = CorrectnessResult(
             predicted_answer=predicted_answer,
@@ -1594,10 +1951,13 @@ async def _score_correctness(
         return result
 
     judge_expected_answers = [
-        _truncate_for_judge(str(expected_answer), max_chars=judge_expected_max_chars) for expected_answer in expected_answers
+        _truncate_for_judge(str(expected_answer), max_chars=judge_expected_max_chars)
+        for expected_answer in expected_answers
     ]
     judge_prompt = JUDGE_PROMPT.format(
-        question=_truncate_for_judge(question or "(not provided)", max_chars=judge_question_max_chars),
+        question=_truncate_for_judge(
+            question or "(not provided)", max_chars=judge_question_max_chars
+        ),
         expected_answers=_format_expected_answers(judge_expected_answers),
         predicted_answer=predicted_answer,
     )
@@ -1612,7 +1972,11 @@ async def _score_correctness(
         except Exception as exc:
             if not _is_oversized_judge_exception(exc):
                 raise
-            score, raw_response, parse_error = 0.0, f"[vertex_oversized_input: {type(exc).__name__}]", "vertex_input_too_large"
+            score, raw_response, parse_error = (
+                0.0,
+                f"[vertex_oversized_input: {type(exc).__name__}]",
+                "vertex_input_too_large",
+            )
     else:
         score, raw_response, parse_error = await _call_binary_judge(
             judge_client,
@@ -1654,7 +2018,9 @@ async def _score_correctness_with_protocol(
     missing_final_at_max_turn_zero_reward: bool,
 ) -> CorrectnessResult:
     _annotate_semantic_child_segments(state, info)
-    if missing_final_at_max_turn_zero_reward and _missing_formal_final_at_max_turn(state):
+    if missing_final_at_max_turn_zero_reward and _missing_formal_final_at_max_turn(
+        state
+    ):
         predicted_answer = _get_predicted_answer(state, completion).strip()
         result = CorrectnessResult(
             predicted_answer=predicted_answer,
@@ -1689,7 +2055,12 @@ async def _score_correctness_with_protocol(
 
 
 def _adaptive_beta_for_solve_rate(
-    *, solve_rate: float, beta_max: float, gamma: float, solve_rate_floor: float, beta_min: float = 0.0
+    *,
+    solve_rate: float,
+    beta_max: float,
+    gamma: float,
+    solve_rate_floor: float,
+    beta_min: float = 0.0,
 ) -> float:
     if solve_rate <= solve_rate_floor:
         return beta_min
@@ -1705,10 +2076,9 @@ def _weighted_turn_token_cost(
     root_token_multiplier: float,
     plain_subcall_token_multiplier: float,
 ) -> float:
-    return (
-        float(root_token_multiplier) * float(breakdown.rlm_turn_tokens)
-        + float(plain_subcall_token_multiplier) * float(breakdown.plain_subcall_tokens)
-    )
+    return float(root_token_multiplier) * float(breakdown.rlm_turn_tokens) + float(
+        plain_subcall_token_multiplier
+    ) * float(breakdown.plain_subcall_tokens)
 
 
 def _adaptive_cost_value(
@@ -1728,7 +2098,9 @@ def _adaptive_cost_value(
             plain_subcall_token_multiplier=plain_subcall_token_multiplier,
         )
     else:
-        raise ValueError(f"adaptive_efficiency_cost_basis must be one of {sorted(_VALID_ADAPTIVE_COST_BASES)}")
+        raise ValueError(
+            f"adaptive_efficiency_cost_basis must be one of {sorted(_VALID_ADAPTIVE_COST_BASES)}"
+        )
 
 
 def _min_max_normalized(value: float, *, min_value: float, max_value: float) -> float:
@@ -1738,7 +2110,9 @@ def _min_max_normalized(value: float, *, min_value: float, max_value: float) -> 
     return (float(value) - float(min_value)) / float(span)
 
 
-def _clip_reward(value: float, *, reward_clip_min: float, reward_clip_max: float) -> float:
+def _clip_reward(
+    value: float, *, reward_clip_min: float, reward_clip_max: float
+) -> float:
     return min(reward_clip_max, max(reward_clip_min, value))
 
 
@@ -1761,6 +2135,7 @@ def build_rubric(
     efficiency_root_token_multiplier: float = 1.0,
     efficiency_plain_subcall_token_multiplier: float = 1.0,
     efficiency_penalty_applies_to: str = "correct_only",
+    efficiency_tie_break_max: float = 0.05,
     reward_clip_min: float = 0.0,
     reward_clip_max: float = 1.0,
     max_turn_penalty_enabled: bool = False,
@@ -1771,25 +2146,37 @@ def build_rubric(
     judge_expected_max_chars: int = 8192,
 ) -> vf.Rubric:
     if efficiency_penalty_mode not in _VALID_EFFICIENCY_PENALTY_MODES:
-        raise ValueError(f"efficiency_penalty_mode must be one of {sorted(_VALID_EFFICIENCY_PENALTY_MODES)}")
+        raise ValueError(
+            f"efficiency_penalty_mode must be one of {sorted(_VALID_EFFICIENCY_PENALTY_MODES)}"
+        )
     if adaptive_efficiency_cost_basis not in _VALID_ADAPTIVE_COST_BASES:
-        raise ValueError(f"adaptive_efficiency_cost_basis must be one of {sorted(_VALID_ADAPTIVE_COST_BASES)}")
+        raise ValueError(
+            f"adaptive_efficiency_cost_basis must be one of {sorted(_VALID_ADAPTIVE_COST_BASES)}"
+        )
     if efficiency_penalty_applies_to not in _VALID_EFFICIENCY_PENALTY_SCOPES:
-        raise ValueError(f"efficiency_penalty_applies_to must be one of {sorted(_VALID_EFFICIENCY_PENALTY_SCOPES)}")
+        raise ValueError(
+            f"efficiency_penalty_applies_to must be one of {sorted(_VALID_EFFICIENCY_PENALTY_SCOPES)}"
+        )
     if reward_clip_min > reward_clip_max:
         raise ValueError("reward_clip_min must be <= reward_clip_max")
     if adaptive_efficiency_beta_min < 0.0:
         raise ValueError("adaptive_efficiency_beta_min must be >= 0.0")
     if adaptive_efficiency_beta_max < adaptive_efficiency_beta_min:
-        raise ValueError("adaptive_efficiency_beta_max must be >= adaptive_efficiency_beta_min")
+        raise ValueError(
+            "adaptive_efficiency_beta_max must be >= adaptive_efficiency_beta_min"
+        )
     if adaptive_efficiency_gamma <= 0.0:
         raise ValueError("adaptive_efficiency_gamma must be > 0.0")
     if not 0.0 <= adaptive_efficiency_solve_rate_floor < 1.0:
-        raise ValueError("adaptive_efficiency_solve_rate_floor must be >= 0.0 and < 1.0")
+        raise ValueError(
+            "adaptive_efficiency_solve_rate_floor must be >= 0.0 and < 1.0"
+        )
     if efficiency_root_token_multiplier < 0.0:
         raise ValueError("efficiency_root_token_multiplier must be >= 0.0")
     if efficiency_plain_subcall_token_multiplier < 0.0:
         raise ValueError("efficiency_plain_subcall_token_multiplier must be >= 0.0")
+    if efficiency_tie_break_max < 0.0:
+        raise ValueError("efficiency_tie_break_max must be >= 0.0")
     if max_turn_penalty < 0.0:
         raise ValueError("max_turn_penalty must be >= 0.0")
     if judge_candidate_max_chars < 1:
@@ -1801,9 +2188,13 @@ def build_rubric(
 
     if judge_provider == "vertex":
         if not judge_vertex_project:
-            raise ValueError("judge_vertex_project is required when judge_provider='vertex'")
+            raise ValueError(
+                "judge_vertex_project is required when judge_provider='vertex'"
+            )
         _load_google_genai()
-        judge_client: Any = _VertexJudgeClientFactory(project=judge_vertex_project, location=judge_vertex_location)
+        judge_client: Any = _VertexJudgeClientFactory(
+            project=judge_vertex_project, location=judge_vertex_location
+        )
     elif judge_provider == "openai_compatible":
         judge_client = AsyncOpenAI(
             base_url=judge_base_url,
@@ -1811,9 +2202,13 @@ def build_rubric(
             default_headers=judge_default_headers,
         )
     else:
-        raise ValueError("judge_provider must be one of ['openai_compatible', 'vertex']")
+        raise ValueError(
+            "judge_provider must be one of ['openai_compatible', 'vertex']"
+        )
 
-    async def reward_fn(state: vf.State, completion, answer: str, info: dict[str, Any] | None) -> float:
+    async def reward_fn(
+        state: vf.State, completion, answer: str, info: dict[str, Any] | None
+    ) -> float:
         correctness_result = await _score_correctness_with_protocol(
             state,
             completion,
@@ -1828,7 +2223,9 @@ def build_rubric(
             judge_expected_max_chars=judge_expected_max_chars,
             missing_final_at_max_turn_zero_reward=missing_final_at_max_turn_zero_reward,
         )
-        efficiency_penalty, prompt_tokens, completion_tokens, total_tokens = _efficiency_penalty_from_state(state)
+        efficiency_penalty, prompt_tokens, completion_tokens, total_tokens = (
+            _efficiency_penalty_from_state(state)
+        )
         breakdown = _segment_rollout_token_breakdown(state)
         weighted_tokens = _weighted_turn_token_cost(
             breakdown,
@@ -1842,9 +2239,14 @@ def build_rubric(
             max_turn_penalty=max_turn_penalty,
         )
 
-        scoped_efficiency_penalty = efficiency_penalty if (
-            correctness_result.score > 0.0 or efficiency_penalty_applies_to == "all_rollouts"
-        ) else 0.0
+        scoped_efficiency_penalty = (
+            efficiency_penalty
+            if (
+                correctness_result.score > 0.0
+                or efficiency_penalty_applies_to == "all_rollouts"
+            )
+            else 0.0
+        )
         total_reward = _clip_reward(
             correctness_result.score - terminal_penalty - scoped_efficiency_penalty,
             reward_clip_min=reward_clip_min,
@@ -1862,7 +2264,9 @@ def build_rubric(
             rlm_turn_tokens=breakdown.rlm_turn_tokens,
             plain_subcall_tokens=breakdown.plain_subcall_tokens,
             weighted_tokens=weighted_tokens,
-            incorrect_cost_penalty=scoped_efficiency_penalty if correctness_result.score <= 0.0 else 0.0,
+            incorrect_cost_penalty=scoped_efficiency_penalty
+            if correctness_result.score <= 0.0
+            else 0.0,
             max_turn_penalty=terminal_penalty,
         )
         return total_reward
@@ -1892,7 +2296,9 @@ def build_rubric(
             float(state.get("semantic_progress", task_score))
             for state, task_score in zip(states, task_scores, strict=True)
         ]
-        solve_rate = sum(progress_scores) / len(progress_scores) if progress_scores else 0.0
+        solve_rate = (
+            sum(progress_scores) / len(progress_scores) if progress_scores else 0.0
+        )
         beta = _adaptive_beta_for_solve_rate(
             solve_rate=solve_rate,
             beta_min=adaptive_efficiency_beta_min,
@@ -1910,7 +2316,11 @@ def build_rubric(
             )
             for state in states
         ]
-        correct_costs = [cost for cost, progress in zip(costs, progress_scores, strict=True) if progress > 0.0]
+        correct_costs = [
+            cost
+            for cost, progress in zip(costs, progress_scores, strict=True)
+            if progress > 0.0
+        ]
         if efficiency_penalty_applies_to == "all_rollouts":
             normalization_costs = costs
         else:
@@ -1919,7 +2329,9 @@ def build_rubric(
         max_cost = max(normalization_costs) if len(normalization_costs) >= 2 else 0
 
         rewards: list[float] = []
-        for state, task_score, progress, cost in zip(states, task_scores, progress_scores, costs, strict=True):
+        for state, task_score, progress, cost in zip(
+            states, task_scores, progress_scores, costs, strict=True
+        ):
             breakdown = _segment_rollout_token_breakdown(state)
             weighted_tokens = _weighted_turn_token_cost(
                 breakdown,
@@ -1927,10 +2339,16 @@ def build_rubric(
                 plain_subcall_token_multiplier=efficiency_plain_subcall_token_multiplier,
             )
             normalized_cost = 0.0
-            applies_to_rollout = progress > 0.0 or efficiency_penalty_applies_to == "all_rollouts"
+            applies_to_rollout = (
+                progress > 0.0 or efficiency_penalty_applies_to == "all_rollouts"
+            )
             if applies_to_rollout:
-                normalized_cost = _min_max_normalized(cost, min_value=min_cost, max_value=max_cost)
-            adaptive_cost_penalty = beta * normalized_cost if applies_to_rollout else 0.0
+                normalized_cost = _min_max_normalized(
+                    cost, min_value=min_cost, max_value=max_cost
+                )
+            adaptive_cost_penalty = (
+                beta * normalized_cost if applies_to_rollout else 0.0
+            )
             terminal_penalty = _max_turn_penalty_from_state(
                 state,
                 correctness=task_score,
@@ -1958,19 +2376,131 @@ def build_rubric(
                 adaptive_beta=beta,
                 adaptive_normalized_cost=normalized_cost,
                 adaptive_cost_penalty=adaptive_cost_penalty,
-                incorrect_cost_penalty=adaptive_cost_penalty if progress <= 0.0 else 0.0,
+                incorrect_cost_penalty=adaptive_cost_penalty
+                if progress <= 0.0
+                else 0.0,
                 max_turn_penalty=terminal_penalty,
             )
             rewards.append(total_reward)
         return rewards
 
+    async def accuracy_stratified_group_reward_fn(
+        states: list[vf.State],
+    ) -> list[float]:
+        correctness_results = await asyncio.gather(
+            *(
+                _score_correctness_with_protocol(
+                    state,
+                    state.get("completion", []),
+                    str(state.get("answer", "")),
+                    state.get("info", {}),
+                    judge_provider=judge_provider,
+                    judge_client=judge_client,
+                    judge_model=judge_model,
+                    judge_thinking_level=judge_thinking_level,
+                    judge_candidate_max_chars=judge_candidate_max_chars,
+                    judge_question_max_chars=judge_question_max_chars,
+                    judge_expected_max_chars=judge_expected_max_chars,
+                    missing_final_at_max_turn_zero_reward=missing_final_at_max_turn_zero_reward,
+                )
+                for state in states
+            )
+        )
+        task_scores = [float(result.score) for result in correctness_results]
+        costs = [
+            _adaptive_cost_value(
+                state,
+                cost_basis=adaptive_efficiency_cost_basis,
+                root_token_multiplier=efficiency_root_token_multiplier,
+                plain_subcall_token_multiplier=efficiency_plain_subcall_token_multiplier,
+            )
+            for state in states
+        ]
+        strata: dict[float, list[int]] = {}
+        for index, score in enumerate(task_scores):
+            strata.setdefault(round(score, 8), []).append(index)
+        unique_scores = sorted(strata)
+        positive_gaps = [
+            right - left
+            for left, right in zip(unique_scores, unique_scores[1:])
+            if right > left
+        ]
+        correctness_safe_max = (
+            min(positive_gaps) / 2.0 if positive_gaps else efficiency_tie_break_max
+        )
+        penalty_max = min(efficiency_tie_break_max, correctness_safe_max)
+
+        normalized_costs = [0.0] * len(states)
+        stratum_sizes = [1] * len(states)
+        for indices in strata.values():
+            for index in indices:
+                stratum_sizes[index] = len(indices)
+            if len(indices) < 2:
+                continue
+            stratum_costs = [costs[index] for index in indices]
+            min_cost = min(stratum_costs)
+            max_cost = max(stratum_costs)
+            for index in indices:
+                normalized_costs[index] = _min_max_normalized(
+                    costs[index], min_value=min_cost, max_value=max_cost
+                )
+
+        rewards: list[float] = []
+        for index, (state, task_score, normalized_cost) in enumerate(
+            zip(states, task_scores, normalized_costs, strict=True)
+        ):
+            breakdown = _segment_rollout_token_breakdown(state)
+            weighted_tokens = _weighted_turn_token_cost(
+                breakdown,
+                root_token_multiplier=efficiency_root_token_multiplier,
+                plain_subcall_token_multiplier=efficiency_plain_subcall_token_multiplier,
+            )
+            cost_penalty = penalty_max * normalized_cost
+            terminal_penalty = _max_turn_penalty_from_state(
+                state,
+                correctness=task_score,
+                max_turn_penalty_enabled=max_turn_penalty_enabled,
+                max_turn_penalty=max_turn_penalty,
+            )
+            total_reward = _clip_reward(
+                task_score - terminal_penalty - cost_penalty,
+                reward_clip_min=reward_clip_min,
+                reward_clip_max=reward_clip_max,
+            )
+            _record_reward_breakdown(
+                state,
+                correctness=task_score,
+                efficiency_penalty=cost_penalty,
+                total_reward=total_reward,
+                prompt_tokens=breakdown.prompt_tokens,
+                completion_tokens=breakdown.completion_tokens,
+                total_tokens=breakdown.total_tokens,
+                trainable_tokens=breakdown.trainable_tokens,
+                rlm_turn_tokens=breakdown.rlm_turn_tokens,
+                plain_subcall_tokens=breakdown.plain_subcall_tokens,
+                weighted_tokens=weighted_tokens,
+                adaptive_normalized_cost=normalized_cost,
+                adaptive_cost_penalty=cost_penalty,
+                incorrect_cost_penalty=cost_penalty if task_score <= 0.0 else 0.0,
+                max_turn_penalty=terminal_penalty,
+            )
+            state["reward_accuracy_stratum_size"] = float(stratum_sizes[index])
+            state["reward_accuracy_stratified_cost_penalty"] = cost_penalty
+            state["reward_efficiency_tie_break_max"] = penalty_max
+            rewards.append(total_reward)
+        return rewards
+
     if efficiency_penalty_mode == "adaptive_group":
         return vf.Rubric(funcs=[adaptive_group_reward_fn])
+    if efficiency_penalty_mode == "accuracy_stratified_group":
+        return vf.Rubric(funcs=[accuracy_stratified_group_reward_fn])
     return vf.Rubric(funcs=[reward_fn])
 
 
 async def correctness_metric(state: vf.State) -> float:
-    return float(state.get("correctness_metric_value", state.get("reward_correctness", 0.0)))
+    return float(
+        state.get("correctness_metric_value", state.get("reward_correctness", 0.0))
+    )
 
 
 async def semantic_progress_metric(state: vf.State) -> float:
@@ -1978,7 +2508,9 @@ async def semantic_progress_metric(state: vf.State) -> float:
 
 
 async def semantic_chunk_accuracy_metric(state: vf.State) -> float:
-    return float(state.get("semantic_chunk_accuracy", 0.0))
+    return float(
+        state.get("semantic_chunk_accuracy", state.get("reward_correctness", 0.0))
+    )
 
 
 async def semantic_exact_metric(state: vf.State) -> float:
@@ -1991,6 +2523,14 @@ async def semantic_child_local_accuracy_metric(state: vf.State) -> float:
 
 async def semantic_child_local_coverage_metric(state: vf.State) -> float:
     return float(state.get("semantic_child_local_coverage", 0.0))
+
+
+async def semantic_complete_packet_call_rate_metric(state: vf.State) -> float:
+    return float(state.get("semantic_complete_packet_call_rate", 0.0))
+
+
+async def semantic_packet_coverage_metric(state: vf.State) -> float:
+    return float(state.get("semantic_packet_coverage", 0.0))
 
 
 async def semantic_child_verified_input_rate_metric(state: vf.State) -> float:
@@ -2139,6 +2679,14 @@ async def adaptive_cost_penalty_metric(state: vf.State) -> float:
     return float(state.get("reward_adaptive_cost_penalty", 0.0))
 
 
+async def accuracy_stratum_size_metric(state: vf.State) -> float:
+    return float(state.get("reward_accuracy_stratum_size", 0.0))
+
+
+async def accuracy_stratified_cost_penalty_metric(state: vf.State) -> float:
+    return float(state.get("reward_accuracy_stratified_cost_penalty", 0.0))
+
+
 async def used_repl_metric(state: vf.State) -> float:
     return 1.0 if state.get("used_repl") else 0.0
 
@@ -2198,6 +2746,8 @@ def add_metrics(rubric: vf.Rubric) -> vf.Rubric:
     rubric.add_metric(semantic_exact_metric)
     rubric.add_metric(semantic_child_local_accuracy_metric)
     rubric.add_metric(semantic_child_local_coverage_metric)
+    rubric.add_metric(semantic_complete_packet_call_rate_metric)
+    rubric.add_metric(semantic_packet_coverage_metric)
     rubric.add_metric(semantic_child_verified_input_rate_metric)
     rubric.add_metric(semantic_child_invalid_input_rate_metric)
     rubric.add_metric(semantic_child_valid_output_rate_metric)
@@ -2234,6 +2784,8 @@ def add_metrics(rubric: vf.Rubric) -> vf.Rubric:
     rubric.add_metric(adaptive_beta_metric)
     rubric.add_metric(adaptive_normalized_cost_metric)
     rubric.add_metric(adaptive_cost_penalty_metric)
+    rubric.add_metric(accuracy_stratum_size_metric)
+    rubric.add_metric(accuracy_stratified_cost_penalty_metric)
     rubric.add_metric(used_repl_metric)
     rubric.add_metric(used_recursion_metric)
     rubric.add_metric(used_llm_subcalls_metric)

@@ -7,13 +7,26 @@ from openai import AsyncOpenAI
 import verifiers as vf
 
 from .dataset import build_datasets
-from .external_rlm import CodeBlock, RLMIteration, build_initial_messages, build_system_prompt, build_user_prompt, find_code_blocks, make_feedback_messages
+from .external_rlm import (
+    CodeBlock,
+    RLMIteration,
+    build_initial_messages,
+    build_system_prompt,
+    build_user_prompt,
+    find_code_blocks,
+    make_feedback_messages,
+)
 from .live_trace import assign_live_trace_suffix, write_live_trace
 from .parsing import extract_final_answer
 from .prompt_variants import DEFAULT_PROMPT_VARIANT, PROMPT_VARIANTS
 from .repl import create_repl
 from .reward import add_metrics, build_rubric
-from .runtime import RecursiveRuntime, RuntimeConfig, SyncInferenceSession, VertexGeminiSession
+from .runtime import (
+    RecursiveRuntime,
+    RuntimeConfig,
+    SyncInferenceSession,
+    VertexGeminiSession,
+)
 from .trace import append_step_trace, make_call_trace, make_segment, prompt_provenance
 
 
@@ -35,6 +48,8 @@ class RLMRLVREnv(vf.MultiTurnEnv):
                 "n_wiki",
                 "curriculum_bucket",
                 "semantic_task_type",
+                "semantic_source_stage",
+                "semantic_difficulty",
             )
             if key in metadata
         }
@@ -67,15 +82,25 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             "subcall_budget_enabled": bool(state.get("subcall_budget_enabled", False)),
             "subcall_budget_total": int(state.get("subcall_budget_total", 0)),
             "subcall_budget_remaining": int(state.get("subcall_budget_remaining", 0)),
-            "subcall_budget_exhausted": bool(state.get("subcall_budget_exhausted", False)),
+            "subcall_budget_exhausted": bool(
+                state.get("subcall_budget_exhausted", False)
+            ),
             "subcall_batch_attempts": int(state.get("subcall_batch_attempts", 0)),
             "subcall_batch_rejections": int(state.get("subcall_batch_rejections", 0)),
             "final_answer": state.get("final_answer"),
-            "used_forced_finalize_prompt": bool(state.get("used_forced_finalize_prompt", False)),
-            "hit_max_turn_without_final": bool(state.get("hit_max_turn_without_final", False)),
+            "used_forced_finalize_prompt": bool(
+                state.get("used_forced_finalize_prompt", False)
+            ),
+            "hit_max_turn_without_final": bool(
+                state.get("hit_max_turn_without_final", False)
+            ),
             "missing_final": bool(state.get("missing_final", False)),
-            "finalized_before_forced_prompt": bool(state.get("finalized_before_forced_prompt", False)),
-            "finalized_on_forced_prompt": bool(state.get("finalized_on_forced_prompt", False)),
+            "finalized_before_forced_prompt": bool(
+                state.get("finalized_before_forced_prompt", False)
+            ),
+            "finalized_on_forced_prompt": bool(
+                state.get("finalized_on_forced_prompt", False)
+            ),
             "sample_metadata": self._sample_metadata(state.get("info") or {}),
             "trace": state.get("rlm_trace") or [],
             "segments": state.get("rlm_segments") or [],
@@ -83,7 +108,11 @@ class RLMRLVREnv(vf.MultiTurnEnv):
 
     def __init__(self, *, runtime_config: RuntimeConfig, **kwargs):
         # max_iterations normal turns + one forced-finalize prompt/response pair.
-        super().__init__(max_turns=runtime_config.max_iterations + 2, interleaved_rollouts=True, **kwargs)
+        super().__init__(
+            max_turns=runtime_config.max_iterations + 2,
+            interleaved_rollouts=True,
+            **kwargs,
+        )
         self.runtime_config = runtime_config
 
     @vf.stop(priority=10)
@@ -100,21 +129,47 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         assert isinstance(client, AsyncOpenAI)
 
         base_url = self.runtime_config.inference_base_url or str(client.base_url)
-        api_key = self.runtime_config.inference_api_key or getattr(client, "api_key", None) or "EMPTY"
+        api_key = (
+            self.runtime_config.inference_api_key
+            or getattr(client, "api_key", None)
+            or "EMPTY"
+        )
         default_headers = dict(getattr(client, "default_headers", {}) or {})
         model_name = str(state["model"])
 
-        state["efficiency_penalty_coef"] = getattr(self, "efficiency_penalty_coef", 0.02)
-        state["efficiency_penalty_mode"] = getattr(self, "efficiency_penalty_mode", "static_per_1k")
-        state["adaptive_efficiency_beta_min"] = getattr(self, "adaptive_efficiency_beta_min", 0.0)
-        state["adaptive_efficiency_beta_max"] = getattr(self, "adaptive_efficiency_beta_max", 0.05)
-        state["adaptive_efficiency_gamma"] = getattr(self, "adaptive_efficiency_gamma", 2.0)
-        state["adaptive_efficiency_solve_rate_floor"] = getattr(self, "adaptive_efficiency_solve_rate_floor", 0.25)
-        state["adaptive_efficiency_cost_basis"] = getattr(self, "adaptive_efficiency_cost_basis", "total_tokens")
-        state["efficiency_root_token_multiplier"] = getattr(self, "efficiency_root_token_multiplier", 1.0)
-        state["efficiency_plain_subcall_token_multiplier"] = getattr(self, "efficiency_plain_subcall_token_multiplier", 1.0)
-        state["efficiency_penalty_applies_to"] = getattr(self, "efficiency_penalty_applies_to", "correct_only")
-        state["semantic_record_map_min_records"] = int(getattr(self, "semantic_record_map_min_records", 8))
+        state["efficiency_penalty_coef"] = getattr(
+            self, "efficiency_penalty_coef", 0.02
+        )
+        state["efficiency_penalty_mode"] = getattr(
+            self, "efficiency_penalty_mode", "static_per_1k"
+        )
+        state["adaptive_efficiency_beta_min"] = getattr(
+            self, "adaptive_efficiency_beta_min", 0.0
+        )
+        state["adaptive_efficiency_beta_max"] = getattr(
+            self, "adaptive_efficiency_beta_max", 0.05
+        )
+        state["adaptive_efficiency_gamma"] = getattr(
+            self, "adaptive_efficiency_gamma", 2.0
+        )
+        state["adaptive_efficiency_solve_rate_floor"] = getattr(
+            self, "adaptive_efficiency_solve_rate_floor", 0.25
+        )
+        state["adaptive_efficiency_cost_basis"] = getattr(
+            self, "adaptive_efficiency_cost_basis", "total_tokens"
+        )
+        state["efficiency_root_token_multiplier"] = getattr(
+            self, "efficiency_root_token_multiplier", 1.0
+        )
+        state["efficiency_plain_subcall_token_multiplier"] = getattr(
+            self, "efficiency_plain_subcall_token_multiplier", 1.0
+        )
+        state["efficiency_penalty_applies_to"] = getattr(
+            self, "efficiency_penalty_applies_to", "correct_only"
+        )
+        state["semantic_record_map_min_records"] = int(
+            getattr(self, "semantic_record_map_min_records", 8)
+        )
         state["reward_clip_min"] = getattr(self, "reward_clip_min", 0.0)
         state["reward_clip_max"] = getattr(self, "reward_clip_max", 1.0)
         state["used_repl"] = False
@@ -125,7 +180,9 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         state["num_subcalls"] = 0
         state["num_llm_subcalls"] = 0
         state["num_rlm_subcalls"] = 0
-        state["subcall_budget_enabled"] = bool(self.runtime_config.subcall_budget_enabled)
+        state["subcall_budget_enabled"] = bool(
+            self.runtime_config.subcall_budget_enabled
+        )
         state["subcall_budget_total"] = int(self.runtime_config.max_total_subcalls)
         state["subcall_budget_remaining"] = int(self.runtime_config.max_total_subcalls)
         state["subcall_budget_exhausted"] = False
@@ -153,7 +210,11 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         state["prompt_variant"] = self.runtime_config.prompt_variant
         state["live_trace_dir"] = self.runtime_config.live_trace_dir
         assign_live_trace_suffix(state)
-        state["sampling_temperature"] = float((state.get("sampling_args") or {}).get("temperature", self.runtime_config.temperature))
+        state["sampling_temperature"] = float(
+            (state.get("sampling_args") or {}).get(
+                "temperature", self.runtime_config.temperature
+            )
+        )
 
         state["_sync_session"] = SyncInferenceSession(
             base_url=base_url,
@@ -165,10 +226,14 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             enable_vllm_extra_body=self.runtime_config.inference_mode == "local",
         )
         if self.runtime_config.llm_subcall_model is not None:
-            state["llm_subcall_session_source"] = self.runtime_config.llm_subcall_provider
+            state["llm_subcall_session_source"] = (
+                self.runtime_config.llm_subcall_provider
+            )
             if self.runtime_config.llm_subcall_provider == "vertex":
                 if not self.runtime_config.llm_subcall_vertex_project:
-                    raise ValueError("llm_subcall_vertex_project is required when llm_subcall_provider='vertex'")
+                    raise ValueError(
+                        "llm_subcall_vertex_project is required when llm_subcall_provider='vertex'"
+                    )
                 state["_plain_llm_session"] = VertexGeminiSession(
                     model_name=self.runtime_config.llm_subcall_model,
                     project=self.runtime_config.llm_subcall_vertex_project,
@@ -223,12 +288,16 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             context_payload=state.get("_root_context", ""),
             llm_query_fn=state["_runtime"]._plain_query,
             rlm_query_fn=state["_runtime"]._recursive_query,
-            llm_query_batch_fn=lambda prompts, model, max_workers: state["_runtime"].run_plain_query_batch(
+            llm_query_batch_fn=lambda prompts, model, max_workers: state[
+                "_runtime"
+            ].run_plain_query_batch(
                 prompts,
                 model=model,
                 max_workers=max_workers,
             ),
-            rlm_query_batch_fn=lambda prompts, model, max_depth, max_workers: state["_runtime"].run_recursive_query_batch(
+            rlm_query_batch_fn=lambda prompts, model, max_depth, max_workers: state[
+                "_runtime"
+            ].run_recursive_query_batch(
                 prompts,
                 model=model,
                 max_depth=max_depth,
@@ -239,15 +308,23 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         )
         return await super().setup_state(state)
 
-    async def add_trajectory_step(self, state: vf.State, trajectory_step: vf.TrajectoryStep):
+    async def add_trajectory_step(
+        self, state: vf.State, trajectory_step: vf.TrajectoryStep
+    ):
         await super().add_trajectory_step(state, trajectory_step)
         tokens = trajectory_step.get("tokens")
         if tokens is None:
             return
 
-        temperature = float((state.get("sampling_args") or {}).get("temperature", self.runtime_config.temperature))
+        temperature = float(
+            (state.get("sampling_args") or {}).get(
+                "temperature", self.runtime_config.temperature
+            )
+        )
         prompt_messages = trajectory_step.get("prompt") or []
-        provenance = prompt_provenance(prompt_messages if isinstance(prompt_messages, list) else [])
+        provenance = prompt_provenance(
+            prompt_messages if isinstance(prompt_messages, list) else []
+        )
         segment = make_segment(
             order=int(state["rlm_segment_counter"]),
             call_id=0,
@@ -260,7 +337,9 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             response_source="root",
             prompt_ids=list(tokens["prompt_ids"]),
             completion_ids=list(tokens["completion_ids"]),
-            completion_logprobs=[float(value) for value in tokens["completion_logprobs"]],
+            completion_logprobs=[
+                float(value) for value in tokens["completion_logprobs"]
+            ],
             completion_mask=[bool(value) for value in tokens["completion_mask"]],
             temperature=temperature,
             response_text=trajectory_step["completion"][-1].get("content", ""),
@@ -273,13 +352,25 @@ class RLMRLVREnv(vf.MultiTurnEnv):
         state["rlm_segments"].append(segment)
         prompt_token_count = float(len(segment["prompt_ids"]))
         completion_token_count = float(len(segment["completion_ids"]))
-        state["total_model_tokens"] = float(state.get("total_model_tokens", 0.0)) + completion_token_count
-        state["total_prompt_tokens"] = float(state.get("total_prompt_tokens", 0.0)) + prompt_token_count
-        state["total_completion_tokens"] = float(state.get("total_completion_tokens", 0.0)) + completion_token_count
-        state["total_rollout_tokens"] = float(state.get("total_rollout_tokens", 0.0)) + prompt_token_count + completion_token_count
+        state["total_model_tokens"] = (
+            float(state.get("total_model_tokens", 0.0)) + completion_token_count
+        )
+        state["total_prompt_tokens"] = (
+            float(state.get("total_prompt_tokens", 0.0)) + prompt_token_count
+        )
+        state["total_completion_tokens"] = (
+            float(state.get("total_completion_tokens", 0.0)) + completion_token_count
+        )
+        state["total_rollout_tokens"] = (
+            float(state.get("total_rollout_tokens", 0.0))
+            + prompt_token_count
+            + completion_token_count
+        )
         write_live_trace(state, event="root_segment")
 
-    async def env_response(self, messages: vf.Messages, state: vf.State, **kwargs) -> vf.Messages:
+    async def env_response(
+        self, messages: vf.Messages, state: vf.State, **kwargs
+    ) -> vf.Messages:
         del kwargs
         runtime: RecursiveRuntime = state["_runtime"]
         assistant_text = str(messages[-1].get("content", "")) if messages else ""
@@ -358,7 +449,12 @@ class RLMRLVREnv(vf.MultiTurnEnv):
             )
 
         response_messages = [*feedback_messages, next_message]
-        state["total_env_tokens"] += float(sum(session.count_text_tokens(message["content"]) for message in response_messages))
+        state["total_env_tokens"] += float(
+            sum(
+                session.count_text_tokens(message["content"])
+                for message in response_messages
+            )
+        )
         self._attach_debug_payload(state)
         write_live_trace(state, event="root_feedback")
         return response_messages
@@ -428,6 +524,7 @@ def load_environment(
     efficiency_root_token_multiplier: float = 1.0,
     efficiency_plain_subcall_token_multiplier: float = 1.0,
     efficiency_penalty_applies_to: str = "correct_only",
+    efficiency_tie_break_max: float = 0.05,
     reward_clip_min: float = 0.0,
     reward_clip_max: float = 1.0,
     max_turn_penalty_enabled: bool = False,
@@ -463,7 +560,9 @@ def load_environment(
         raise ValueError("subcall_batch_max_workers must be >= 1 when set")
     subcall_batch_overflow_mode = subcall_batch_overflow_mode.lower()
     if subcall_batch_overflow_mode not in {"partial", "reject"}:
-        raise ValueError("subcall_batch_overflow_mode must be one of ['partial', 'reject']")
+        raise ValueError(
+            "subcall_batch_overflow_mode must be one of ['partial', 'reject']"
+        )
     if llm_subcall_empty_response_max_attempts < 1:
         raise ValueError("llm_subcall_empty_response_max_attempts must be >= 1")
     if llm_subcall_empty_response_base_retry_seconds < 0:
@@ -480,29 +579,50 @@ def load_environment(
         raise ValueError("temperature must be >= 0.0")
     if prompt_variant not in PROMPT_VARIANTS:
         raise ValueError(f"prompt_variant must be one of {sorted(PROMPT_VARIANTS)}")
-    if recursive_cap_prompt_variant is not None and recursive_cap_prompt_variant not in PROMPT_VARIANTS:
-        raise ValueError(f"recursive_cap_prompt_variant must be one of {sorted(PROMPT_VARIANTS)}")
-    valid_efficiency_penalty_modes = {"static_per_1k", "adaptive_group"}
+    if (
+        recursive_cap_prompt_variant is not None
+        and recursive_cap_prompt_variant not in PROMPT_VARIANTS
+    ):
+        raise ValueError(
+            f"recursive_cap_prompt_variant must be one of {sorted(PROMPT_VARIANTS)}"
+        )
+    valid_efficiency_penalty_modes = {
+        "static_per_1k",
+        "adaptive_group",
+        "accuracy_stratified_group",
+    }
     if efficiency_penalty_mode not in valid_efficiency_penalty_modes:
-        raise ValueError(f"efficiency_penalty_mode must be one of {sorted(valid_efficiency_penalty_modes)}")
+        raise ValueError(
+            f"efficiency_penalty_mode must be one of {sorted(valid_efficiency_penalty_modes)}"
+        )
     if adaptive_efficiency_beta_min < 0.0:
         raise ValueError("adaptive_efficiency_beta_min must be >= 0.0")
     if adaptive_efficiency_beta_max < adaptive_efficiency_beta_min:
-        raise ValueError("adaptive_efficiency_beta_max must be >= adaptive_efficiency_beta_min")
+        raise ValueError(
+            "adaptive_efficiency_beta_max must be >= adaptive_efficiency_beta_min"
+        )
     if adaptive_efficiency_gamma <= 0.0:
         raise ValueError("adaptive_efficiency_gamma must be > 0.0")
     if not 0.0 <= adaptive_efficiency_solve_rate_floor < 1.0:
-        raise ValueError("adaptive_efficiency_solve_rate_floor must be >= 0.0 and < 1.0")
+        raise ValueError(
+            "adaptive_efficiency_solve_rate_floor must be >= 0.0 and < 1.0"
+        )
     valid_adaptive_cost_bases = {"total_tokens", "weighted_turn_tokens"}
     if adaptive_efficiency_cost_basis not in valid_adaptive_cost_bases:
-        raise ValueError(f"adaptive_efficiency_cost_basis must be one of {sorted(valid_adaptive_cost_bases)}")
+        raise ValueError(
+            f"adaptive_efficiency_cost_basis must be one of {sorted(valid_adaptive_cost_bases)}"
+        )
     if efficiency_root_token_multiplier < 0.0:
         raise ValueError("efficiency_root_token_multiplier must be >= 0.0")
     if efficiency_plain_subcall_token_multiplier < 0.0:
         raise ValueError("efficiency_plain_subcall_token_multiplier must be >= 0.0")
+    if efficiency_tie_break_max < 0.0:
+        raise ValueError("efficiency_tie_break_max must be >= 0.0")
     valid_efficiency_penalty_scopes = {"correct_only", "all_rollouts"}
     if efficiency_penalty_applies_to not in valid_efficiency_penalty_scopes:
-        raise ValueError(f"efficiency_penalty_applies_to must be one of {sorted(valid_efficiency_penalty_scopes)}")
+        raise ValueError(
+            f"efficiency_penalty_applies_to must be one of {sorted(valid_efficiency_penalty_scopes)}"
+        )
     if reward_clip_min > reward_clip_max:
         raise ValueError("reward_clip_min must be <= reward_clip_max")
     if max_turn_penalty < 0.0:
@@ -516,13 +636,17 @@ def load_environment(
 
     valid_api_providers = {"openai_compatible", "vertex"}
     if llm_subcall_provider not in valid_api_providers:
-        raise ValueError(f"llm_subcall_provider must be one of {sorted(valid_api_providers)}")
+        raise ValueError(
+            f"llm_subcall_provider must be one of {sorted(valid_api_providers)}"
+        )
     if judge_provider not in valid_api_providers:
         raise ValueError(f"judge_provider must be one of {sorted(valid_api_providers)}")
 
     valid_inference_modes = {"hosted", "local"}
     if inference_mode not in valid_inference_modes:
-        raise ValueError(f"inference_mode must be one of {sorted(valid_inference_modes)}")
+        raise ValueError(
+            f"inference_mode must be one of {sorted(valid_inference_modes)}"
+        )
 
     valid_repl_backends = {"local"}
     if repl_backend not in valid_repl_backends:
@@ -530,7 +654,9 @@ def load_environment(
     recursive_rlm_batch_mode = recursive_rlm_batch_mode.lower()
     valid_recursive_rlm_batch_modes = {"serial", "thread"}
     if recursive_rlm_batch_mode not in valid_recursive_rlm_batch_modes:
-        raise ValueError(f"recursive_rlm_batch_mode must be one of {sorted(valid_recursive_rlm_batch_modes)}")
+        raise ValueError(
+            f"recursive_rlm_batch_mode must be one of {sorted(valid_recursive_rlm_batch_modes)}"
+        )
 
     if inference_base_url is None:
         if inference_mode == "local":
@@ -600,7 +726,8 @@ def load_environment(
         llm_subcall_base_url=llm_subcall_base_url,
         llm_subcall_api_key=(
             os.environ.get(llm_subcall_api_key_var)
-            if llm_subcall_model is not None and llm_subcall_provider == "openai_compatible"
+            if llm_subcall_model is not None
+            and llm_subcall_provider == "openai_compatible"
             else None
         ),
         llm_subcall_default_headers=llm_subcall_default_headers or None,
@@ -609,7 +736,8 @@ def load_environment(
             if llm_subcall_model is not None and llm_subcall_provider == "vertex"
             else None
         ),
-        llm_subcall_vertex_location=llm_subcall_vertex_location or os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
+        llm_subcall_vertex_location=llm_subcall_vertex_location
+        or os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
         llm_subcall_thinking_level=llm_subcall_thinking_level,
         llm_subcall_empty_response_max_attempts=llm_subcall_empty_response_max_attempts,
         llm_subcall_empty_response_base_retry_seconds=llm_subcall_empty_response_base_retry_seconds,
@@ -647,10 +775,15 @@ def load_environment(
         judge_provider=judge_provider,
         judge_model=judge_model,
         judge_base_url=judge_base_url,
-        judge_api_key=os.environ[judge_api_key_var] if judge_provider == "openai_compatible" else None,
+        judge_api_key=os.environ[judge_api_key_var]
+        if judge_provider == "openai_compatible"
+        else None,
         judge_default_headers=judge_default_headers or None,
-        judge_vertex_project=os.environ.get(judge_vertex_project_env) if judge_provider == "vertex" else None,
-        judge_vertex_location=judge_vertex_location or os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
+        judge_vertex_project=os.environ.get(judge_vertex_project_env)
+        if judge_provider == "vertex"
+        else None,
+        judge_vertex_location=judge_vertex_location
+        or os.environ.get("GOOGLE_CLOUD_LOCATION", "global"),
         judge_thinking_level=judge_thinking_level,
         efficiency_penalty_mode=efficiency_penalty_mode,
         adaptive_efficiency_beta_min=adaptive_efficiency_beta_min,
@@ -661,6 +794,7 @@ def load_environment(
         efficiency_root_token_multiplier=efficiency_root_token_multiplier,
         efficiency_plain_subcall_token_multiplier=efficiency_plain_subcall_token_multiplier,
         efficiency_penalty_applies_to=efficiency_penalty_applies_to,
+        efficiency_tie_break_max=efficiency_tie_break_max,
         reward_clip_min=reward_clip_min,
         reward_clip_max=reward_clip_max,
         max_turn_penalty_enabled=max_turn_penalty_enabled,

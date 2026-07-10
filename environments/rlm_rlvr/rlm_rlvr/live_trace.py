@@ -101,21 +101,30 @@ def _compact_segment(segment: dict[str, Any]) -> dict[str, Any]:
         if completion_token_count not in (None, "")
         else (len(completion_ids) if isinstance(completion_ids, list) else None),
         "trainable_completion_tokens": (
-            sum(1 for item in completion_mask if item) if is_trainable and isinstance(completion_mask, list) else 0
+            sum(1 for item in completion_mask if item)
+            if is_trainable and isinstance(completion_mask, list)
+            else 0
         )
         if isinstance(completion_mask, list)
         else None,
         "temperature": segment.get("temperature"),
         "response_text": segment.get("response_text"),
-        "semantic_recognized_record_count": segment.get("semantic_recognized_record_count"),
+        "semantic_recognized_record_count": segment.get(
+            "semantic_recognized_record_count"
+        ),
         "semantic_recognized_chunk_ids": segment.get("semantic_recognized_chunk_ids"),
+        "semantic_recognized_packet_ids": segment.get("semantic_recognized_packet_ids"),
         "semantic_primary_chunk_id": segment.get("semantic_primary_chunk_id"),
+        "semantic_primary_packet_id": segment.get("semantic_primary_packet_id"),
+        "semantic_complete_packet": segment.get("semantic_complete_packet"),
         "semantic_local_signal": segment.get("semantic_local_signal"),
         "semantic_local_accuracy": segment.get("semantic_local_accuracy"),
         "semantic_local_coverage": segment.get("semantic_local_coverage"),
         "semantic_local_schema_valid": segment.get("semantic_local_schema_valid"),
         "semantic_local_advantage": segment.get("semantic_local_advantage"),
-        "semantic_terminal_fallback_eligible": segment.get("semantic_terminal_fallback_eligible"),
+        "semantic_terminal_fallback_eligible": segment.get(
+            "semantic_terminal_fallback_eligible"
+        ),
         "semantic_local_fallback_reason": segment.get("semantic_local_fallback_reason"),
     }
 
@@ -139,6 +148,8 @@ def _sample_metadata(state: dict[str, Any]) -> dict[str, Any]:
             "n_wiki",
             "curriculum_bucket",
             "semantic_task_type",
+            "semantic_source_stage",
+            "semantic_difficulty",
         )
         if key in metadata
     }
@@ -183,7 +194,9 @@ def write_live_trace(
             "subcall_budget_enabled": bool(state.get("subcall_budget_enabled", False)),
             "subcall_budget_total": int(state.get("subcall_budget_total", 0)),
             "subcall_budget_remaining": int(state.get("subcall_budget_remaining", 0)),
-            "subcall_budget_exhausted": bool(state.get("subcall_budget_exhausted", False)),
+            "subcall_budget_exhausted": bool(
+                state.get("subcall_budget_exhausted", False)
+            ),
             "subcall_batch_attempts": int(state.get("subcall_batch_attempts", 0)),
             "subcall_batch_rejections": int(state.get("subcall_batch_rejections", 0)),
             "final_answer": state.get("final_answer"),
@@ -194,7 +207,9 @@ def write_live_trace(
             "total_rollout_tokens": float(state.get("total_rollout_tokens", 0.0)),
         },
         "traces": traces,
-        "segments": [_compact_segment(segment) for segment in state.get("rlm_segments") or []],
+        "segments": [
+            _compact_segment(segment) for segment in state.get("rlm_segments") or []
+        ],
     }
 
     path.parent.mkdir(parents=True, exist_ok=True)

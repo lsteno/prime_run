@@ -55,7 +55,10 @@ def _segment_summary(segment: dict[str, Any]) -> dict[str, Any]:
     semantic_keys = (
         "semantic_recognized_record_count",
         "semantic_recognized_chunk_ids",
+        "semantic_recognized_packet_ids",
         "semantic_primary_chunk_id",
+        "semantic_primary_packet_id",
+        "semantic_complete_packet",
         "semantic_full_chunk",
         "semantic_input_verified",
         "semantic_input_rejection_reason",

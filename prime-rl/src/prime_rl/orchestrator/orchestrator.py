@@ -277,8 +277,7 @@ async def orchestrate(config: OrchestratorConfig):
                 name=env_name,
             )
         logger.info(
-            f"Connecting train environment {env_name} to {len(worker_clients)} worker(s): "
-            f"{', '.join(worker_addresses)}"
+            f"Connecting train environment {env_name} to {len(worker_clients)} worker(s): {', '.join(worker_addresses)}"
         )
         train_env_clients.append(env_client)
 
@@ -306,9 +305,7 @@ async def orchestrate(config: OrchestratorConfig):
                 worker_addresses = []
                 for worker_idx in range(worker_count):
                     worker_name = eval_env_name if worker_count == 1 else f"{eval_env_name}_w{worker_idx}"
-                    log_name = (
-                        f"{eval_env_name}.log" if worker_count == 1 else f"{eval_env_name}_w{worker_idx}.log"
-                    )
+                    log_name = f"{eval_env_name}.log" if worker_count == 1 else f"{eval_env_name}_w{worker_idx}.log"
                     log_file = (get_log_dir(config.output_dir) / "eval" / log_name).as_posix()
                     address, process = spawn_env_server(
                         env_id=env_id,
@@ -750,6 +747,7 @@ async def orchestrate(config: OrchestratorConfig):
                     for rollout in train_rollouts
                 ],
                 "reward": [rollout["reward"] for rollout in train_rollouts],
+                "terminal_advantage": advantages,
                 "is_truncated": [rollout["is_truncated"] for rollout in train_rollouts],
                 "stop_condition": [rollout.get("stop_condition") for rollout in train_rollouts],
                 "seq_len": [get_seq_len(rollout) for rollout in train_rollouts],
@@ -802,6 +800,20 @@ async def orchestrate(config: OrchestratorConfig):
         by_example = results_df.groupby("example_id")
 
         solve_none, solve_all, effective_batch_size = compute_solve_rates(results_df, metrics_df)
+        semantic_df = results_df[results_df["curriculum_bucket"] != config.buffer.curriculum_base_bucket]
+        semantic_group_reward_std = (
+            semantic_df.groupby("example_id").reward.std(ddof=0).mean() if not semantic_df.empty else 0.0
+        )
+        semantic_nonzero_advantage_rate = (
+            (semantic_df.terminal_advantage.abs() > 1e-8).mean() if not semantic_df.empty else 0.0
+        )
+        semantic_groups_with_signal = (
+            semantic_df.groupby("example_id")
+            .terminal_advantage.apply(lambda values: (values.abs() > 1e-8).any())
+            .mean()
+            if not semantic_df.empty
+            else 0.0
+        )
         to_log = {
             # Progress metrics
             "progress/tokens": num_tokens,
@@ -867,6 +879,9 @@ async def orchestrate(config: OrchestratorConfig):
             "solve_none/all": solve_none,
             "solve_all/all": solve_all,
             "effective_batch_size/all": effective_batch_size,
+            "credit/semantic/group_reward_std": float(semantic_group_reward_std),
+            "credit/semantic/nonzero_root_advantage_rate": float(semantic_nonzero_advantage_rate),
+            "credit/semantic/groups_with_root_signal_rate": float(semantic_groups_with_signal),
             **{f"batch/{env}": r for env, r in results_df.task.value_counts(normalize=True).items()},
             # Time metrics
             "time/step": step_time,
