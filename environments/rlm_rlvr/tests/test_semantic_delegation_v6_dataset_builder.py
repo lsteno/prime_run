@@ -100,6 +100,7 @@ def test_v6_builds_balanced_packet_tasks_and_preserves_base_rows(
     )
 
     assert manifest["target_private_hf_repo"] == builder.PRIVATE_HF_REPO
+    assert "split: semantic_eval" in (output_dir / "README.md").read_text()
     assert pq.ParquetFile(output_dir / "semantic_eval.parquet").metadata.num_rows == 4
     for split in builder.SPLITS:
         output_rows = pq.read_table(output_dir / f"{split}.parquet").to_pylist()

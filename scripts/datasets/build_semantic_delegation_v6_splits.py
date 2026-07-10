@@ -50,6 +50,24 @@ MAX_CONTEXT_CHARS = 150_000
 SEMANTIC_EVAL_ROWS = 128
 logger = logging.getLogger(__name__)
 
+DATASET_CARD = """---
+configs:
+- config_name: default
+  data_files:
+  - split: train
+    path: train.parquet
+  - split: eval
+    path: eval.parquet
+  - split: semantic_eval
+    path: semantic_eval.parquet
+---
+
+# BEEG Agents Semantic Delegation V6
+
+Private training data with packetized semantic delegation tasks. Labels and
+packet mappings are verifier-only metadata and must not be exposed to policies.
+"""
+
 
 DENIED_OOLONG_BENCHMARK_SOURCES = {
     "ag_news",
@@ -921,6 +939,7 @@ def build_dataset(
     (output_dir / "validation_summary.json").write_text(
         json.dumps(public_validation, indent=2) + "\n"
     )
+    (output_dir / "README.md").write_text(DATASET_CARD)
     return manifest
 
 
